@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { genesis, apply, clock, invariants, rebuild, mkTask } from '../lib/fsm.mjs';
+import { genesis, apply, applyEvent, clock, invariants, rebuild, mkTask, INFRA_RETRY_MAX } from '../lib/fsm.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
 const T0 = '2026-09-06T10:00:00.000Z';
@@ -592,6 +592,15 @@ test('T44/F8: rebuild parity — the PROJECTION converges across a rich sequence
   s = r2.state;
   journals.push(...r2.journal);
   ok(s, 'post-reset');
+  // T45/F-A extension: a duplicate-id residue (identical content — the
+  // frozen branch's mixed-deploy shape) and a RECOVERY epoch marker are
+  // rebuild-neutral under keeps-last (the dup replays ONCE; RECOVERY is
+  // audit-only). The repair commit mints the epoch record LAST, so the live
+  // journal_seq advances past it — mirrored here.
+  journals.push(structuredClone(journals[journals.length - 1]));
+  journals.push({ id: `e${s.journal_seq}`, ts: now, applied: true, kind: 'RECOVERY', reason: 'history-walk', dropFrom: null, droppedRecords: null, snapshotSha: 'deadbeef' });
+  s.journal_seq += 1;
+  ok(s, 'post-recovery-marker');
 
   // REBUILD from the ORIGINAL genesis + the journal
   const reb = rebuild(genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 }, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'test-chain', now: T0 }), journals, { nextMilestone: nm });
@@ -635,4 +644,134 @@ test('T44/44-h P1: TWO-LEVEL ghost deps cascade (B1-ghost, B2-deps-B1 — the fi
   assert.equal(rejected.length, 2, 'both invalid specs journaled as REJECTED');
   assert.equal(rejected[0].applied, false);
   ok(s, 'fixpoint milestone door');
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-F: the infra_failed outcome class (net-zero burn, own budget).
+
+test('T45/F-F: infra_failed report — net-zero burn, ready + lease cleared, distinct history why', () => {
+  let s = boot({ max_parallel: 2 });
+  let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r.state.tasks.A1.lease.token;
+  // pure applyEvent (no clock pass): the task returns to READY, lease CLEARED
+  const ri = applyEvent(r.state, report('A1', lease, { status: 'infra_failed', error: 'mock-lane-429' }, step(5000), 'run-i', 'evt-infra-1'), step(5000));
+  ok(ri.state, 'infra-pure');
+  assert.equal(ri.applied, true);
+  const t = ri.state.tasks.A1;
+  assert.equal(t.status, 'ready', 'back to ready (lane unavailable, not work failure)');
+  assert.equal(t.attempts, 0, 'net-zero burn: the assignment is voided');
+  assert.equal(t.lease, null, 'lease cleared (ready is non-terminal — the explicit clear)');
+  assert.equal(t.infra_attempts, 1);
+  assert.equal(ri.state.stats.infra_retries, 1);
+  assert.ok(t.history.some(h => /infra-retry/.test(h.why)), `history why: ${t.history.map(h => h.why).join('|')}`);
+  const j = ri.eventOut;
+  assert.equal(j.kind, 'REPORT');
+  assert.equal(j.to, 'ready');
+  assert.equal(j.reason, 'infra-retry');
+  assert.equal(j.error, 'mock-lane-429');
+  // the composite apply() (event + clock): reassignment in the SAME pass
+  const r2 = apply(r.state, report('A1', lease, { status: 'infra_failed', error: 'mock-lane-429' }, step(5000), 'run-i', 'evt-infra-2'), step(5000), NM);
+  ok(r2.state, 'infra-composite');
+  assert.equal(r2.state.tasks.A1.status, 'assigned', 'reassigned in the same clock pass');
+  assert.equal(r2.state.tasks.A1.attempts, 1, 'attempts oscillates 1->0->1 — the work ladder never burns');
+  assert.equal(r2.state.stats.infra_retries, 1);
+});
+
+test('T45/F-F: INFRA_RETRY_MAX exhaustion -> quarantined with the DISTINCT infra-exhausted reason', () => {
+  assert.equal(INFRA_RETRY_MAX, 3, 'the budget is a lib constant (not a config knob)');
+  let s = boot({ max_parallel: 2 });
+  let n = 0;
+  for (let i = 0; i < 3; i++) {
+    let r = apply(s, { kind: 'TICK', event_id: `t-${i}`, ts: step(n), actor: 'chain' }, step(n), NM);
+    s = r.state; n += 1000;
+    const t = s.tasks.A1;
+    assert.ok(t.lease, `A1 leased at round ${i} (status=${t.status})`);
+    const rr = apply(s, report('A1', t.lease.token, { status: 'infra_failed', error: 'mock-lane-429' }, step(n), 'run-x', `evt-infra-${i}`), step(n), NM);
+    s = rr.state; n += 1000;
+    ok(s, `infra-round-${i}`);
+  }
+  const t = s.tasks.A1;
+  assert.equal(t.status, 'quarantined', 'the lane-death terminal');
+  assert.equal(t.infra_attempts, INFRA_RETRY_MAX);
+  assert.equal(s.stats.infra_retries, 2, 'the third report parks — only 2 retries counted');
+  assert.ok(t.history.some(h => /infra-exhausted/.test(h.why)), 'the DISTINCT reason is in the audit trail');
+  assert.equal(t.attempts, 1, 'the work ladder never burned past 1 (net-zero held to the end)');
+  assert.equal(t.lease, null);
+});
+
+test('T45/F-F: infra report on a TERMINAL task rejects task-not-leased (the lease guard is unchanged)', () => {
+  let s = boot({ max_parallel: 2 });
+  const r1 = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r1.state.tasks.A1.lease.token;
+  const r2 = apply(r1.state, report('A1', lease, { status: 'done' }, step(5000), 'run-d', 'evt-done'), step(5000), NM);
+  const r3 = apply(r2.state, report('A1', lease, { status: 'infra_failed', error: 'x' }, step(6000), 'run-late', 'evt-late-infra'), step(6000), NM);
+  assert.equal(r3.applied, false);
+  assert.match(r3.reason, /task-not-leased\(done\)/);
+  assert.equal(r3.state.stats.infra_retries, 0);
+});
+
+test('T45/F-F: rebuild mirrors infra-retry (net-zero + lease cleared) and infra-exhausted (F8 parity)', () => {
+  let s = boot({ max_parallel: 2 });
+  const gen = structuredClone(s);
+  const journal = [];
+  const drive = (ev) => {
+    const r = apply(s, ev, step(1000 * (journal.length + 1)), NM);
+    s = r.state;
+    journal.push(...r.journal);
+    ok(s, 'ff-parity-step');
+  };
+  drive({ kind: 'TICK', event_id: 't1', ts: step(1000), actor: 'chain' });
+  // two infra flaps (each reassigns in the same pass), then the lane recovers
+  for (let i = 0; i < 2; i++) {
+    drive(report('A1', s.tasks.A1.lease.token, { status: 'infra_failed', error: 'mock-lane-429' }, step(2000 + i * 10), 'run-i', `evt-if-${i}`));
+  }
+  drive(report('A1', s.tasks.A1.lease.token, { status: 'done', artifact: 'recovered' }, step(3000), 'run-ok', 'evt-ok'));
+  // a second task exhausts the infra budget -> quarantined (infra-exhausted)
+  for (let i = 0; i < 3; i++) {
+    const t = s.tasks.A2;
+    if (t.status !== 'assigned') break;  // quarantined on the 3rd
+    drive(report('A2', t.lease.token, { status: 'infra_failed', error: 'mock-lane-5xx' }, step(5000 + i * 10), 'run-i2', `evt-if2-${i}`));
+  }
+  assert.equal(s.tasks.A2.status, 'quarantined');
+  assert.equal(s.stats.infra_retries, 4);  // A1 x2 + A2's first two
+  const reb = rebuild(gen, journal);
+  const proj = (st) => ({
+    tasks: Object.fromEntries(Object.entries(st.tasks).map(([id, t]) => [id, {
+      status: t.status, attempts: t.attempts, lease: t.lease ? t.lease.token : null, infra: t.infra_attempts ?? 0,
+    }])),
+    stats: st.stats,
+    chain: { seq: st.chain.seq },
+  });
+  assert.deepEqual(proj(reb), proj(s), 'rebuild mirrors the infra classes (net-zero burn, lease clears, infra-exhausted)');
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-A: rebuild keeps-last-on-duplicate-id.
+
+test('T45/F-A: rebuild KEEPS-LAST on duplicate ids — last content wins, replayed once; journal_seq monotonic', () => {
+  const g = boot({ max_parallel: 2 });
+  const recs = [
+    { id: 'e1', ts: step(1000), applied: true, kind: 'TICK', seq: 1, actor: 'chain' },
+    { id: 'e1', ts: step(2000), applied: true, kind: 'TICK', seq: 2, actor: 'chain' },  // SAME id, DIFFERENT content (LAST wins)
+    { id: 'e2', ts: step(3000), applied: true, kind: 'ASSIGN', task: 'A1', from: 'ready', to: 'assigned', lease: 'l-1', expires: step(60000), attempt: 1, behavior: 'succeed' },
+    { id: 'e2', ts: step(4000), applied: true, kind: 'ASSIGN', task: 'A2', from: 'ready', to: 'assigned', lease: 'l-2', expires: step(60000), attempt: 1, behavior: 'flaky' },
+    { id: 'e3', ts: step(5000), applied: false, kind: 'REJECTED', origKind: 'REPORT', reason: 'stale-lease' },
+  ];
+  const reb = rebuild(g, recs);
+  assert.equal(reb.chain.seq, 2, 'the LAST e1 content won (seq=2), applied ONCE');
+  assert.equal(reb.tasks.A2.status, 'assigned', 'the LAST e2 content won (A2 assigned)');
+  assert.equal(reb.tasks.A1.status, 'ready', 'the superseded e2 content (A1) did NOT apply');
+  assert.equal(reb.stats.dispatched, 1, 'one ASSIGN applied (not two)');
+  assert.equal(reb.stats.rejected_events, 1, 'applied:false still counted once');
+  assert.equal(reb.journal_seq, 4, 'journal_seq monotonic through the duplicates (max id + 1)');
+  // an EXACT duplicate of the LAST content (the frozen-branch overlap shape)
+  // is replay-neutral: same id, same content -> applied once
+  const recs2 = [...recs, structuredClone(recs[3])];
+  const reb2 = rebuild(g, recs2);
+  assert.equal(reb2.tasks.A2.status, 'assigned');
+  assert.equal(reb2.stats.dispatched, 1, 'the identical-content duplicate applied ONCE');
+  // id-less records replay individually (each its own group)
+  const recs3 = [...recs, { ts: step(6000), applied: true, kind: 'CONTROL', command: 'pause' }];
+  const reb3 = rebuild(g, recs3);
+  assert.equal(reb3.chain.paused, true, 'an id-less record still replays');
 });

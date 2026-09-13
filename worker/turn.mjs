@@ -32,32 +32,51 @@ async function realWork() {
   // X7: the non-deterministic-agent seam. One free-model OpenRouter
   // completion stands in for a CC turn. Proves: a real LLM call inside the
   // deterministic FSM wrapper, reported through the same lease contract.
+  //
+  // F-F (T45) outcome classification — infra vs work:
+  //   transport throw (AbortSignal timeout / DNS / socket)  -> infra_failed 'transport-<name>'
+  //   HTTP 401 / 402 / 429 / 5xx                             -> infra_failed 'openrouter-<status>'
+  //     (lane/key state — operator action, not task poison; 402 = drained-
+  //     with-top-up, 401 = expired key: both infra per the key-pool laws)
+  //   200 + content                                          -> done
+  //   200 + empty completion                                 -> failed 'empty-completion' (WORK class —
+  //     the lane answered; the model produced nothing; retrying is meaningful)
+  //   other 4xx                                              -> failed 'openrouter-<status>' (deterministic class)
   const key = process.env.OPENROUTER_API_KEY;
   const t0 = Date.now();
-  const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${key}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'minimax/minimax-m3:free',
-      messages: [
-        { role: 'system', content: 'You are a task worker. Reply with a one-line result summary.' },
-        { role: 'user', content: `Task ${CP.task}: ${CP.prompt || 'compute a one-line status report for this unit of work.'}` },
-      ],
-      max_tokens: 64,
-    }),
-    signal: AbortSignal.timeout(150_000),  // bounded: the lease is the semantic backstop, not the hang
-  });
+  let r;
+  try {
+    r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'minimax/minimax-m3:free',
+        messages: [
+          { role: 'system', content: 'You are a task worker. Reply with a one-line result summary.' },
+          { role: 'user', content: `Task ${CP.task}: ${CP.prompt || 'compute a one-line status report for this unit of work.'}` },
+        ],
+        max_tokens: 64,
+      }),
+      signal: AbortSignal.timeout(150_000),  // bounded: the lease is the semantic backstop, not the hang
+    });
+  } catch (e) {
+    return { status: 'infra_failed', error: `transport-${e?.name || 'error'}`, duration_ms: Date.now() - t0 };
+  }
   const d = await r.json().catch(() => ({}));
   const content = d?.choices?.[0]?.message?.content || null;
-  return {
-    status: r.status === 200 && content ? 'done' : 'failed',
-    artifact: content ? String(content).slice(0, 200) : null,
-    error: r.status !== 200 ? `openrouter-${r.status}` : (content ? null : 'empty-completion'),
-    duration_ms: Date.now() - t0,
-  };
+  if (r.status === 200) {
+    if (content) {
+      return { status: 'done', artifact: String(content).slice(0, 200), duration_ms: Date.now() - t0 };
+    }
+    return { status: 'failed', error: 'empty-completion', duration_ms: Date.now() - t0 };
+  }
+  if (r.status === 401 || r.status === 402 || r.status === 429 || r.status >= 500) {
+    return { status: 'infra_failed', error: `openrouter-${r.status}`, duration_ms: Date.now() - t0 };
+  }
+  return { status: 'failed', error: `openrouter-${r.status}`, duration_ms: Date.now() - t0 };
 }
 
 async function main() {

@@ -111,9 +111,9 @@ function summaryMd(state, applied, reason, actions) {
     `## conductor turn — ${new Date().toISOString()}`,
     `applied=${applied} reason=${reason} version=v${state.version} chain.seq=${state.chain.seq} phase=${state.project.phase} milestone=M${state.project.milestone}`,
     '',
-    `| done | failed | quarantined | cancelled | active | ready | backlog | retries | timeouts | orphaned | dispatched |`,
-    `|---|---|---|---|---|---|---|---|---|---|---|`,
-    `| ${by('done')} | ${by('failed')} | ${by('quarantined')} | ${by('cancelled')} | ${by('assigned') + by('in_progress')} | ${by('ready')} | ${by('backlog')} | ${state.stats.retries} | ${state.stats.timeouts} | ${state.stats.orphaned_reports} | ${state.stats.dispatched} |`,
+    `| done | failed | quarantined | cancelled | active | ready | backlog | retries | timeouts | orphaned | dispatched | infra_retries |`,
+    `|---|---|---|---|---|---|---|---|---|---|---|---|`,
+    `| ${by('done')} | ${by('failed')} | ${by('quarantined')} | ${by('cancelled')} | ${by('assigned') + by('in_progress')} | ${by('ready')} | ${by('backlog')} | ${state.stats.retries} | ${state.stats.timeouts} | ${state.stats.orphaned_reports} | ${state.stats.dispatched} | ${state.stats.infra_retries} |`,
     '',
     `actions: ${actions.map(a => a.type + (a.task ? `(${a.task})` : '')).join(', ') || 'none'}`,
   ].join('\n');
@@ -139,8 +139,30 @@ async function main() {
     return { state: g, spec: { tasks: mp.m1, milestones: 3, chainId } };
   };
   const recover = () => {
+    // F-A (T45): the repair contract — walk history for the last parseable
+    // snapshot; ALSO reconcile the id space with whatever the corrupt era
+    // left on-branch. journalMaxId = the newest on-branch journal id (the
+    // repair mints strictly above it); dropFrom = the snapshot's pre-repair
+    // journal_seq (arms store.commit()'s rollback sweep: KEEP idNum < dropFrom,
+    // DROP idNum >= dropFrom); droppedRecords = the sweep's audit count;
+    // snapshotSha = the commit the repair rolled back TO.
     const good = store.findLastGoodState();
-    return good ? { state: good.state, reason: 'history-walk' } : null;
+    const tail = store.readJournalTail(1);
+    const journalMaxId = tail.length ? parseInt(String(tail[0].id || '').slice(1), 10) : NaN;
+    if (good) {
+      const dropFrom = good.state.journal_seq;
+      return {
+        state: good.state, reason: 'history-walk', snapshotSha: good.sha,
+        journalMaxId, dropFrom,
+        droppedRecords: store.countJournalFrom(dropFrom),
+      };
+    }
+    // bootstrap-ON-AN-EXISTING-BRANCH: no parseable snapshot anywhere in
+    // history — fresh genesis, ids still reconciled above the leftover journal
+    // (no sweep: there is no snapshot-era truth to restore; the old records
+    // are pre-epoch residue). A truly absent journal returns null (the plain
+    // bootstrap: the state branch is fresh/empty).
+    return Number.isFinite(journalMaxId) ? { state: null, reason: 'bootstrap', journalMaxId } : null;
   };
   const out = await Promise.resolve(store.commit({
     mutate: (cur, queue, controlQueue, queueBad, ctlBad) => conductorTick({
@@ -192,7 +214,14 @@ async function main() {
       await postIssueComment(`**[fsm]** milestone M${j.milestone} STARTED (${j.tasks.length} tasks)`);
     }
     if (j.kind === 'PHASE' && j.to === 'done') {
-      await postIssueComment(`**[fsm]** PROJECT COMPLETE — stats ${JSON.stringify(state.stats)}`);
+      // R2 quality-gate (T45): a completion dominated by quarantine/cancel is
+      // a DEGRADED halt — the alert must not read "PROJECT COMPLETE" when
+      // the work died (the probe1 kill: 0% done, invariants clean, all green).
+      if (j.degraded) {
+        await postIssueComment(`**[fsm-alert]** PROJECT HALTED DEGRADED — done ${state.stats.done}/${Object.keys(state.tasks).length} (quarantined=${state.stats.quarantined} cancelled=${state.stats.cancelled}); quality gate: done < 50%. Investigate the work lane before reset. stats ${JSON.stringify(state.stats)}`);
+      } else {
+        await postIssueComment(`**[fsm]** PROJECT COMPLETE — stats ${JSON.stringify(state.stats)}`);
+      }
     }
   }
 

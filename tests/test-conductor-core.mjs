@@ -383,3 +383,91 @@ test('now is stamped per-value (multiple ts per commit — the extraction contra
   // strictly increasing: each mkJ/apply stamped a fresh now()
   assert.deepEqual(ts, [...ts].sort(), 'ts values are monotonic');
 });
+
+// ---------------------------------------------------------------------------
+// T45 additions (F-A reconciliation / F-F infra drain).
+
+test('T45/F-A: recovery reconciles journal_seq above the on-branch max id; RECOVERY record carries the sweep audit', () => {
+  const clock = makeNow(T0);
+  const snap = boot();
+  snap.journal_seq = 7;  // a snapshot whose seq sits BELOW the on-branch ids (the rollback shape)
+  const out = conductorTick({
+    cur: null, queue: [], controlQueue: [],
+    ev: tickEv('backstop'), now: clock.now, nextMilestone: NM,
+    recover: () => ({ state: snap, reason: 'history-walk', journalMaxId: 9, dropFrom: 7, droppedRecords: 3, snapshotSha: 'deadbeef' }),
+    makeGenesis,
+  });
+  const rec = out.journal.find(j => j.kind === 'RECOVERY');
+  assert.ok(rec, 'RECOVERY record present');
+  const ids = out.journal.map(j => parseInt(j.id.slice(1), 10));
+  assert.equal(ids[0], 10, 'the FIRST record mints ABOVE the on-branch max id (reconciliation before any mkJ)');
+  assert.ok(parseInt(rec.id.slice(1), 10) > 9, 'the RECOVERY record mints above the on-branch max id');
+  assert.deepEqual(ids, [...ids].sort((a, b) => a - b), 'ids strictly increasing from the reconciled base');
+  assert.equal(rec.reason, 'history-walk');
+  assert.equal(rec.dropFrom, 7);
+  assert.equal(rec.droppedRecords, 3);
+  assert.equal(rec.snapshotSha, 'deadbeef');
+  assert.equal(out.journalDropFrom, 7, 'the rollback sweep is armed for store.commit');
+  assert.ok(out.state.journal_seq > 9, `journal_seq ${out.state.journal_seq} above the pre-repair on-branch max`);
+  assert.ok(out.actions.some(a => a.type === 'RECOVERY_NOTICE'));
+  ok(out.state, 'fa-reconcile');
+});
+
+test('T45/F-A: bootstrap-on-existing-branch reconciles ids too (no sweep — nothing to restore)', () => {
+  const clock = makeNow(T0);
+  const out = conductorTick({
+    cur: null, queue: [], controlQueue: [],
+    ev: tickEv('chain'), now: clock.now, nextMilestone: NM,
+    recover: () => ({ state: null, reason: 'bootstrap', journalMaxId: 9 }),
+    makeGenesis,
+  });
+  assert.ok(out.journal.some(j => j.kind === 'RECOVERY' && j.reason === 'bootstrap'));
+  assert.ok(out.actions.some(a => a.type === 'BOOTSTRAP_NOTICE'));
+  const ids = out.journal.map(j => parseInt(j.id.slice(1), 10));
+  assert.equal(Math.min(...ids), 10, 'the first record mints above the leftover journal ids');
+  assert.equal(out.journalDropFrom, undefined, 'no sweep on bootstrap');
+  ok(out.state, 'fa-bootstrap');
+});
+
+test('T45/F-A: repair WITHOUT journalMaxId (legacy recover shape) keeps the old semantics', () => {
+  const clock = makeNow(T0);
+  const good = boot();
+  good.chain.paused = true;  // a quiesced snapshot: held wake, repair-forces-commit
+  const out = conductorTick({
+    cur: null, queue: [], controlQueue: [],
+    ev: tickEv('backstop'), now: clock.now, nextMilestone: NM,
+    recover: () => ({ state: good, reason: 'history-walk' }),
+    makeGenesis,
+  });
+  assert.equal(out.journalDropFrom, undefined);
+  const rec = out.journal.find(j => j.kind === 'RECOVERY');
+  assert.equal(rec.dropFrom, null);
+  assert.equal(rec.droppedRecords, null);
+  assert.equal(rec.snapshotSha, null);
+  ok(out.state, 'fa-legacy');
+});
+
+test('T45/F-F: an infra_failed report drains through the tick — net-zero burn, reassignment, infra_retries counted', () => {
+  const s = assignOne();  // X assigned attempt 1
+  const clock = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s),
+    queue: [{
+      event_id: 'rep-infra-1', task: 'X', lease: s.tasks.X.lease.token,
+      outcome: { status: 'infra_failed', error: 'transport-drop' }, run_id: 'r-infra',
+    }],
+    controlQueue: [], ev: tickEv('chain'), now: clock.now, nextMilestone: nextMilestoneFactory(ONE),
+    recover: noRecover, makeGenesis: makeGenesisFor(ONE),
+  });
+  const x = out.state.tasks.X;
+  assert.equal(x.status, 'assigned', 'reassigned in the same clock pass (at-least-once lane)');
+  assert.equal(x.attempts, 1, 'net-zero burn: attempts back to the pre-assignment value');
+  assert.equal(x.infra_attempts, 1);
+  assert.equal(out.state.stats.infra_retries, 1);
+  const rep = out.journal.find(j => j.kind === 'REPORT' && j.task === 'X');
+  assert.equal(rep.to, 'ready');
+  assert.equal(rep.reason, 'infra-retry');
+  assert.equal(rep.error, 'transport-drop');
+  assert.ok(out.journal.some(j => j.kind === 'ASSIGN' && j.task === 'X' && j.attempt === 1), 'the reassignment is journaled');
+  ok(out.state, 'ff-infra-drain');
+});

@@ -16,6 +16,8 @@
 //                next tick (the watchdog-reprime path, simulated)
 //   cas        — a rival writer lands between read and push (CAS retry)
 //   grow       — 1200+ events: rotation + bounded sizes
+//   infra      — T45/F-F: the lane flaps infra_failed twice, then recovers
+//                (net-zero attempt burn; the work ladder never burns)
 //
 // Usage: node sim/run-sim.mjs [scenario]  (default: all)
 
@@ -309,10 +311,58 @@ function scenarioGrow() {
   } finally { lab.cleanup(); }
 }
 
+function scenarioInfra() {
+  const lab = setupRepo();
+  try {
+    const clock = makeClock();
+    const store = new Store({ cwd: lab.clone });
+    // F-F: an infra-flapping lane — the worker reports infra_failed twice
+    // (mock-lane-429), then the lane recovers. The task must COMPLETE with
+    // zero work-failures, the flaps counted in infra_retries, and the work
+    // ladder (attempts) never burning past its single real attempt.
+    const s0 = genesis({
+      config: { max_parallel: 1, lease_minutes: 1, max_attempts: 3 },
+      project: { tasks: [{ id: 'I1', title: 'i', behavior: 'infra', work_ms: 100 }], milestones: 1 },
+      chainId: 'sim-infra', now: clock.now(),
+    });
+    store.init(s0);
+    const infraLeft = { I1: 2 };
+    let state = s0;
+    let guard = 0;
+    while (guard++ < 20 && state.project.phase !== 'done') {
+      const out = store.commit({
+        mutate: (cur) => {
+          const r = apply(cur, { kind: 'TICK', event_id: `t-${guard}`, ts: clock.now(), actor: 'chain' }, clock.now(), null);
+          return { state: r.state, journal: r.journal, message: 'tick' };
+        },
+      });
+      state = out.state;
+      const t = state.tasks.I1;
+      if (t.status === 'assigned' && t.lease) {
+        const w = mockWork('infra', { task: 'I1', attempt: t.attempts, workMs: 100, infraLeft: infraLeft.I1 });
+        if (w.outcome.status === 'infra_failed') infraLeft.I1 -= 1;
+        const ro = store.commit({
+          mutate: (cur) => {
+            const r = apply(cur, { kind: 'REPORT', event_id: `rep-${guard}`, task: 'I1', lease: t.lease.token, outcome: { ...w.outcome, duration_ms: 10 }, run_id: `sim-${guard}` }, clock.now(), null);
+            return { state: r.state, journal: r.journal, message: 'report' };
+          },
+        });
+        state = ro.state;
+      }
+      clock.advance(1000);
+    }
+    const s = state;
+    const pass = s.project.phase === 'done' && s.stats.done === 1 && s.stats.failed === 0
+      && s.stats.quarantined === 0 && s.stats.infra_retries === 2 && s.tasks.I1.attempts === 1;
+    record('infra', pass,
+      `done=${s.stats.done} failed=${s.stats.failed} quarantined=${s.stats.quarantined} infra_retries=${s.stats.infra_retries} attempts=${s.tasks.I1.attempts} (lane flap absorbed with NET-ZERO burn — the work ladder never burned)`);
+  } finally { lab.cleanup(); }
+}
+
 // ---------------------------------------------------------------------------
 
 const which = process.argv[2] || 'all';
-const scenarios = { happy: scenarioHappy, dup: scenarioDup, stale: scenarioStale, dropev: scenarioDropEv, crash: scenarioCrash, cas: scenarioCas, grow: scenarioGrow };
+const scenarios = { happy: scenarioHappy, dup: scenarioDup, stale: scenarioStale, dropev: scenarioDropEv, crash: scenarioCrash, cas: scenarioCas, grow: scenarioGrow, infra: scenarioInfra };
 const toRun = which === 'all' ? Object.keys(scenarios) : [which];
 for (const name of toRun) {
   if (!scenarios[name]) { console.error(`unknown scenario: ${name}`); process.exit(1); }

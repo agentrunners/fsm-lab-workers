@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../lib/store.mjs';
 import { genesis, apply, rebuild } from '../lib/fsm.mjs';
+import { conductorTick } from '../lib/conductor-core.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
 const NM = nextMilestoneFactory(fastProject());
@@ -448,5 +449,249 @@ test('T44/F1: the drain consumes rejected reports — queue EMPTIES (the zombie 
     assert.equal(st.readQueue().length, 0, 'queue still empty');
     const rejectedAfter = st.readJournals().filter(x => x.kind === 'REJECTED').length;
     assert.equal(rejectedAfter, rejectedBefore, 'no zombie re-rejection of the consumed event_id');
+  } finally { lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-A additions: the corruption-repair rollback sweep (probe1's shape,
+// driven through the REAL Store + REAL conductorTick; the R3-adjudicated
+// direction — KEEP idNum < dropFrom, DROP idNum >= dropFrom).
+
+// a raw plumbing commit: write exactly these branch files over the parent tree
+function plumbCommit(st, files, message) {
+  const dir = mkdtempSync(join(tmpdir(), 'fsm-plumb-'));
+  try {
+    const mappings = [];
+    for (const [dest, content] of Object.entries(files)) {
+      const base = dest.split('/').pop();
+      writeFileSync(join(dir, base), content);
+      mappings.push([join(dir, base), dest]);
+    }
+    const commit = st.buildCommit(mappings, [], st.headSha(), message);
+    st.git(['push', 'origin', `${commit}:refs/heads/fsm-state`]);
+    return commit;
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+// the conductor-adapter-shaped repair turn: the REAL conductorTick with a
+// recover() closure mirroring conductor/turn.mjs's F-A contract
+function repairCommit(st, ts = '2026-09-06T11:00:00Z') {
+  return st.commit({
+    mutate: (cur, queue, controlQueue, queueBad, ctlBad) => conductorTick({
+      cur, queue, controlQueue, queueBad, ctlBad,
+      ev: { kind: 'TICK', actor: 'backstop', event_id: 'evt-repair', ts },
+      now: () => ts,
+      nextMilestone: NM,
+      recover: () => {
+        const good = st.findLastGoodState();
+        const tail = st.readJournalTail(1);
+        const journalMaxId = tail.length ? parseInt(String(tail[0].id || '').slice(1), 10) : NaN;
+        if (good) {
+          const dropFrom = good.state.journal_seq;
+          return {
+            state: good.state, reason: 'history-walk', snapshotSha: good.sha,
+            journalMaxId, dropFrom, droppedRecords: st.countJournalFrom(dropFrom),
+          };
+        }
+        return Number.isFinite(journalMaxId) ? { state: null, reason: 'bootstrap', journalMaxId } : null;
+      },
+      makeGenesis: () => {
+        const g = genesis({ config: cfg, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'repair-chain', now: ts });
+        return { state: g, spec: { tasks: fastProject().m1, milestones: 2, chainId: 'repair-chain' } };
+      },
+    }),
+  });
+}
+
+const rec = (id, fields, ts) => ({ id, ts, applied: true, ...fields });
+const jlines = (recs) => recs.map(r => JSON.stringify(r)).join('\n') + '\n';
+
+test('T45/F-A: repair sweep — probe1 shape (rollback journal integrity + R3 gate)', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone, rotateAt: 10, keepGens: 6 });
+    const g0 = boot('2026-09-06T10:00:00Z');
+    st.init(g0);
+    // era1: two REAL commits — snapshot journal_seq lands at 7 (records e1..e6)
+    st.fetch();
+    st.commit({ mutate: (cur) => {
+      const r = apply(cur, { kind: 'TICK', actor: 'chain', ts: '2026-09-06T10:00:05Z', event_id: 'evt-a' }, '2026-09-06T10:00:05Z', NM);
+      return { state: r.state, journal: r.journal, message: 'era1 tick' };
+    } });
+    st.commit({ mutate: (cur) => {
+      const t = cur.tasks.A1;
+      const r = apply(cur, { kind: 'REPORT', event_id: 'evt-b', task: 'A1', lease: t.lease.token, outcome: { status: 'done', artifact: 'era1' }, run_id: 'r-b' }, '2026-09-06T10:00:10Z', NM);
+      return { state: r.state, journal: r.journal, message: 'era1 report' };
+    } });
+    st.fetch();
+    const snapshotSeq = st.readState().state.journal_seq;
+    const era1 = st.readJournals();
+    assert.ok(era1.length >= 5, `era1 records: ${era1.length}`);
+    // the corrupt era: records e7..e9 land on-branch AND the state.json is
+    // garbage — exactly probe1 (the snapshot's seq sits BELOW the on-branch ids)
+    plumbCommit(st, {
+      'state/state.json': 'THIS IS NOT JSON{{{',
+      'state/journal-1.jsonl': jlines([...era1, ...[
+        rec('e7', { kind: 'TICK', seq: 2, actor: 'chain' }, '2026-09-06T10:30:00Z'),
+        rec('e8', { kind: 'ASSIGN', task: 'A5', from: 'ready', to: 'assigned', lease: 'l-corrupt', expires: '2026-09-06T10:41:00Z', attempt: 1, behavior: 'succeed' }, '2026-09-06T10:31:00Z'),
+        rec('e9', { kind: 'REPORT', task: 'A5', lease: 'l-corrupt', to: 'done', run_id: 'run-corrupt' }, '2026-09-06T10:32:00Z'),
+      ]]),
+    }, 'corrupt era');
+    st.fetch();
+    assert.ok(st.readState().corrupt, 'tip is corrupt');
+    // the repair turn: the REAL conductorTick through the real store
+    const out = repairCommit(st);
+    assert.equal(out.committed, true);
+    st.fetch();
+    const all = st.readJournals();
+    const ids = all.map(j => j.id);
+    // (a) CHECK1 dead — zero duplicate ids on-branch post-repair
+    assert.equal(new Set(ids).size, ids.length, `duplicate ids on-branch: ${ids.join(',')}`);
+    // (b) CHECK2 dead — journal_seq > max on-branch id
+    const final = st.readState().state;
+    const maxId = Math.max(...ids.map(i => parseInt(i.slice(1), 10)));
+    assert.ok(final.journal_seq > maxId, `journal_seq ${final.journal_seq} <= max on-branch id ${maxId}`);
+    // (c) the R3-adjudicated DIRECTION: rolled-back records GONE, era1 KEPT
+    for (const bad of ['e7', 'e8', 'e9']) assert.ok(!ids.includes(bad), `rolled-back record ${bad} must be SWEPT`);
+    for (const r of era1) assert.ok(ids.includes(r.id), `era1 record ${r.id} must SURVIVE the sweep`);
+    // (d) the RECOVERY record carries the rollback audit
+    const recovery = all.find(j => j.kind === 'RECOVERY');
+    assert.ok(recovery, 'RECOVERY record present');
+    assert.equal(recovery.reason, 'history-walk');
+    assert.equal(recovery.dropFrom, snapshotSeq);
+    assert.equal(recovery.droppedRecords, 3);
+    assert.ok(recovery.snapshotSha, 'snapshotSha carried');
+    // (e)+(f) R3's gate: the repair's OWN records are present on-branch
+    // (the (b)-side double-writer failure — journal_seq advanced past records
+    // that never landed)
+    const repairIds = (out.journal || []).map(j => j.id);
+    assert.ok(repairIds.length >= 2, `the repair journaled ${repairIds.length} records`);
+    for (const id of repairIds) assert.ok(ids.includes(id), `the repair's own record ${id} must be ON-BRANCH post-commit`);
+    assert.ok(Math.max(...repairIds.map(i => parseInt(i.slice(1), 10))) > 9, 'repair records mint ABOVE the swept-out corrupt era');
+    // CHECK3 dead — rebuild(genesis, readJournals()) agrees with the live state
+    const rebuilt = rebuild(g0, all);
+    for (const [id, t] of Object.entries(final.tasks)) {
+      assert.equal(rebuilt.tasks[id]?.status, t.status, `rebuild status mismatch for ${id}`);
+      assert.equal(rebuilt.tasks[id]?.attempts, t.attempts, `rebuild attempts mismatch for ${id}`);
+    }
+    assert.equal(rebuilt.chain.seq, final.chain.seq);
+    assert.equal(rebuilt.stats.done, final.stats.done);
+    assert.equal(rebuilt.stats.infra_retries, final.stats.infra_retries);
+  } finally { lab.cleanup(); }
+});
+
+test('T45/F-A: a sweep that EMPTIES the current gen removes the gen file; records land in the NEXT gen', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone, rotateAt: 5, keepGens: 6 });
+    const g0 = boot('2026-09-06T10:00:00Z');
+    st.init(g0);
+    // era1 (hand-built snapshot): journal-1 = e1..e5, state seq=6
+    const era1State = structuredClone(g0);
+    era1State.journal_seq = 6;
+    const era1 = [
+      rec('e1', { kind: 'TICK', seq: 1, actor: 'chain' }, '2026-09-06T10:00:01Z'),
+      rec('e2', { kind: 'ASSIGN', task: 'A1', from: 'ready', to: 'assigned', lease: 'l-1', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'succeed' }, '2026-09-06T10:00:02Z'),
+      rec('e3', { kind: 'ASSIGN', task: 'A2', from: 'ready', to: 'assigned', lease: 'l-2', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'flaky' }, '2026-09-06T10:00:03Z'),
+      rec('e4', { kind: 'REPORT', task: 'A1', lease: 'l-1', to: 'done', run_id: 'r-1' }, '2026-09-06T10:00:04Z'),
+      rec('e5', { kind: 'UNLOCK', task: 'A4', from: 'backlog', to: 'ready' }, '2026-09-06T10:00:05Z'),
+    ];
+    plumbCommit(st, {
+      'state/state.json': JSON.stringify(era1State, null, 1) + '\n',
+      'state/journal-1.jsonl': jlines(era1),
+    }, 'era1 (hand-built snapshot)');
+    // corrupt era: journal-2 holds ONLY rolled-back records (ids >= 6)
+    plumbCommit(st, {
+      'state/state.json': 'GARBAGE',
+      'state/journal-2.jsonl': jlines([
+        rec('e6', { kind: 'TICK', seq: 2, actor: 'chain' }, '2026-09-06T10:30:00Z'),
+        rec('e7', { kind: 'ASSIGN', task: 'A5', from: 'ready', to: 'assigned', lease: 'l-c', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'succeed' }, '2026-09-06T10:30:01Z'),
+        rec('e8', { kind: 'REPORT', task: 'A5', lease: 'l-c', to: 'done', run_id: 'r-c' }, '2026-09-06T10:30:02Z'),
+      ]),
+    }, 'corrupt era (all records >= dropFrom)');
+    st.fetch();
+    assert.ok(st.readState().corrupt);
+    const out = repairCommit(st);
+    assert.equal(out.committed, true);
+    st.fetch();
+    const files = st.listStateFiles().filter(f => /journal-\d+/.test(f));
+    assert.ok(!files.includes('state/journal-2.jsonl'), `the EMPTIED current gen is REMOVED (files: ${files.join(',')})`);
+    assert.ok(files.includes('state/journal-1.jsonl'), 'the good gen survives');
+    assert.ok(files.includes('state/journal-3.jsonl'), 'the repair records land in the NEXT gen');
+    // gen-1 content byte-identical: e1..e5 untouched by the sweep
+    const raw1 = st.readFile('state/journal-1.jsonl');
+    assert.equal(raw1, jlines(era1), 'the untouched good gen is byte-identical (no spurious rewrite)');
+    const all = st.readJournals();
+    const ids = all.map(j => j.id);
+    assert.equal(new Set(ids).size, ids.length, 'no duplicate ids');
+    for (const bad of ['e6', 'e7', 'e8']) assert.ok(!ids.includes(bad), `rolled-back ${bad} swept`);
+    for (const r of era1) assert.ok(ids.includes(r.id), `era1 ${r.id} survives`);
+    const recovery = all.find(j => j.kind === 'RECOVERY');
+    assert.equal(recovery.dropFrom, 6);
+    assert.equal(recovery.droppedRecords, 3);
+    const final = st.readState().state;
+    assert.ok(final.journal_seq > Math.max(...ids.map(i => parseInt(i.slice(1), 10))));
+    // R3's gate: the repair's own records are on-branch (in gen-3)
+    for (const id of (out.journal || []).map(j => j.id)) assert.ok(ids.includes(id), `repair record ${id} on-branch`);
+  } finally { lab.cleanup(); }
+});
+
+test('T45/F-A: multi-gen STRADDLE — corrupt-era records in the current gen AND a prior gen are swept from BOTH', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone, rotateAt: 10, keepGens: 6 });
+    const g0 = boot('2026-09-06T10:00:00Z');
+    st.init(g0);
+    // era1: journal-1 = e1..e5, state seq=6
+    const era1State = structuredClone(g0);
+    era1State.journal_seq = 6;
+    const era1 = [
+      rec('e1', { kind: 'TICK', seq: 1, actor: 'chain' }, '2026-09-06T10:00:01Z'),
+      rec('e2', { kind: 'ASSIGN', task: 'A1', from: 'ready', to: 'assigned', lease: 'l-1', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'succeed' }, '2026-09-06T10:00:02Z'),
+      rec('e3', { kind: 'REPORT', task: 'A1', lease: 'l-1', to: 'done', run_id: 'r-1' }, '2026-09-06T10:00:03Z'),
+      rec('e4', { kind: 'UNLOCK', task: 'A4', from: 'backlog', to: 'ready' }, '2026-09-06T10:00:04Z'),
+      rec('e5', { kind: 'TICK', seq: 2, actor: 'chain' }, '2026-09-06T10:00:05Z'),
+    ];
+    plumbCommit(st, {
+      'state/state.json': JSON.stringify(era1State, null, 1) + '\n',
+      'state/journal-1.jsonl': jlines(era1),
+    }, 'era1');
+    // corrupt era STRADDLING both gens: gen-1 carries e1..e10 (era1 + e6..e10),
+    // gen-2 carries e11..e14 — dropFrom=6 must sweep e6..e14 out of BOTH
+    const corrupt = [
+      rec('e6', { kind: 'TICK', seq: 3, actor: 'chain' }, '2026-09-06T10:20:00Z'),
+      rec('e7', { kind: 'ASSIGN', task: 'A2', from: 'ready', to: 'assigned', lease: 'l-c2', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'flaky' }, '2026-09-06T10:20:01Z'),
+      rec('e8', { kind: 'ASSIGN', task: 'A3', from: 'ready', to: 'assigned', lease: 'l-c3', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'poison' }, '2026-09-06T10:20:02Z'),
+      rec('e9', { kind: 'REPORT', task: 'A2', lease: 'l-c2', to: 'done', run_id: 'r-c2' }, '2026-09-06T10:20:03Z'),
+      rec('e10', { kind: 'REPORT', task: 'A3', lease: 'l-c3', to: 'done', run_id: 'r-c3' }, '2026-09-06T10:20:04Z'),
+      rec('e11', { kind: 'TICK', seq: 4, actor: 'chain' }, '2026-09-06T10:25:00Z'),
+      rec('e12', { kind: 'ASSIGN', task: 'A5', from: 'ready', to: 'assigned', lease: 'l-c5', expires: '2026-09-06T10:40:00Z', attempt: 1, behavior: 'dup' }, '2026-09-06T10:25:01Z'),
+      rec('e13', { kind: 'REPORT', task: 'A5', lease: 'l-c5', to: 'done', run_id: 'r-c5' }, '2026-09-06T10:25:02Z'),
+      rec('e14', { kind: 'TICK', seq: 5, actor: 'chain' }, '2026-09-06T10:30:00Z'),
+    ];
+    plumbCommit(st, {
+      'state/state.json': 'GARBAGE',
+      'state/journal-1.jsonl': jlines([...era1, ...corrupt.slice(0, 5)]),
+      'state/journal-2.jsonl': jlines(corrupt.slice(5)),
+    }, 'corrupt era (straddling gens)');
+    st.fetch();
+    assert.ok(st.readState().corrupt);
+    const out = repairCommit(st);
+    assert.equal(out.committed, true);
+    st.fetch();
+    const files = st.listStateFiles().filter(f => /journal-\d+/.test(f));
+    assert.ok(!files.includes('state/journal-2.jsonl'), 'the emptied gen-2 is REMOVED');
+    assert.ok(files.includes('state/journal-1.jsonl'), 'gen-1 survives (rewritten to its good prefix)');
+    assert.ok(files.includes('state/journal-3.jsonl'), 'the repair records land in gen-3');
+    // gen-1 was swept IN PLACE: e1..e5 only (the straddle — its corrupt tail e6..e10 gone)
+    assert.equal(st.readFile('state/journal-1.jsonl'), jlines(era1), 'gen-1 rewritten to contain ONLY its pre-snapshot records');
+    const all = st.readJournals();
+    const ids = all.map(j => j.id);
+    assert.equal(new Set(ids).size, ids.length, 'no duplicate ids');
+    for (let n = 6; n <= 14; n++) assert.ok(!ids.includes(`e${n}`), `rolled-back e${n} swept from BOTH gens`);
+    for (const r of era1) assert.ok(ids.includes(r.id), `era1 ${r.id} survives`);
+    const recovery = all.find(j => j.kind === 'RECOVERY');
+    assert.equal(recovery.dropFrom, 6);
+    assert.equal(recovery.droppedRecords, 9, 'the audit counts the straddle (5 from gen-1 + 4 from gen-2)');
+    for (const id of (out.journal || []).map(j => j.id)) assert.ok(ids.includes(id), `repair record ${id} on-branch`);
+    const final = st.readState().state;
+    assert.ok(final.journal_seq > Math.max(...ids.map(i => parseInt(i.slice(1), 10))));
   } finally { lab.cleanup(); }
 });
