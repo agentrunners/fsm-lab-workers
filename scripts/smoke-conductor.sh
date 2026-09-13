@@ -192,5 +192,26 @@ grep -q '"paused":false' "$WORK/c4-check.json" && grep -q '"resumeRec":true' "$W
   && ok "c4: queued RESUME applied (control-first) + the wake TICK applied (resumed)" || bad "c4: $(cat "$WORK/c4-check.json")"
 
 echo
+echo "== CASE 5 (T45/F-C): tiny JOB_TTL_MIN -> budget-exhausted skips (commit LANDED, rc=0) =="
+C5=$(mkclone c5)
+T0=$(tip "$C5" c5-origin.git)
+# JOB_TTL_MIN=0.05 (3s) with the 45s safety margin => the deadline is in the
+# past from the first dispatch: every worker ladder skips loudly, the
+# self-tick skips loudly, the commit STILL lands (commit-before-act), and the
+# exit code stays 0 (skip, don't die — the lease deadline is the handler).
+( cd "$C5" && EVENT='{"schedule":"* * * * *"}' GITHUB_RUN_ID=s5-w1 JOB_TTL_MIN=0.05 \
+    node conductor/turn.mjs; echo "wake rc=$?" ) > "$WORK/c5-log.txt" 2>&1
+T1=$(tip "$C5" c5-origin.git)
+[ "$T1" != "$T0" ] && ok "c5: bootstrap+tick COMMIT landed (tip advanced — state is truth)" || bad "c5: no commit"
+grep -q 'DISPATCH-SKIPPED task=' "$WORK/c5-log.txt" \
+  && ok "c5: worker dispatch SKIPPED loudly (DISPATCH-SKIPPED budget-exhausted)" || bad "c5: no DISPATCH-SKIPPED log"
+grep -q 'SELF-TICK-SKIPPED budget-exhausted' "$WORK/c5-log.txt" \
+  && ok "c5: self-tick SKIPPED loudly (watchdog/backstop revives)" || bad "c5: no SELF-TICK-SKIPPED log"
+grep -q 'rc=0' "$WORK/c5-log.txt" \
+  && ok "c5: exit code stays 0 (skip, don't die)" || bad "c5: rc != 0 ($(grep 'rc=' "$WORK/c5-log.txt" | tail -1))"
+grep -q 'dispatchSkipped=' "$WORK/c5-log.txt" \
+  && ok "c5: dispatchSkipped surfaced in TURN-COMPLETE" || bad "c5: dispatchSkipped not surfaced"
+
+echo
 echo "== SMOKE-RESULT: $PASS ok, $FAIL fail =="
 [ "$FAIL" -eq 0 ] && echo "SMOKE-PASS" || { echo "SMOKE-FAIL"; exit 1; }

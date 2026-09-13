@@ -471,3 +471,50 @@ test('T45/F-F: an infra_failed report drains through the tick — net-zero burn,
   assert.ok(out.journal.some(j => j.kind === 'ASSIGN' && j.task === 'X' && j.attempt === 1), 'the reassignment is journaled');
   ok(out.state, 'ff-infra-drain');
 });
+
+// ---------------------------------------------------------------------------
+// T45/F-C: makeBudget — the per-turn dispatch-budget arithmetic (pure).
+
+import { makeBudget } from '../lib/conductor-core.mjs';
+
+test('T45/F-C: makeBudget — remaining/clamp/fits math + monotonic remaining', () => {
+  let nowMs = T0;                       // virtual clock
+  const b = makeBudget({ startMs: T0, ttlMs: 10 * 60_000, safetyMs: 45_000, nowMs: () => nowMs });
+  assert.equal(b.deadlineMs, T0 + 600_000 - 45_000, 'deadline = start + ttl - safety');
+  // t=0: remaining = 555s
+  assert.equal(b.remaining(), 555_000);
+  assert.equal(b.fits(30_000), true);
+  assert.equal(b.fits(600_000), false, 'nothing bigger than the remaining window fits');
+  // clamp floors at 0 and caps at remaining
+  assert.equal(b.clamp(240_000), 240_000);
+  assert.equal(b.clamp(999_999), 555_000, 'clamped to what fits');
+  // monotonic: remaining only shrinks as the clock advances
+  nowMs += 100_000;
+  assert.equal(b.remaining(), 455_000);
+  assert.ok(b.remaining() < 555_000);
+  // the worker-ladder discipline (adapter-side, exercised here as arithmetic):
+  // reserve carved FIRST -> max(0, remaining - 30s)
+  assert.equal(Math.max(0, b.remaining() - 30_000), 425_000);
+});
+
+test('T45/F-C: makeBudget — the skip thresholds (MIN_CALL_MS discipline) + negative floor', () => {
+  let nowMs = T0;
+  const b = makeBudget({ startMs: T0, ttlMs: 90_000, safetyMs: 45_000, nowMs: () => nowMs });
+  assert.equal(b.remaining(), 45_000);
+  nowMs += 30_000;  // 15s remaining: no worker dispatch fits (15s - 30s reserve -> 0 < 30s MIN_CALL_MS)
+  assert.equal(b.remaining(), 15_000);
+  assert.equal(Math.max(0, b.remaining() - 30_000), 0, 'worker budget floors at 0 — below MIN_CALL_MS -> DISPATCH-SKIPPED');
+  assert.equal(b.fits(30_000), false, 'the self-tick skip threshold (remaining < MIN_CALL_MS)');
+  // past the deadline: remaining goes NEGATIVE — every consumer floors first
+  nowMs += 60_000;
+  assert.ok(b.remaining() < 0);
+  assert.equal(b.clamp(10_000), 0, 'clamp never returns a negative wait');
+});
+
+test('T45/F-C: makeBudget — the local fallback lane (no RUN_STARTED_AT env: process start + TTL)', () => {
+  // the adapter's fallback: startMs = process start, ttl = JOB_TTL_MIN default 10
+  const start = Date.now();
+  const b = makeBudget({ startMs: start, ttlMs: 10 * 60_000, safetyMs: 45_000 });
+  const r = b.remaining();
+  assert.ok(r > 550_000 && r <= 555_000, `fallback deadline ≈ now + 9m15s (got ${Math.round(r / 1000)}s)`);
+});

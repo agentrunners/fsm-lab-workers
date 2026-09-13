@@ -5,11 +5,17 @@
 //   1. read state (via git fetch of the fsm-state branch — read-only)
 //   2. if halted/paused -> exit (chain stopped on purpose)
 //   3. staleness = now - chain.last_tick > stale_after
-//   4. if stale AND no conductor run started recently (in-flight check) ->
-//      re-prime: dispatch fsm-tick (reason: watchdog-reprime)
-//   5. circuit breaker: >= maxReprimes re-primes within the window AND still
-//      stale -> STOP re-priming, open ONE alert issue (dedup: search open
-//      issues for the alert marker first)
+//   4. if stale AND no conductor run in flight -> the latch decision
+//      (lib/watchdog-core.mjs — T45/F-B): the newest 3 watchdog-reprime runs
+//      ALL created after chain.last_tick = N consecutive re-primes with ZERO
+//      chain progress -> LATCHED: stop re-priming, open/refresh ONE alert
+//      issue. Re-arm = ANY applied tick (auto-release — the operator's manual
+//      fsm-tick dispatch, already printed in every alert body; derived state,
+//      nothing persisted). NOT latched -> re-prime.
+//   5. alert comments are 24h-deduped by the newest TRUSTED marker
+//      (lib/watchdog-core.mjs alertDedup — T45/F-D: per_page=20&desc fetch,
+//      newest-marker-by-created_at, author gate {MEMBER,COLLABORATOR,OWNER} ∪
+//      Bot — strangers cannot suppress a live alert).
 //   6. if state.json is corrupt -> alert issue (the conductor self-heals on
 //      its next tick via findLastGoodState; if the chain is dead, the
 //      re-prime dispatch triggers that recovery path)
@@ -18,13 +24,12 @@
 // the primary driver; this is the safety net that catches dead links.
 
 import { Store } from '../lib/store.mjs';
+import { breakerDecision, alertDedup, LATCH_REPRIMES } from '../lib/watchdog-core.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
 const PAT = process.env.LAB_PAT;
 const TOKEN = process.env.GH_TOKEN || PAT; // X1a: job token first, PAT fallback
 const STALE_AFTER_MS = parseInt(process.env.STALE_AFTER_MIN || '4', 10) * 60_000;
-const REPRIME_WINDOW_MIN = 30;
-const MAX_REPRIMES = 3;
 
 async function api(path, method = 'GET', body = null) {
   const r = await fetch(`https://api.github.com${path}`, {
@@ -55,13 +60,16 @@ async function openAlertIssue(body) {
     // T44 rate-limit: comment only if the last marker comment is older than
     // 24h — a corrupt-state chain firing every ~2h scan was commenting the
     // same alert 12x/day (the alert issue itself is already deduped to ONE).
-    // 44-h P2: prefix-match '[fsm-watchdog]' (covers the CIRCUIT-BREAKER
-    // variant too) + DESC order (per_page returns the OLDEST by default —
-    // the newest marker was invisible once the issue exceeded 20 comments).
-    const r = await api(`/repos/${REPO}/issues/${existing.number}/comments?per_page=1&sort=created&direction=desc`, 'GET');
-    const last = (r.data || []).find(c => (c.body || '').includes('[fsm-watchdog]'));
-    if (last && Date.now() - Date.parse(last.created_at) < 24 * 3600_000) {
-      console.log(`WATCHDOG-ALERT-SKIP (recent marker <24h on issue #${existing.number})`);
+    // T45/F-D hardening: fetch per_page=20 (an operator reply being newest no
+    // longer hides the marker) + the dedup decision lives in
+    // lib/watchdog-core.mjs alertDedup — newest TRUSTED marker by created_at
+    // (order-independent; W2-b law-20: sort/direction are ignored server-side)
+    // + the author gate {MEMBER,COLLABORATOR,OWNER} ∪ Bot (strangers cannot
+    // suppress a live alert; the watchdog's own posts pass via type Bot).
+    const r = await api(`/repos/${REPO}/issues/${existing.number}/comments?per_page=20&sort=created&direction=desc`, 'GET');
+    const dedup = alertDedup({ comments: r.data || [], nowMs: Date.now() });
+    if (dedup.skip) {
+      console.log(`WATCHDOG-ALERT-SKIP (recent trusted marker <24h on issue #${existing.number}: age=${dedup.markerAgeMin}min by=${dedup.markerBy})`);
       return existing.number;
     }
     await api(`/repos/${REPO}/issues/${existing.number}/comments`, 'POST', { body });
@@ -75,9 +83,11 @@ async function openAlertIssue(body) {
   return r.data?.number || null;
 }
 
-async function conductorRunsSince(minutes) {
-  const since = new Date(Date.now() - minutes * 60_000).toISOString();
-  const r = await api(`/repos/${REPO}/actions/workflows/conductor.yml/runs?created=>=${since}&per_page=100`);
+// T45/F-B: the newest conductor runs (window-free — the latch is cadence-
+// proof and must see re-primes hours apart; law-20 makes the selection
+// order-independent anyway). per_page=100 bounds the call.
+async function conductorRuns() {
+  const r = await api(`/repos/${REPO}/actions/workflows/conductor.yml/runs?per_page=100`);
   return r.data?.workflow_runs || [];
 }
 
@@ -106,30 +116,34 @@ async function main() {
 
   if (!stale) { console.log('WATCHDOG-DONE mode=healthy'); return; }
 
-  // stale: is a conductor run already in flight? (queue latency, slow tick)
-  // T44: lookback 6min < the conductor job timeout (10min) but benign: the
-  // conductor group is cancel-in-progress:false — an extra re-prime QUEUES
-  // behind the live run rather than cancelling it; worst case it feeds the
-  // breaker count one benign duplicate.
-  const recent = await conductorRunsSince(6);
-  const active = recent.filter(r => ['queued', 'in_progress'].includes(r.status));
-  if (active.length > 0) {
-    console.log(`WATCHDOG-DONE mode=stale-but-inflight (${active.length} run(s) queued/running) — waiting`);
+  // stale: the latch decision (F-B) — ONE runs call covers both the in-flight
+  // guard and the breaker predicate. T44 in-flight note: lookback 6min < the
+  // conductor job timeout (10min) but benign: the conductor group is
+  // cancel-in-progress:false — an extra re-prime QUEUES behind the live run
+  // rather than cancelling it.
+  const runs = await conductorRuns();
+  const decision = breakerDecision({ state, recentRuns: runs, nowMs: Date.now() });
+  if (decision.inflight > 0) {
+    console.log(`WATCHDOG-DONE mode=stale-but-inflight (${decision.inflight} run(s) queued/running) — waiting`);
     return;
   }
 
-  // circuit breaker: count my re-primes in the window (run-name carries the
-  // reason; runs dispatched by the watchdog are named via client_payload)
-  const windowRuns = await conductorRunsSince(REPRIME_WINDOW_MIN);
-  const reprimes = windowRuns.filter(r => (r.name || '').includes('watchdog-reprime'));
-  if (reprimes.length >= MAX_REPRIMES) {
-    const body = `**[fsm-watchdog CIRCUIT-BREAKER]** the chain has been re-primed ${reprimes.length}× in ${REPRIME_WINDOW_MIN}min and is STILL stale (seq=${state.chain.seq}, last_tick=${state.chain.last_tick}).\n\n`
-      + `Re-priming is now DISABLED. Manual intervention required:\n`
+  // the LATCH (F-B): the newest 3 re-primes ALL sit after last_tick — N
+  // consecutive re-primes with zero chain progress. Latched -> do NOT
+  // re-prime; open/refresh the ONE alert issue (24h-deduped comment,
+  // F-D-hardened). Re-arm is ANY applied tick: if the operator's manual
+  // fsm-tick lands, last_tick advances past the re-prime runs and the latch
+  // condition is false on the next scan — re-priming resumes automatically.
+  if (decision.latched) {
+    const body = `**[fsm-watchdog LATCHED]** ${LATCH_REPRIMES} consecutive re-primes with NO chain progress (seq frozen at ${state.chain.seq}, last_tick ${state.chain.last_tick}) — re-priming is DISABLED until a tick lands.\n\n`
+      + `Re-arm (the T43 breaker contract): fix the root cause, then dispatch ONE manual tick:\n`
+      + `POST /repos/${REPO}/dispatches {"event_type":"fsm-tick","client_payload":{"reason":"manual"}}\n\n`
+      + `If that tick lands, the latch releases automatically on the next scan.\n\n`
       + `1. read the last conductor run's log (Actions tab)\n`
       + `2. fix the root cause\n`
-      + `3. re-arm: POST /repos/${REPO}/dispatches {"event_type":"fsm-tick","client_payload":{"reason":"manual"}}`;
+      + `3. dispatch the manual tick above (the re-arm)`;
     const n = await openAlertIssue(body);
-    console.log(`WATCHDOG-DONE mode=breaker-open alert=${n} reprimes=${reprimes.length}`);
+    console.log(`WATCHDOG-DONE mode=latched alert=${n} reprimes=${decision.reprimesTotal} seq=${state.chain.seq} last_tick=${state.chain.last_tick} (re-prime disabled until a tick lands)`);
     return;
   }
 
@@ -145,7 +159,7 @@ async function main() {
       client_payload: { reason: 'watchdog-reprime', stale_seq: state.chain.seq },
     });
   }
-  console.log(`WATCHDOG-REPRIME dispatch=${r.status} (reprime ${reprimes.length + 1}/${MAX_REPRIMES} in window)`);
+  console.log(`WATCHDOG-REPRIME dispatch=${r.status} (recent re-primes=${decision.reprimesTotal}; latch trips at ${LATCH_REPRIMES} with no chain progress)`);
   console.log('WATCHDOG-DONE mode=reprime');
 }
 
