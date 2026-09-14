@@ -518,3 +518,43 @@ test('T45/F-C: makeBudget — the local fallback lane (no RUN_STARTED_AT env: pr
   const r = b.remaining();
   assert.ok(r > 550_000 && r <= 555_000, `fallback deadline ≈ now + 9m15s (got ${Math.round(r / 1000)}s)`);
 });
+
+// ---------------------------------------------------------------------------
+// T45/F-G(c): CONTROL journal records carry actor + note (audit trail).
+
+test('T45/F-G(c): queued pause with note+sender -> the CONTROL journal record carries BOTH; direct control carries the sender; note absence -> null', () => {
+  const clock = makeNow(T0);
+  const base = boot();
+  const out = conductorTick({
+    cur: structuredClone(base),
+    queue: [], controlQueue: [
+      { cmd: 'pause', id: 'ctl-q1', ts: iso(T0), note: 'night hold', sender: 'zikomolapoutl' },
+      { cmd: 'halt', id: 'ctl-q2', ts: iso(T0) },  // no note, no sender (legacy queue shape)
+    ],
+    ev: tickEv('chain'), now: clock.now, nextMilestone: NM,
+    recover: noRecover, makeGenesis,
+  });
+  const pause = out.journal.find(j => j.kind === 'CONTROL' && j.command === 'pause');
+  assert.ok(pause, 'pause CONTROL record present');
+  assert.equal(pause.actor, 'zikomolapoutl', 'the sender is journaled as actor');
+  assert.equal(pause.note, 'night hold', 'the note is journaled');
+  const halt = out.journal.find(j => j.kind === 'CONTROL' && j.command === 'halt');
+  assert.equal(halt.actor, null, 'absent sender -> null (legacy queue records are shape-stable)');
+  assert.equal(halt.note, null, 'absent note -> null');
+  ok(out.state, 'fgc-queued');
+});
+
+test('T45/F-G(c): a DIRECT control wake carries the sender through the router; the reset record journals actor+note', () => {
+  const clock = makeNow(T0);
+  const out = conductorTick({
+    cur: null, queue: [], controlQueue: [],
+    ev: { kind: 'CONTROL', command: 'reset', actor: 'xfnwpho1', note: 'fresh epoch', event_id: 'ctl-direct-1', ts: iso(T0) },
+    now: clock.now, nextMilestone: NM,
+    recover: noRecover, makeGenesis,
+  });
+  const reset = out.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset');
+  assert.ok(reset, 'reset CONTROL record present');
+  assert.equal(reset.actor, 'xfnwpho1', 'the direct reset carries the dispatching sender');
+  assert.equal(reset.note, 'fresh epoch');
+  ok(out.state, 'fgc-direct-reset');
+});

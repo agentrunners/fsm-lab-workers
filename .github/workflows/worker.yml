@@ -11,6 +11,13 @@
 # but silent" (no-report behavior) is a first-class failure class the FSM
 # handles by design — this is the at-least-once contract.
 #
+# T45/F-G(e) — the TTL-kill SIGNATURE (porting contract): a timeout-minutes
+# kill presents as conclusion=CANCELLED (NOT failure) with a step duration ≈
+# timeout-minutes (live datum 34073438112: step 20m03s, cancelled). In-lab
+# the lease/quarantine path is the handler BY DESIGN — the run conclusion is
+# cosmetic; any failure-watch porting this contract must count
+# cancelled-at-TTL as the kill class.
+#
 # T44/X14: 20min >= lease(15, real lane) + report margin. The real-LLM lane
 # runs with lease_minutes=15 (configure control) — mock lane lease is 4min
 # but a generous job TTL costs nothing on a public repo and removes the
@@ -46,5 +53,14 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # T45/F-E: GITHUB_RUN_ID is STABLE across re-runs — only the attempt
+          # increments. The report id is attempt-scoped (rep-<run>-a<attempt>)
+          # so a re-run's report is never dedup-swallowed. GITHUB_RUN_ATTEMPT
+          # IS a default env var, but the mapping keeps the contract explicit.
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          # T45/F-G(a): the mock sleep cap = WORKER_TTL_MIN - 2 (margin so the
+          # report enqueues before the SIGTERM). Keep in sync with
+          # timeout-minutes above.
+          WORKER_TTL_MIN: '20'
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs

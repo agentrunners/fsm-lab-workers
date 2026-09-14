@@ -52,16 +52,22 @@ trigger ─▶ one agent turn ─▶ reply       conductor ─▶ FSM(state) ─
 | Failure class | Detection | Handler | Proven in |
 |---|---|---|---|
 | Worker run dies (CI) | run conclusion=failure | lease deadline → retry/quarantine | sim `dropev`/`crash`; live X4 |
+| Worker TTL kill | conclusion=**cancelled** with a step duration ≈ timeout-minutes (a `timeout-minutes` kill presents as cancelled, NOT failure — run 34073438112: step 20m03s, cancelled). In-lab the lease deadline is the semantic handler BY DESIGN (the run conclusion is cosmetic); any failure-watch PORTING this contract must count cancelled-at-TTL as the kill class | lease deadline → retry/quarantine (same lane as hangs) | live datum 34073438112; F-G(a) makes `slow` report late → the orphan lane is reachable |
+| Worker re-run (operator) | attempt-scoped report id `rep-<run>-a<attempt>` | re-run only workers whose report NEVER enqueued (enqueue failure, infra blip). Once a report is enqueued, the FSM's retry ladder IS the retry mechanism — a re-run cannot improve an outcome: its report lands as a stale-lease ORPHAN (journaled, orphaned_reports+1), visible waste, never silent, never dedup-swallowed | unit T45/F-E (probe2 Shape A re-driven) |
 | Worker hangs | no report by lease expiry | same | sim; live X4 (hang behavior) |
+| Lane unavailable (401/402/429/5xx/transport) | worker reports outcome `infra_failed` | net-zero attempt burn → ready, own budget INFRA_RETRY_MAX=3 → `infra-exhausted` quarantine (DISTINCT from task-poison) + `infra_retries` stat | unit T45/F-F; sim `infra` |
 | Report dispatch dropped | no report by lease expiry | same | sim `dropev`; live X4 |
 | Duplicate report | event_id dedup | second is a no-op, journaled | unit `duplicate`; sim `dup`; live X4 |
 | Stale report (task reassigned) | lease token mismatch | rejected as orphan, counted | unit `stale-lease`; sim `stale`; live X4 |
 | Poison task | attempts ≥ max | quarantined + alert comment | unit `poison`; sim; live X4 |
 | Concurrent state writers | non-FF push reject | CAS retry: re-read + re-apply (dedup absorbs double-apply) | store `CAS` tests; live X3 |
-| state.json corrupted | JSON parse fail | git-history walk → last good snapshot → RECOVERY record forces the commit (quiescence can't suppress repair) → continue | store `corruption` + fault injection; live never corrupted |
+| state.json corrupted | JSON parse fail | git-history walk → last good snapshot → RECOVERY record forces the commit (quiescence can't suppress repair) → continue; the repair SWEEPS rolled-back journal records (ids ≥ snapshot seq) and reconciles journal_seq above the on-branch max id | store `corruption` + fault injection; live never corrupted |
+| Journal rolled back with the state (corrupt-era records on-branch) | duplicate ids / journal_seq ≤ max on-branch id at repair | rollback sweep at repair (KEEP < dropFrom, DROP ≥ dropFrom) + keeps-last rebuild | unit T45/F-A (probe1 shape); probe1 re-run |
 | Conductor dies mid-turn | chain staleness | watchdog re-prime (dispatch tick) | sim `crash`; live X5 |
-| Chain keeps dying | re-prime counter | circuit breaker → alert issue, stop re-priming | live X5 |
-| Runaway chain | (rate cap knob) | tick_min_interval_s + STOP_CHAIN at completion | config |
+| Chain keeps dying | latch: newest 3 re-primes all after chain.last_tick (zero progress) | LATCHED alert, re-priming disabled until any tick lands (auto re-arm = the operator's manual fsm-tick) | unit T45/F-B (probe3A regimes); live X5b |
+| Turn overruns the job TTL | per-turn budget (RUN_STARTED_AT + JOB_TTL_MIN) | DISPATCH-SKIPPED / SELF-TICK-SKIPPED loudly (lease re-covers; watchdog/backstop revives) — never die mid-dispatch | smoke case 5 (tiny-TTL); T45/F-C |
+| Stranger suppresses the alert marker | author-association gate | only MEMBER/COLLABORATOR/OWNER ∪ Bot markers refresh the 24h dedup window | unit T45/F-D |
+| Runaway chain | (rate cap knob) | tick_min_interval_s + STOP_CHAIN at completion; degraded completion (<50% done) halts as `project-degraded` with a distinct alert | config; T45 R2 gate |
 | Everything gone | branch deleted | bootstrap genesis + alert | conductor bootstrap path |
 
 ## Repo layout

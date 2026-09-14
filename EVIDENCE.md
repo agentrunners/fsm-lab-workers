@@ -281,3 +281,15 @@ local gates: 41/41→57/57 tests, sim 7/7, offline conductor smoke
   "dead on fresh repos" revised to "cold-start + sparse". External driving
   remains the production answer; the quiescence fix makes the sparse
   backstops FREE (no commit, no self-dispatch).
+
+### T45/F-G(e) — the worker TTL-kill signature (doc-only, porting contract)
+- A `timeout-minutes` kill presents as conclusion=**cancelled** (NOT failure)
+  with a step duration ≈ timeout-minutes — live datum run 34073438112
+  (step 20m03s, conclusion cancelled, no report). In-lab the lease deadline
+  is the semantic handler BY DESIGN (the run conclusion is cosmetic); the
+  porting contract for any failure-watch: count cancelled-at-TTL as the kill
+  class. No cheap in-run marker exists (the killed process can't log).
+- Companion (F-G(a)): the mock sleep cap is now WORKER_TTL_MIN − 2 (margin),
+  so the `slow` behavior reports LATE (stale-lease orphan) instead of being
+  SIGTERM-killed at the cap — the orphaned-report lane is reachable from the
+  mock lane; first live observation to be noted here (X18).

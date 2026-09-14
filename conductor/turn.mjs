@@ -12,7 +12,7 @@
 // group — single state writer by construction):
 //   repository_dispatch fsm-tick    {client_payload: {reason, seq}}
 //   repository_dispatch fsm-control {client_payload: {command, patch}}
-//   repository_dispatch fsm-report  {client_payload: {event_id, task, ...}} (legacy)
+//   repository_dispatch fsm-report  {client_payload: {event_id, task, ...}} (legacy — no workflow registers this type; the router branch is kept for payload-shape strictness: a write-access direct dispatch of it must still route, not mis-route)
 //   workflow_dispatch (manual tick) / schedule (backstop tick)
 //
 // Turn algorithm (fail-safe ordering — commit BEFORE act):

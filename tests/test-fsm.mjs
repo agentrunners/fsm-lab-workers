@@ -531,15 +531,17 @@ test('T44/F10: invariants catch lease leaks (inactive-with-lease) and duplicate 
   leaked.tasks.A1.status = 'ready';
   leaked.tasks.A1.lease = { token: 'l-leak', expires: step(60000), issued_at: T0 };
   assert.ok(invariants(leaked).some(v => v.includes('inactive-with-lease')));
-  // duplicate token across two active tasks
-  const s2 = boot();
+  // duplicate token across two active tasks — 44-h F10 residual (T45/F-H):
+  // boot with max_parallel 4 so >=2 actives are GUARANTEED (fastProject m1
+  // has 4+ ready) and the assertion is UNCONDITIONAL (the old shape silently
+  // skipped when <2 actives — a test that can not fail proves nothing)
+  const s2 = boot({ max_parallel: 4 });
   const r = apply(s2, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'x' }, T0, NM);
   const dupd = structuredClone(r.state);
   const actives = Object.values(dupd.tasks).filter(t => t.status === 'assigned');
-  if (actives.length >= 2) {
-    dupd.tasks[actives[1].id].lease.token = actives[0].lease.token;
-    assert.ok(invariants(dupd).some(v => v.includes('duplicate-lease-token')));
-  }
+  assert.ok(actives.length >= 2, `max_parallel=4 must assign >=2 tasks (got ${actives.length}) — the F10 assertion is unconditional`);
+  dupd.tasks[actives[1].id].lease.token = actives[0].lease.token;
+  assert.ok(invariants(dupd).some(v => v.includes('duplicate-lease-token')));
 });
 
 test('T44/F8: rebuild parity — the PROJECTION converges across a rich sequence (rejects, timeouts, reset, cascades)', () => {

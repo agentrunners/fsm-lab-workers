@@ -347,6 +347,9 @@ test('T44/F5: rotation is DISJOINT — retained lines are distinct ids, no slidi
     assert.ok(ids.length <= 40, `retention bounded (got ${ids.length})`);
     // per-generation disjointness: no id appears in two gen FILES
     const files = st.listStateFiles().filter(f => /journal-\d+/.test(f));
+    // 44-h F5 residual (T45/F-H): the FILE count is bounded too — keepGens
+    // retained generations (+1 for the in-flight gen at the append boundary)
+    assert.ok(files.length <= st.keepGens + 1, `gen FILE count bounded: keepGens=${st.keepGens} + 1, got ${files.length} (${files.join(',')})`);
     const perGen = files.map(f => {
       const raw = st.readFile(f);
       return raw.split('\n').map(l => l.trim()).filter(Boolean).map(l => JSON.parse(l).id);
@@ -693,5 +696,139 @@ test('T45/F-A: multi-gen STRADDLE — corrupt-era records in the current gen AND
     for (const id of (out.journal || []).map(j => j.id)) assert.ok(ids.includes(id), `repair record ${id} on-branch`);
     const final = st.readState().state;
     assert.ok(final.journal_seq > Math.max(...ids.map(i => parseInt(i.slice(1), 10))));
+  } finally { lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-E: probe2's Shape A re-driven through a REAL drain — a re-run's
+// attempt-scoped report is a stale-lease ORPHAN (journaled, visible), never a
+// dedup swallow (the documented re-run contract).
+
+test('T45/F-E: re-run shape — rep-111-a1{failed} then rep-111-a2{done}: the failed APPLIES (attempt burn), the re-run is a stale-lease REJECT (NOT dedup-swallowed)', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    // assign A1 (one tick)
+    let state = null;
+    st.commit({ mutate: (cur) => {
+      const r = apply(cur, { kind: 'TICK', actor: 'chain', ts: '2026-09-06T10:00:05Z', event_id: 't-a' }, '2026-09-06T10:00:05Z', NM);
+      state = r.state;
+      return { state: r.state, journal: r.journal, message: 'assign' };
+    } });
+    const lease = state.tasks.A1.lease.token;
+    // attempt 1 of run 111: the flaky worker FAILS (work-class — burns the attempt)
+    st.enqueueReport({ event_id: 'rep-111-a1', task: 'A1', lease, outcome: { status: 'failed', error: 'flaky' }, run_id: '111' });
+    // the re-run (attempt 2) reports done with the SAME run id, DIFFERENT attempt
+    st.enqueueReport({ event_id: 'rep-111-a2', task: 'A1', lease, outcome: { status: 'done', artifact: 'better result' }, run_id: '111' });
+    // the drain: the first applies; by the time the second is drained the
+    // failed->retry->reassignment cycle has already minted a NEW lease — the
+    // re-run's report lands as a stale-lease ORPHAN (journaled), never a
+    // dedup swallow (the OLD rep-<run> id shape swallowed it silently).
+    st.commit({ mutate: (cur, queue) => conductorTick({
+      cur, queue, controlQueue: [],
+      ev: { kind: 'TICK', actor: 'chain', event_id: 't-drain', ts: '2026-09-06T10:01:00Z' },
+      now: () => '2026-09-06T10:01:00Z',
+      nextMilestone: NM,
+      recover: null,
+      makeGenesis: () => { throw new Error('no genesis expected'); },
+    }) });
+    st.fetch();
+    const final = st.readState().state;
+    const tail = st.readJournalTail(30);
+    const applied = tail.find(j => j.kind === 'REPORT' && j.task === 'A1');
+    assert.equal(applied.to, 'failed', 'the failed report applied (work-class: failed, then the clock retry-scan requeues it)');
+    const rej = tail.find(j => j.kind === 'REJECTED' && j.event_id === 'rep-111-a2');
+    assert.ok(rej, 'the re-run report was JOURNALED as rejected');
+    assert.equal(rej.reason, 'stale-lease', 'the documented contract: re-run outcome = stale-lease orphan (the FSM retry ladder owns retries)');
+    assert.equal(final.stats.orphaned_reports, 1, 'the visible-waste counter incremented — never silent');
+    assert.equal(final.tasks.A1.status, 'assigned', 'reassigned in the same pass (new lease — the retry ladder)');
+    assert.notEqual(final.tasks.A1.lease.token, lease, 'a NEW lease owns the task now');
+    assert.ok(final.tasks.A1.attempts >= 2, 'the reassignment burned the next REAL attempt (the re-run itself burned nothing — it is not a dedup swallow, it is an orphan)');
+  } finally { lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-G(d): strict queue reads — an EXISTING-but-unreadable queue file
+// throws instead of masquerading as empty (the silent-rewrite kill).
+
+test('T45/F-G(d): FSM_LAB_FAULT_READ_SHOW — an existing-but-unreadable queue THROWS; the branch tip is UNCHANGED', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.commit({ mutate: (cur) => {
+      const r = apply(cur, { kind: 'TICK', actor: 'chain', ts: '2026-09-06T10:00:05Z', event_id: 't-fd' }, '2026-09-06T10:00:05Z', NM);
+      return { state: r.state, journal: r.journal, message: 'tick' };
+    } });
+    st.fetch();
+    // a report lands on the queue (the file now EXISTS on the branch)
+    const enq = st.enqueueReport({ event_id: 'rep-fd-1', task: 'A1', lease: 'tok', outcome: { status: 'done', artifact: 'x' }, run_id: 'r-fd' });
+    assert.equal(enq.ok, true);
+    st.fetch();
+    const before = st.headSha();
+    assert.ok(st.readQueueEx().items.length === 1, 'the queue is readable pre-fault');
+    // the fault seam: git show fails while ls-tree still lists the path
+    process.env.FSM_LAB_FAULT_READ_SHOW = '1';
+    let threw = null;
+    try {
+      st.readQueueEx();
+    } catch (e) { threw = e; }
+    // the enqueue path must THROW too (it reads via readQueueEx)
+    let enqThrew = null;
+    try {
+      st.enqueueReport({ event_id: 'rep-fd-2', task: 'A1', lease: 'tok', outcome: { status: 'done' }, run_id: 'r-fd-2' });
+    } catch (e) { enqThrew = e; }
+    delete process.env.FSM_LAB_FAULT_READ_SHOW;
+    assert.ok(threw, 'readQueueEx must THROW when an existing file reads as damaged');
+    assert.match(threw.message, /readFileStrict: git show failed/);
+    assert.ok(enqThrew, 'enqueueReport must THROW (a silent rewrite would DELETE the queued report)');
+    // the branch survived untouched — the CAS push was never attempted
+    st.fetch();
+    assert.equal(st.headSha(), before, 'branch tip unchanged — no data loss, the failure is VISIBLE');
+    // and the absent-file path still reads as empty (not a throw)
+    assert.equal(st.readFileStrict('state/no-such-file.jsonl'), null, 'an ABSENT path still returns null (bootstrap semantics intact)');
+  } finally { delete process.env.FSM_LAB_FAULT_READ_SHOW; lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// T45/F-G(d2): enqueue merges PRESERVE unparseable lines (G-11 — the last
+// real unaudited-drop surface; only the conductor's drain may drop, journaled).
+
+test('T45/F-G(d2): enqueue onto a queue holding a bad line PRESERVES it; the drain then journals REJECTED(unparseable) and empties', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    const g0 = boot('2026-09-06T10:00:00Z');
+    st.init(g0);
+    // hand-place a queue with ONE unparseable line (the damage shape)
+    plumbCommit(st, {
+      'state/state.json': JSON.stringify(g0, null, 1) + '\n',
+      'state/reports-queue.jsonl': 'THIS LINE IS NOT JSON{{{\n',
+    }, 'damaged queue (one bad line)');
+    st.fetch();
+    // a worker CAS-appends onto the damaged queue
+    const enq = st.enqueueReport({ event_id: 'rep-d2-1', task: 'A1', lease: 'tok', outcome: { status: 'done', artifact: 'ok' }, run_id: 'r-d2' });
+    assert.equal(enq.ok, true);
+    st.fetch();
+    const raw = st.readFile('state/reports-queue.jsonl');
+    const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+    assert.equal(lines.length, 2, `the bad line SURVIVED the merge (got ${lines.length} lines)`);
+    assert.match(lines[0], /THIS LINE IS NOT JSON/, 'the bad line is preserved VERBATIM ahead of the new record');
+    assert.match(lines[1], /rep-d2-1/);
+    // the full discipline end-to-end: the conductor's drain journals the bad
+    // line REJECTED(unparseable) and empties the queue (the ONLY drop path)
+    st.commit({ mutate: (cur, queue, controlQueue, queueBad) => conductorTick({
+      cur, queue, controlQueue, queueBad,
+      ev: { kind: 'TICK', actor: 'chain', event_id: 't-d2', ts: '2026-09-06T10:01:00Z' },
+      now: () => '2026-09-06T10:01:00Z',
+      nextMilestone: NM,
+      recover: null,
+      makeGenesis: () => { throw new Error('no genesis expected'); },
+    }) });
+    st.fetch();
+    const tail = st.readJournalTail(30);
+    const rej = tail.find(j => j.kind === 'REJECTED' && j.reason === 'unparseable');
+    assert.ok(rej, 'the drain JOURNALED the bad line as REJECTED(unparseable)');
+    assert.match(rej.raw, /THIS LINE IS NOT JSON/);
+    assert.equal(st.readQueueEx().items.length, 0, 'the drain emptied the queue (the only sanctioned drop)');
+    assert.equal(st.readQueueEx().bad.length, 0);
   } finally { lab.cleanup(); }
 });

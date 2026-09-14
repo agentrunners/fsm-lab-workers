@@ -72,6 +72,10 @@ async function main() {
     cmd: cp.command,
     patch: cp.patch,
     note: cp.note || '',
+    // T45/F-G(c): the SENDER rides the queue record — the CONTROL journal
+    // record carries it as `actor` (audit-only; the ops WRITE gate stays
+    // GitHub's write-access model)
+    sender: EVENT.sender?.login || null,
     ts: new Date().toISOString(),
     id: `ctl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   };
