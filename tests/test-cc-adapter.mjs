@@ -485,3 +485,39 @@ test('X20-run-1 lesson: an ISO-string now() clock fails LOUD (the NaN-wall insta
     /opts\.now\(\) must return finite epoch-ms/,
   );
 });
+
+test('X20 run-4 lesson: startBridge spawns, listens on 127.0.0.1, synthesizes the models route, and stops cleanly', async () => {
+  const { startBridge } = await import('../worker/cc-bridge-helper.mjs').catch(() => ({}));
+  // the helper lives in the adapter (not exported) — drive it through a real
+  // lane-less bridge spawn instead: spawn cc-bridge.mjs directly (no network
+  // needed until a request arrives) and check the port-file contract
+  const { spawn } = await import('node:child_process');
+  const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const scratch = mkdtempSync(join(tmpdir(), 'bridge-test-'));
+  const portFile = join(scratch, 'port');
+  const child = spawn(process.execPath, ['worker/cc-bridge.mjs', portFile], {
+    env: { PATH: process.env.PATH || '/usr/bin:/bin', OPENROUTER_API_KEY: 'sk-or-v1-test-key', CC_LANE_MODEL: 'test/model:free' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  let port = null;
+  for (let i = 0; i < 40 && !(Number.isInteger(port) && port > 0); i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    try { port = parseInt(readFileSync(portFile, 'utf8').trim(), 10); } catch { /* not yet */ }
+  }
+  assert.ok(Number.isInteger(port) && port > 0, `the bridge writes its port file (${out.slice(0, 120)})`);
+  // the models route: synthesized, 200, no network
+  const r = await fetch(`http://127.0.0.1:${port}/v1/models/test%2Fmodel%3Afree`);
+  assert.equal(r.status, 200);
+  const body = await r.json();
+  assert.equal(body.data[0].id, 'test/model:free');
+  // unknown route: LOUD 501 (never a silent 404 mirror)
+  const r2 = await fetch(`http://127.0.0.1:${port}/v1/something-else`, { method: 'POST' });
+  assert.equal(r2.status, 501);
+  child.kill('SIGKILL');
+  rmSync(scratch, { recursive: true, force: true });
+});

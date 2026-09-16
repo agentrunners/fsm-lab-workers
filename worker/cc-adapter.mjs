@@ -81,7 +81,7 @@
 // {key_index, model, rc, duration_ms, class}, models tried, real duration.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, statSync, copyFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -177,8 +177,7 @@ const TRANSPORT_STDERR_RE = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRES
 const CC_BRIDGE_PATH = fileURLToPath(new URL('./cc-bridge.mjs', import.meta.url));
 
 async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
-  const { mkdtempSync: mkd, readFileSync: rdf, rmSync: rm } = await import('node:fs');
-  const scratch = mkdtemp(join(tmpdir(), 'cc-bridge-'));
+  const scratch = mkdtempSync(join(tmpdir(), 'cc-bridge-'));
   const portFile = join(scratch, 'port');
   const child = spawn(process.execPath, [CC_BRIDGE_PATH, portFile], {
     env: {
@@ -196,13 +195,13 @@ async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
   const t0 = Date.now();
   let port = null;
   while (Date.now() - t0 < timeoutMs) {
-    try { port = parseInt(rdf(portFile, 'utf8').trim(), 10); } catch { /* not yet */ }
+    try { port = parseInt(readFileSync(portFile, 'utf8').trim(), 10); } catch { /* not yet */ }
     if (Number.isInteger(port) && port > 0) break;
     await new Promise((r) => setTimeout(r, 50));
   }
   if (!(Number.isInteger(port) && port > 0)) {
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
-    rm(scratch, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
     throw new Error(`bridge did not listen in ${timeoutMs}ms (${output.split('\n').filter(Boolean).slice(0, 2).join(' | ').slice(0, 120)})`);
   }
   log(`CC-BRIDGE-UP 127.0.0.1:${port} (model ${lane.model}, key ${lane.keyIndex})`);
@@ -210,7 +209,7 @@ async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
     url: `http://127.0.0.1:${port}`,
     stop() {
       try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
-      rm(scratch, { recursive: true, force: true });
+      rmSync(scratch, { recursive: true, force: true });
     },
   };
 }
@@ -370,7 +369,7 @@ function pushSessionsBranch({ env, files, log }) {
       mkdirSync(dirname(join(wc, rel)), { recursive: true });
       writeFileSync(join(wc, rel), content);
     }
-    const add = git(['add', ...files.map(([rel]) => rel)]);
+    const add = git(['add', ...[...files.keys()]]);
     if (add.status !== 0) throw fail('git add', add);
     const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
       'commit', '-m', 'transcript: sessions update']);
