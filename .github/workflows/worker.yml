@@ -97,5 +97,9 @@ jobs:
           OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
           CC_MODEL: ${{ vars.CC_MODEL || '' }}
           CC_VERSION: ${{ vars.CC_VERSION || '' }}
+          # T46/W4: the CC adapter's transcript push (fsm-sessions branch) —
+          # the job token (X20 run-1 finding: without it the turn reports
+          # infra 'transcript-push-failed')
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs

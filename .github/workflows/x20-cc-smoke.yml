@@ -40,7 +40,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'   # claude-code 2.1.273 requires >=22 (X20 run 1: EBADENGINE on node 20)
 
       - name: Install the pinned claude-code CLI (timed)
         id: install
@@ -58,6 +58,8 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           CC_MODEL: ${{ vars.CC_MODEL }}
           X20_PROMPT: ${{ inputs.prompt }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}              # the transcript push (fsm-sessions branch)
+          GITHUB_REPOSITORY: ${{ github.repository }}
           # CC_FAKE_LLM intentionally UNSET — the real lane; this run IS the
           # measurement (tests always run fake; this is the one real turn)
         run: |
@@ -74,7 +76,10 @@ jobs:
               budget: { max_turns: 4, wall_ms: 8 * 60_000, lane_attempts: 3 },
               mode: "cc", attempt: 1,
             };
-            const r = await ccTurn(envelope, { runId: "x20-local", now: () => new Date().toISOString() });
+            // NOTE: opts.now is UNSET — the adapter default (Date.now, epoch-ms).
+            // X20 run 1 passed an ISO-string clock: the wall went NaN and the
+            // group died in 50ms (now guarded loud in the adapter).
+            const r = await ccTurn(envelope, { runId: "x20-local" });
             console.log("X20-RESULT " + JSON.stringify(r, null, 1));
             if (r.status !== "done") process.exit(4);
           '

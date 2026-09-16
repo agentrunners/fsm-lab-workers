@@ -468,3 +468,10 @@ test('cc determinism: same fixture → byte-identical outcome surface (timings e
   assert.equal(pick(a.result), pick(b.result), 'the outcome surface is a pure function of (envelope, fixture)');
   a.roots.cleanup(); b.roots.cleanup();
 });
+
+test('X20-run-1 lesson: an ISO-string now() clock fails LOUD (the NaN-wall instant-kill class)', async () => {
+  await assert.rejects(
+    () => ccTurn(envelope(), { env: fakeEnv(), runId: 'iso-clock', now: () => new Date().toISOString() }),
+    /opts\.now\(\) must return finite epoch-ms/,
+  );
+});
