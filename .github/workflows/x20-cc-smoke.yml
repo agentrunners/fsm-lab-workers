@@ -1,0 +1,86 @@
+# x20-cc-smoke — the T46/X20 CC-ceiling probe (F-M5: feature-branch dispatch).
+#
+# A THROWAWAY measurement surface, NOT part of the FSM: manual dispatch ONLY
+# (no push/schedule triggers), meant to run ON THE FEATURE BRANCH
+# (workflow_dispatch with ref=t46/wb-4 — repository_dispatch would resolve
+# from the default branch only, which is exactly why this is a
+# workflow_dispatch). Measures the LOWER BOUND of the GHA CC ceiling:
+#   - claude-code CLI install time on a stock ubuntu runner
+#   - ONE adapter turn through the REAL OpenRouter free lane
+#   - the quota/latency readback
+# Kill-F9 label: the free lane's numbers are a LOWER BOUND on capability
+# (rate-limited, best-effort models) — the ceiling claim must say so.
+#
+# Secrets needed (fsm-lab repo): OPENROUTER_API_KEY (primary lane).
+# Optional vars: CC_MODEL (model slug; default dots-studio free), CC_VERSION
+# (CLI pin; default latest).
+name: x20-cc-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'the one-turn prompt (default: a trivial echo task)'
+        required: false
+        default: 'Reply with exactly: X20-SMOKE-OK and nothing else.'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: x20-cc-smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install the pinned claude-code CLI (timed)
+        id: install
+        run: |
+          t0=$(date +%s)
+          npm install -g @anthropic-ai/claude-code@${CC_VERSION:-latest}
+          t1=$(date +%s)
+          echo "install_s=$((t1-t0))s" >> "$GITHUB_OUTPUT"
+          claude --version || true
+        env:
+          CC_VERSION: ${{ vars.CC_VERSION }}
+
+      - name: One adapter turn through the REAL free lane (timed)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CC_MODEL: ${{ vars.CC_MODEL }}
+          X20_PROMPT: ${{ inputs.prompt }}
+          # CC_FAKE_LLM intentionally UNSET — the real lane; this run IS the
+          # measurement (tests always run fake; this is the one real turn)
+        run: |
+          t0=$(date +%s)
+          node --input-type=module -e '
+            import { ccTurn } from "./worker/cc-adapter.mjs";
+            const prompt = process.env.X20_PROMPT;
+            const deadline = Date.now() + 8 * 60_000;   // 8min wall for the probe
+            const envelope = {
+              task_ref: { kind: "state-task", id: "x20-smoke" },
+              prompt,
+              deadline_ms: deadline,
+              session: "x20/smoke/local-a1",
+              budget: { max_turns: 4, wall_ms: 8 * 60_000, lane_attempts: 3 },
+              mode: "cc", attempt: 1,
+            };
+            const r = await ccTurn(envelope, { runId: "x20-local", now: () => new Date().toISOString() });
+            console.log("X20-RESULT " + JSON.stringify(r, null, 1));
+            if (r.status !== "done") process.exit(4);
+          '
+          t1=$(date +%s)
+          echo "turn_s=$((t1-t0))s"
+
+      - name: The readback (quota/latency tails from the adapter telemetry)
+        if: always()
+        run: echo "install_s from step 1; turn telemetry is in the X20-RESULT JSON above (per-lane durations, lane attempts, model, rc)."
