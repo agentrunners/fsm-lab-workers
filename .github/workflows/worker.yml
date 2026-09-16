@@ -1,10 +1,25 @@
 # fsm-worker — the agent seat. One run = one task attempt.
 #
-# Receives {task, lease, behavior, attempt, work_ms, mode} via fsm-task dispatch.
+# Receives the turn envelope via fsm-task dispatch (client_payload). T46/W-B
+# §1c MODE routing (worker/turn.mjs):
+#   mode=mock (default) — the deterministic harness shim (sim/harness-shim.mjs):
+#     CP.behavior drives the seeded behavior set (fast/slow/poison/infra-flaky/
+#     deadline/hang/dup-report/wb-violation + the legacy vocabulary as aliases).
+#   mode=real — one OpenRouter completion on the env-driven model chain
+#     (OPENROUTER_MODEL, then the free defaults) with one fallback hop on
+#     infra-class failure, bounded by budget.lane_attempts.
+#   mode=cc — the CC adapter (W4); until it ships the turn reports
+#     infra_failed 'cc-adapter-missing'.
+# EVERY mode passes the LAW-1 START-GATE first (envelopeFromDispatch): an
+# already-expired deadline → one infra_failed 'late-start' report, exit 0 —
+# the lease is never burned on a guaranteed orphan.
+#
 # NEVER writes state and NEVER dispatches — it reports by CAS-appending a
 # line to state/reports-queue.jsonl (data through git; the tick drains it
 # atomically). The lease token in the report is the validity claim:
 # stale/duplicate reports are absorbed by the conductor (orphan/dedup).
+# If the enqueue itself fails (after retry), the payload is written to the
+# run's step summary (the visible-waste lane) and the run exits 2.
 #
 # TTL wall: timeout-minutes kills hangs; the CONDUCTOR's lease deadline is
 # the semantic backstop (retry / quarantine). The job dying "successfully
@@ -62,5 +77,11 @@ jobs:
           # report enqueues before the SIGTERM). Keep in sync with
           # timeout-minutes above.
           WORKER_TTL_MIN: '20'
+          # T46/W-B §1c: MODE=real model chain head (OPTIONAL repo variable —
+          # empty/absent = the free-lane defaults in worker/turn.mjs; the
+          # chain is [this, dots-studio/dots-3-note-preview:free,
+          # nvidia/nemotron-3-ultra-550b-a55b:free, cohere/north-mini-code:free]
+          # with ONE fallback hop on infra-class failure).
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || '' }}
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs
