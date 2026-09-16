@@ -139,9 +139,10 @@ test('unified reset (direct dispatch): queued reports drain AFTER the reset — 
   const resetRec = out.journal[0];
   assert.equal(resetRec.kind, 'CONTROL');
   assert.equal(resetRec.command, 'reset');
-  // the SLIM genesis spec (rebuild() replays it)
+  // the SLIM genesis spec (rebuild() replays it) — T46/W2: + mode (the epoch
+  // mode rides the spec for rebuild parity; legacy specs default 'mock')
   const spec = resetRec.genesisSpec;
-  assert.deepEqual(Object.keys(spec).sort(), ['chainId', 'config', 'journal_seq', 'milestones', 'now', 'tasks']);
+  assert.deepEqual(Object.keys(spec).sort(), ['chainId', 'config', 'journal_seq', 'milestones', 'mode', 'now', 'tasks']);
   assert.deepEqual(spec.tasks, fastProject().m1);
   assert.equal(spec.milestones, 2);
   assert.equal(spec.journal_seq, s.journal_seq);

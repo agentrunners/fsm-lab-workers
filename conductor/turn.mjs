@@ -31,7 +31,10 @@
 import { Store } from '../lib/store.mjs';
 import { genesis } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
-import { conductorTick, makeBudget } from '../lib/conductor-core.mjs';
+import {
+  conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
+  pacingFloorDecision, VERIFY_WINDOW_MS,
+} from '../lib/conductor-core.mjs';
 import { buildEvent } from '../lib/event-ingest.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
@@ -152,12 +155,18 @@ async function main() {
   // The mutate closure is the one-liner: the ALGORITHM is lib/conductor-core's
   // conductorTick; the injected closures keep the store I/O here (F15).
   const DEFAULT_CFG = () => ({ max_parallel: 4, lease_minutes: 4, max_attempts: 3, tick_min_interval_s: 25 });
+  // T46/W2 (F-B2 conductor half): the epoch MODE — cold-start genesis and
+  // every reset mint project.mode from this env (operator-switched: the X21
+  // synthetic CC epoch = set EPOCH_MODE=cc + reset; the default stays mock).
+  // genesis() validates it (GENESIS_MODES); a bad value fails the genesis —
+  // loud, never a silent wrong-mode epoch.
+  const EPOCH_MODE = process.env.EPOCH_MODE || 'mock';
   const makeGenesis = ({ config } = {}) => {
     const cfg = config || DEFAULT_CFG();
     const mp = mockProject();
     const chainId = `c-${Date.now()}`;
-    const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now() });
-    return { state: g, spec: { tasks: mp.m1, milestones: 3, chainId } };
+    const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now(), mode: EPOCH_MODE });
+    return { state: g, spec: { tasks: mp.m1, milestones: 3, chainId, mode: g.project.mode } };
   };
   const recover = () => {
     // F-A (T45): the repair contract — walk history for the last parseable
@@ -185,10 +194,44 @@ async function main() {
     // bootstrap: the state branch is fresh/empty).
     return Number.isFinite(journalMaxId) ? { state: null, reason: 'bootstrap', journalMaxId } : null;
   };
+  // T46/W2 (law-4): the runs fetch is guarded — one API call ONLY when some
+  // task's lease has aged past the pre-window (360s), else zero cost on
+  // quiet ticks. The fetch is PRE-COMMIT (the mutate stays I/O-free); a
+  // stale peek fails OPEN (no flip, the reaper backstops — same doc as the
+  // quiet guard). Matching key: worker.yml's run-name
+  // `task-<id> · <behavior> · a<attempt>` → `${taskId}#a${attempt}`.
+  let seenDispatchKeys = null;
+  let verifyNowMs = null;
+  {
+    store.fetch();
+    const peek = store.readState();
+    const st = peek && peek.state;
+    const preWindowMs = VERIFY_WINDOW_MS / 2;
+    const needsScan = !!(st && st.tasks && Object.values(st.tasks).some(t =>
+      (t.status === 'assigned' || t.status === 'in_progress') && t.lease
+      && Number.isFinite(Date.parse(t.lease.issued_at || ''))
+      && (Date.now() - Date.parse(t.lease.issued_at)) > preWindowMs));
+    if (needsScan) {
+      const rr = await api(`/repos/${REPO}/actions/workflows/worker.yml/runs?per_page=20`);
+      if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
+        const keys = new Set();
+        for (const run of rr.data.workflow_runs) {
+          const m = /^task-(.+?) · .+? · a(\d+)$/.exec(run.name || '');
+          if (m) keys.add(`${m[1]}#a${m[2]}`);
+        }
+        seenDispatchKeys = keys;
+        verifyNowMs = Date.now();
+        console.log(`VERIFY-SCAN runs=${rr.data.workflow_runs.length} keys=${keys.size} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
+      } else {
+        console.log(`VERIFY-SCAN-SKIPPED runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
+      }
+    }
+  }
   const out = await Promise.resolve(store.commit({
     mutate: (cur, queue, controlQueue, queueBad, ctlBad) => conductorTick({
       cur, queue, controlQueue, queueBad, ctlBad, ev, now,
       nextMilestone: NM, recover, makeGenesis,
+      seenDispatchKeys, verifyNowMs,
     }),
   }));
 
@@ -205,9 +248,36 @@ async function main() {
   // 4. execute actions (workers first — parallelism starts ASAP)
   let dispatchFailures = 0;
   let dispatchSkipped = 0;   // F-C: budget-exhausted skips (lease re-covers — loud, not fatal)
+  let dispatchPaced = 0;     // T46/W2 (F-M2): pacing-floor skips (long-lease epochs only)
   const actionList = out.actions || [];
+  // T46/W2 (F-B2): the brief rides every dispatch AS QUOTED DATA; the mode
+  // comes from the epoch (state.project.mode — W1's genesis field). Read
+  // ONCE per turn; absent brief omits cleanly.
+  let briefMd = null;
+  try {
+    const fsMod = await import('node:fs');
+    briefMd = fsMod.default.readFileSync('briefs/project.md', 'utf8');
+  } catch { /* absent brief — the envelope omits it cleanly */ }
+  const epochMode = state.project?.mode || 'mock';
+  const floorS = parseInt(process.env.PACING_FLOOR_S || '300', 10);
+  let lastDispatchMs = NaN;
+  let dispatchIndex = 0;
   for (const a of actionList) {
     if (a.type === 'DISPATCH_WORKER') {
+      // T46/W2 (F-M2): the lease-aware pacing floor — only long-lease
+      // epochs (lease_minutes ≥ 7); a skip is LOUD (the task re-covers next
+      // tick — same doc as F-C's budget skip).
+      const floor = pacingFloorDecision({
+        leaseMinutes: state.config.lease_minutes,
+        floorS, lastDispatchMs, nowMs: Date.now(),
+        isFirstDispatchOfTurn: dispatchIndex === 0,
+      });
+      if (floor.applies) {
+        console.log(`DISPATCH-PACED task=${a.task} floor=${floorS}s elapsed=${Math.round((Date.now() - lastDispatchMs) / 1000)}s (lease_minutes=${state.config.lease_minutes} ≥ 7 — long-lease epoch) — re-covers next tick`);
+        dispatchPaced++;
+        continue;
+      }
+      dispatchIndex++;
       // F-C (R3 D1-M2, hardened): the reserve is carved out FIRST — the
       // worker ladder's budget is what remains AFTER the heartbeat window is
       // reserved, so no Retry-After ladder can starve the self-tick.
@@ -220,12 +290,19 @@ async function main() {
         dispatchSkipped++;
         break;
       }
-      const d = await dispatchRetry('fsm-task', {
-        task: a.task, lease: a.lease, behavior: a.behavior,
-        attempt: a.attempt, work_ms: a.work_ms, expires: a.expires,
-        chain: state.chain.id,
-      }, { budgetMs: workerBudgetMs });
-      if (!d.ok) dispatchFailures++;
+      // T46/W2 (F-B2): the envelope payload — SUPERSET of the legacy shape
+      // (old workers ignore the extras; new workers route through
+      // envelopeFromDispatch). prompt carries the brief AS QUOTED DATA;
+      // deadline_ms is minted HERE (absolute, queue-delay-proof).
+      const payload = assembleDispatchPayload(
+        { ...a, chain: state.chain.id },
+        state.tasks[a.task] || null,
+        briefMd,
+        { nowMs: Date.now(), mode: epochMode },
+      );
+      const d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
+      if (d.ok) lastDispatchMs = Date.now();
+      else dispatchFailures++;
     }
     if (a.type === 'BOOTSTRAP_NOTICE') {
       await postIssueComment(`**[fsm]** BOOTSTRAP: fresh genesis committed (state branch was absent or its history was unreadable — if this is unexpected, the previous state was LOST; check the repo's branch protection and recent pushes).`);
@@ -291,7 +368,7 @@ async function main() {
   }
   // summary + compact log line
   const fs = await import('node:fs');
-  const appliedReason = `${out.reason || 'ok'}${dispatchFailures ? ` dispatchFailures=${dispatchFailures}` : ''}${dispatchSkipped ? ` dispatchSkipped=${dispatchSkipped}` : ''}${selfTickSkipped ? ' selfTick=skipped' : ''}`;
+  const appliedReason = `${out.reason || 'ok'}${dispatchFailures ? ` dispatchFailures=${dispatchFailures}` : ''}${dispatchSkipped ? ` dispatchSkipped=${dispatchSkipped}` : ''}${dispatchPaced ? ` dispatchPaced=${dispatchPaced}` : ''}${selfTickSkipped ? ' selfTick=skipped' : ''}`;
   fs.default.appendFileSync(process.env.GITHUB_STEP_SUMMARY || '/dev/null',
     summaryMd(state, true, appliedReason, actionList) + '\n');
   console.log(`TURN-COMPLETE applied=true reason=${appliedReason} v=${state.version} seq=${state.chain.seq} `
