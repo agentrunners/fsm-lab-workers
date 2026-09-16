@@ -499,3 +499,27 @@ test('mint: two same-real-ms wakes mint DISTINCT ids from the injected clock (th
   assert.notEqual(e1.event_id, e2.event_id, 'same real-ms wakes must not collide');
   assert.equal(e2.event_id, `tick-r-${NOW + 1000}`);
 });
+
+test('X21 live finding: the ox unwrap — a valid ox rides the envelope; corrupt shapes fail closed; absent ox falls through', () => {
+  // valid: the ox envelope wins over top-level derivations
+  const cp = { task: 'T-9', attempt: 1, lease: 'l', behavior: 'succeed', work_ms: 1, expires: new Date(Date.now() + 600_000).toISOString(), chain: 'c',
+    ox: JSON.stringify({ task_ref: { kind: 'state-task', id: 'T-9' }, prompt: 'the real prompt', deadline_ms: Date.now() + 300_000, session: 'c/T-9/r-a1', budget: { max_turns: 5, wall_ms: 240_000, lane_attempts: 2 }, mode: 'cc', attempt: 1 }) };
+  const r = envelopeFromDispatch(cp, Date.now());
+  assert.ok(r.ok, `valid ox unwraps (got ${JSON.stringify(r).slice(0, 120)})`);
+  assert.equal(r.envelope.prompt, 'the real prompt');
+  assert.equal(r.envelope.mode, 'cc');
+  assert.equal(r.envelope.budget.lane_attempts, 2);
+  // corrupt: not JSON
+  const bad1 = envelopeFromDispatch({ ...cp, ox: '{nope' }, Date.now());
+  assert.ok(!bad1.ok && bad1.reason === 'bad-envelope');
+  // corrupt: decodes to a non-object
+  const bad2 = envelopeFromDispatch({ ...cp, ox: '"just a string"' }, Date.now());
+  assert.ok(!bad2.ok && bad2.reason === 'bad-envelope');
+  // corrupt: non-string ox
+  const bad3 = envelopeFromDispatch({ ...cp, ox: { nested: true } }, Date.now());
+  assert.ok(!bad3.ok && bad3.reason === 'bad-envelope');
+  // absent: the legacy path still works
+  const legacy = envelopeFromDispatch({ task: 'T-9', attempt: 1, lease: 'l', behavior: 'succeed', work_ms: 1, expires: new Date(Date.now() + 600_000).toISOString(), chain: 'c' }, Date.now());
+  assert.ok(legacy.ok);
+  assert.equal(legacy.envelope.mode, 'mock');
+});

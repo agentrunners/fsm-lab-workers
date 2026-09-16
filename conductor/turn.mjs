@@ -302,7 +302,13 @@ async function main() {
       );
       const d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
       if (d.ok) lastDispatchMs = Date.now();
-      else dispatchFailures++;
+      else {
+        // X21 lesson: 4 dispatchFailures with ZERO logged detail (the 422
+        // 10-property limit took a whole debugging round to find) — the
+        // failure's STATUS + body slice are always visible now
+        dispatchFailures++;
+        console.log(`DISPATCH-FAILED task=${a.task} HTTP=${d.status ?? 'none'} body=${String(JSON.stringify(d.body) ?? '').slice(0, 200)}`);
+      }
     }
     if (a.type === 'BOOTSTRAP_NOTICE') {
       await postIssueComment(`**[fsm]** BOOTSTRAP: fresh genesis committed (state branch was absent or its history was unreadable — if this is unexpected, the previous state was LOST; check the repo's branch protection and recent pushes).`);
