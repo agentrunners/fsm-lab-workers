@@ -69,6 +69,10 @@ jobs:
           # process start locally).
           RUN_STARTED_AT: ${{ github.run_started_at }}
           JOB_TTL_MIN: '10'  # T45/F-C: keep in sync with timeout-minutes above
+          # T46/W2 (F-B2): the epoch MODE — repo variable EPOCH_MODE (mock
+          # default; 'cc' for the X21 synthetic epoch; 'real' the raw lane).
+          # genesis validates; a bad value fails the genesis LOUD.
+          EPOCH_MODE: ${{ vars.EPOCH_MODE || 'mock' }}
           EVENT: ${{ toJSON(github.event) }}
           OPS_ISSUE: '1'
         run: node conductor/turn.mjs
