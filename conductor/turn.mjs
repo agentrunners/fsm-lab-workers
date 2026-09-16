@@ -259,7 +259,7 @@ async function main() {
     briefMd = fsMod.default.readFileSync('briefs/project.md', 'utf8');
   } catch { /* absent brief — the envelope omits it cleanly */ }
   const epochMode = state.project?.mode || 'mock';
-  const floorS = parseInt(process.env.PACING_FLOOR_S || '300', 10);
+  const floorS = parseInt(process.env.PACING_FLOOR_S || '0', 10);   // X21: default OFF (the skip-left-assigned bug — see conductor-core)
   let lastDispatchMs = NaN;
   let dispatchIndex = 0;
   for (const a of actionList) {
