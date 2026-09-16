@@ -504,8 +504,13 @@ test('routing: W2 near-expired lease — deadline minted in the past BY DESIGN (
 });
 
 test('routing: W2 payload with mode=cc — the envelope budget bounds the lane chain (lane_attempts rides the dispatch into the adapter)', async () => {
+  // the fixture marker rides the OX envelope (the X21 10-property shape:
+  // the envelope wins over top-level fields at the gate)
+  const base = w2Payload({}, { mode: 'cc' });
+  const ox = JSON.parse(base.ox);
+  ox.prompt = '[fixture:429] always-rate-limited';
   const h = makeHarness({
-    cp: { ...w2Payload({}, { mode: 'cc' }), prompt: '[fixture:429] always-rate-limited' },
+    cp: { ...base, ox: JSON.stringify(ox) },
     env: ccEnv(),
   });
   await h.turn();

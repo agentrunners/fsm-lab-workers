@@ -517,7 +517,7 @@ function scenarioMatrix() {
   });
   p('the W2 envelope rode every dispatch (prompt+brief/deadline_ms/mode/session/budget)',
     badPayload.length === 0 && d.dispatches.length > 10
-    && d.dispatches.every(x => x.payload.prompt.includes('<<<PROJECT-BRIEF')),
+    && d.dispatches.every(x => String(x.payload.ox || '').includes('<<<PROJECT-BRIEF')),
     `dispatches=${d.dispatches.length} bad=${badPayload.length}`);
 
   // law-4 never fired in the matrix (every materialized run was seen)
