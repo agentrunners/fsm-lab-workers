@@ -384,7 +384,14 @@ export async function ccTurn(envelope, opts = {}) {
   };
 
   const fake = env.CC_FAKE_LLM === '1';
+  // the wall arithmetic depends on now() returning EPOCH-MS — an ISO-string
+  // clock (a caller mistake seen live in X20's first dispatch: setTimeout(NaN)
+  // fires instantly = the silent instant-kill class) fails LOUD here, the
+  // same contract the envelope deadline guard enforces.
   const t0 = now();
+  if (typeof t0 !== 'number' || !Number.isFinite(t0)) {
+    throw new Error(`ccTurn: opts.now() must return finite epoch-ms (got ${typeof t0}: ${String(t0).slice(0, 40)}) — the wall timers depend on it`);
+  }
   // the wall: the lease deadline AND the turn's own wall budget, whichever
   // bites first (the ABSOLUTE deadline still gates — F-G(a) arithmetic)
   const wallDeadlineMs = Math.min(envelope.deadline_ms, t0 + budget.wall_ms);
