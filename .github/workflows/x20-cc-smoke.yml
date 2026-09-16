@@ -81,7 +81,10 @@ jobs:
             // group died in 50ms (now guarded loud in the adapter).
             const r = await ccTurn(envelope, { runId: "x20-local" });
             console.log("X20-RESULT " + JSON.stringify(r, null, 1));
-            if (r.status !== "done") process.exit(4);
+            // the adapter returns the RAW-EXTRACTION shape for done lanes
+            // (content/reasoning — classification is runTurn's single call,
+            // by design); the smoke's gate checks the content marker
+            if (!String(r.content || "").includes("X20-SMOKE-OK")) process.exit(4);
           '
           t1=$(date +%s)
           echo "turn_s=$((t1-t0))s"
