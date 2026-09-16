@@ -64,7 +64,7 @@ permissions:
 jobs:
   work:
     runs-on: ubuntu-latest
-    timeout-minutes: 20   # >= real-lane lease (15) + report margin (X14)
+    timeout-minutes: 50   # T46/X21: the wall can be lease-2min (45-lease epochs); was 20 (the 15-lease era)
     steps:
       - uses: actions/checkout@v4
 
