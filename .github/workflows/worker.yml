@@ -93,7 +93,7 @@ jobs:
           # T45/F-G(a): the mock sleep cap = WORKER_TTL_MIN - 2 (margin so the
           # report enqueues before the SIGTERM). Keep in sync with
           # timeout-minutes above.
-          WORKER_TTL_MIN: '20'
+          WORKER_TTL_MIN: '50'
           # T46/W-B §1c: MODE=real model chain head (OPTIONAL repo variable —
           # empty/absent = the free-lane defaults in worker/turn.mjs; the
           # chain is [this, dots-studio/dots-3-note-preview:free,
