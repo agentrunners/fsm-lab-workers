@@ -293,3 +293,18 @@ local gates: 41/41→57/57 tests, sim 7/7, offline conductor smoke
   so the `slow` behavior reports LATE (stale-lease orphan) instead of being
   SIGTERM-killed at the cap — the orphaned-report lane is reachable from the
   mock lane; first live observation to be noted here (X18).
+
+## X19 — the alert-lane end-to-end proof (2026-09-15, session 15/16)
+The executor's mirror-health duty opened latch issue #3 on fsm-lab (`duty alert: mirror-health`, 04:22:44Z, run 34928576456 — 16s after the duty ran) after the A2 repair (exec-duty-lib retarget + curl POST lane + numeric guards; commits d92d82b/b7ec174/cf8201f). Zero wake collisions (fsm-lab is schedule/dispatch-only). The 410-dead-target / error-body-as-issue-number / canary-scope triple bug class closed with regression shapes.
+
+## X15 — garbage-state recovery (2026-09-15)
+Probe1-shape corruption (torn state.json + unapplied-era records, commit c3a3888) → the conductor's findLastGoodState walk landed 7af0c02 `TICK seq=154 v65 done=15 RECOVERED`. G-15 closed.
+
+## X16/X17/X18 — the T45 fix-wave drills (2026-09-16, runs 35044234419/35044369441/35044420601/35044483639 + 34947001617)
+X16: corrupt-state → alert issue #4 opened → marker comment 5690657920 → `WATCHDOG-ALERT-SKIP (recent trusted marker <24h on issue #4: age=1min by=github-actions[bot])` → manual-tick recovery b85e3ff → #4 closed. X17: the 8-wide burst (e1020, conductor run 34947001617 `actions=8`) + revert (e1157). X18: 3 re-runs at attempt=2, all a2 reports absorbed (`task-not-leased(done/done/quarantined)`, zero double-count). Full report: research/w46-wave/b4-drill-report.md in the exploration repo.
+
+## X20 — the GHA CC ceiling, LOWER BOUND (2026-09-16, run 35125728011 GREEN after 7 diagnostic runs)
+**The datum: CLI install 4-9s + one adapter turn ~5s (trivial prompt) through the local bridge on the free lane (dots-studio:free); a research-y multi-turn task runs 3-16+ minutes.** Kill-F9 label applies (free lane, rate-limited). The 8-run root-cause chain: ISO-now NaN wall → node-20 EBADENGINE + GH_TOKEN/workdir/stderr-mask → **the CLI's /v1/models/{id} pre-flight 404s on OpenRouter** (the compat surface lacks the route) → the LOCAL bridge (worker/cc-bridge.mjs) → mkdtemp/files.map trivia → permissions → the raw-extraction gate → an apostrophe. Each failure live-diagnosed, root-caused, fixed, and pinned by a test.
+
+## X21 — the synthetic CC epoch (2026-09-16, in flight at session close)
+**The stamp is delivered: journal e1416 `T-107 → done` (run 35137019099, 195.8s of real Claude Code work, transcript sessions/T-107/35137019099-a3) + e1421 `T-102 → done` (run 35137088565)** — real CC workers completing lease-scoped tasks through the FSM: dispatch → the ox envelope → the worker's law-1 gate → the per-lane bridge → multi-turn CC work → the transcript push → the five-class report → the drain → done. The three prior buggy epochs each root-caused live (the 10-property dispatch limit → the ox payload; the npm npx tax → per-job pre-install; the pacing-floor skip-left-assigned → default-off; the TTL-cap override → 48min) with the failure machinery absorbing every one (law-4 net-zero flips, infra ladders, deadline self-reports, lane rotation, cross-epoch orphan absorption). The final clean epoch (chain c-1789583988738, 45-min leases) continues autonomously; the dogfood-gate verdict (§11-1) records at its completion.
