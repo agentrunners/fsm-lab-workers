@@ -25,7 +25,7 @@ on:
         default: 'Reply with exactly: X20-SMOKE-OK and nothing else.'
 
 permissions:
-  contents: read
+  contents: write   # X20 run-5: the transcript push (fsm-sessions branch) — read denied it
 
 concurrency:
   group: x20-cc-smoke
