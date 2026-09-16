@@ -72,6 +72,14 @@ jobs:
         with:
           node-version: '22'   # T46/X21: claude-code 2.1.273 requires >=22 (the adapter's npx spawns on the system node)
 
+      - name: Install the CC CLI (once per job — the adapter's npx then resolves instantly)
+        # X21 live finding: a fresh npx download took ~7 MINUTES on the worker
+        # runner (vs 4-9s via npm install -g in the X20 smoke) — the wall
+        # budget must buy WORK, not package downloads
+        run: npm install -g @anthropic-ai/claude-code@${CC_VERSION:-latest} && claude --version || true
+        env:
+          CC_VERSION: ${{ vars.CC_VERSION }}
+
       - name: Work the task
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
