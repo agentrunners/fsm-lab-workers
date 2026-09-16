@@ -145,16 +145,26 @@ test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output
 
 test('cc lane env: the FULL F-M8 contract shape (pure)', () => {
   const env = ccLaneEnv({ key: KEY1, keyIndex: 1, model: 'm/a' }, envelope({ deadline_ms: Date.parse('2026-09-16T12:34:56.000Z') }));
+  // X20 run-3: F-M8 AMENDED — + CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  // (the background session-title call 404s on the bridge and kills the
+  // turn); the direct (no-bridge) lane keeps the key as the token
   assert.deepEqual(env, {
     ANTHROPIC_BASE_URL: CC_BRIDGE_BASE_URL,
     ANTHROPIC_AUTH_TOKEN: KEY1,
     ANTHROPIC_MODEL: 'm/a',
     ANTHROPIC_SMALL_FAST_MODEL: 'm/a',
     DISABLE_TELEMETRY: '1',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     OX_AGENT_DEADLINE_UTC: '2026-09-16T12:34:56.000Z',
     OX_AGENT_TASK_ID: 'T1',
   });
   assert.equal(CC_BRIDGE_BASE_URL, 'https://openrouter.ai/api/v1');
+  // the BRIDGE lane (real mode): the local URL + a DUMMY token — the real
+  // key lives only in the bridge process's env (credential hygiene)
+  const bridged = ccLaneEnv({ key: KEY1, keyIndex: 1, model: 'm/a' }, envelope({ deadline_ms: Date.parse('2026-09-16T12:34:56.000Z') }), { CC_BRIDGE_URL: 'http://127.0.0.1:45678' });
+  assert.equal(bridged.ANTHROPIC_BASE_URL, 'http://127.0.0.1:45678');
+  assert.equal(bridged.ANTHROPIC_AUTH_TOKEN, 'bridge-local-no-key');
+  assert.ok(!JSON.stringify(bridged).includes(KEY1), 'the real key never rides the CLI env in bridged mode');
 });
 
 test('ccTurn: envelope guards — the shim-parity throws (bad envelope / task_ref / prompt / deadline)', async () => {

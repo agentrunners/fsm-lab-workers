@@ -144,19 +144,77 @@ export function ccArgv(envelope, budget, env = process.env) {
 
 // the F-M8 per-lane env contract (asserted by the fake-CLI conformance)
 export function ccLaneEnv(lane, envelope, extra = {}) {
+  // the LOCAL bridge URL (real mode) rides extra.CC_BRIDGE_URL — popped
+  // here so it never reaches the child env twice
+  const { CC_BRIDGE_URL, ...rest } = extra;
   return {
-    ANTHROPIC_BASE_URL: CC_BRIDGE_BASE_URL,
-    ANTHROPIC_AUTH_TOKEN: lane.key,
+    // T46/X20 run-3: the CLI's pre-flight GET /v1/models/{id} 404s on
+    // OpenRouter (the compat surface lacks the per-model route), killing
+    // the turn before the main call. The bridge (worker/cc-bridge.mjs,
+    // spawned PER LANE) synthesizes the models route and passes
+    // /v1/messages through. F-M8 AMENDED: the base URL is the local
+    // bridge; the REAL key lives ONLY in the bridge's env (the CLI gets a
+    // dummy token — a spawned CLI can no longer read the credential).
+    ANTHROPIC_BASE_URL: CC_BRIDGE_URL || CC_BRIDGE_BASE_URL,
+    ANTHROPIC_AUTH_TOKEN: CC_BRIDGE_URL ? 'bridge-local-no-key' : lane.key,
     ANTHROPIC_MODEL: lane.model,
     ANTHROPIC_SMALL_FAST_MODEL: lane.model,
     DISABLE_TELEMETRY: '1',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     OX_AGENT_DEADLINE_UTC: new Date(envelope.deadline_ms).toISOString(),
     OX_AGENT_TASK_ID: envelope.task_ref.id,
-    ...extra,
+    ...rest,
   };
 }
 
 const TRANSPORT_STDERR_RE = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|fetch failed|network|socket|tunneling|connect/i;
+
+// ---------------------------------------------------------------------------
+// The LOCAL bridge lifecycle (real mode only — X20 run-3 root cause fix).
+// Spawns worker/cc-bridge.mjs with the LANE's key+model, waits for the port
+// file, and returns {url, stop()}. The key never rides the CLI's env.
+// ---------------------------------------------------------------------------
+const CC_BRIDGE_PATH = fileURLToPath(new URL('./cc-bridge.mjs', import.meta.url));
+
+async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
+  const { mkdtempSync: mkd, readFileSync: rdf, rmSync: rm } = await import('node:fs');
+  const scratch = mkdtemp(join(tmpdir(), 'cc-bridge-'));
+  const portFile = join(scratch, 'port');
+  const child = spawn(process.execPath, [CC_BRIDGE_PATH, portFile], {
+    env: {
+      PATH: process.env.PATH || '/usr/bin:/bin',
+      OPENROUTER_API_KEY: lane.key,
+      CC_LANE_MODEL: lane.model,
+      OPENROUTER_BASE: process.env.OPENROUTER_BASE || '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,   // its own group: a CLI group-kill cannot take the bridge
+  });
+  let output = '';
+  child.stdout.on('data', (d) => { output += d; });
+  child.stderr.on('data', (d) => { output += d; });
+  const t0 = Date.now();
+  let port = null;
+  while (Date.now() - t0 < timeoutMs) {
+    try { port = parseInt(rdf(portFile, 'utf8').trim(), 10); } catch { /* not yet */ }
+    if (Number.isInteger(port) && port > 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (!(Number.isInteger(port) && port > 0)) {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    rm(scratch, { recursive: true, force: true });
+    throw new Error(`bridge did not listen in ${timeoutMs}ms (${output.split('\n').filter(Boolean).slice(0, 2).join(' | ').slice(0, 120)})`);
+  }
+  log(`CC-BRIDGE-UP 127.0.0.1:${port} (model ${lane.model}, key ${lane.keyIndex})`);
+  return {
+    url: `http://127.0.0.1:${port}`,
+    stop() {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+      rm(scratch, { recursive: true, force: true });
+    },
+  };
+}
+
 
 // ---------------------------------------------------------------------------
 // The spawn (process-group-scoped, wall-killed).
@@ -436,10 +494,29 @@ export async function ccTurn(envelope, opts = {}) {
       const lane = lanes[i];
       const argv = ccArgv(envelope, budget, env);
       const extraEnv = {};
+      // T46/X20 run-3: real mode runs the LOCAL bridge per lane (the CLI's
+      // models pre-flight 404s upstream; the key stays out of the CLI env).
+      // Fake mode needs no bridge — the fake CLI never touches the network.
+      let bridge = null;
+      if (!fake) {
+        try {
+          bridge = await startBridge(lane, log);
+          extraEnv.CC_BRIDGE_URL = bridge.url;
+        } catch (e) {
+          laneLog.push({
+            lane: i + 1, key_index: lane.keyIndex, model: lane.model,
+            rc: null, signal: null, duration_ms: 0, wall_killed: false,
+            class: 'infra', bridge_error: String(e?.message ?? e).slice(0, 120),
+          });
+          lastClass = `cc-bridge(${String(e?.message ?? e).slice(0, 80)})`;
+          continue;   // the bridge is infra — rotate the lane
+        }
+      }
       if (fake) {
         mkdirSync(echoRoot, { recursive: true });
         extraEnv.FAKE_CC_ECHO_PATH = join(echoRoot, `lane-${i}.json`);
       }
+      try {
       // env: the caller's env (PATH et al.) with the F-M8 contract overlaid
       const childEnv = {};
       for (const [k, v] of Object.entries(env)) if (typeof v === 'string') childEnv[k] = v;
@@ -553,6 +630,11 @@ export async function ccTurn(envelope, opts = {}) {
         ...(parsed.repeat_report === true ? { repeat_report: true } : {}),
         summary: `cc: task ${taskId} attempt ${attempt} ${cls.status === 'done' ? 'completed' : 'failed'} on lane ${i + 1} (${lane.model})`,
       }, i + 1, { turns: Number.isInteger(parsed.num_turns) ? parsed.num_turns : 1 });
+      } finally {
+        // the per-lane bridge dies with the lane (rotation = fresh bridge
+        // with the next lane's key+model)
+        if (bridge) bridge.stop();
+      }
     }
     // ---- every lane burned: the routing-level infra marker ---------------
     return await finalize({
