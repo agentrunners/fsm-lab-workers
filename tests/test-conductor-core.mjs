@@ -558,3 +558,54 @@ test('T45/F-G(c): a DIRECT control wake carries the sender through the router; t
   assert.equal(reset.note, 'fresh epoch');
   ok(out.state, 'fgc-direct-reset');
 });
+
+// ---------------------------------------------------------------------------
+// T46 law-7: the cold-start pin — branch-absent is genesis-ELIGIBLE,
+// idempotently, and the notice tells the truth about it. (The live 404 path
+// is the conductor adapter's: Store read -> cur null -> recover() -> null ->
+// makeGenesis — this unit test pins the eligibility logic itself.)
+// ---------------------------------------------------------------------------
+
+test('T46/law-7: cold start — an ABSENT state branch (cur=null, no snapshot anywhere) is genesis-eligible, idempotently', () => {
+  // eligibility: cur null + recover() null (the branch-absent 404 shape)
+  // => fresh genesis, NOT an error — a brand-new deployment cold-starts clean
+  const clock = makeNow(T0);
+  const out1 = conductorTick({
+    cur: null, queue: [], controlQueue: [], ev: tickEv('watchdog-reprime'),
+    now: clock.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out1.noop, undefined, 'the cold-start turn COMMITS (genesis material)');
+  assert.equal(out1.state.chain.primed_by, 'watchdog-reprime');
+  assert.ok(out1.journal.some(j => j.kind === 'RECOVERY' && j.reason === 'bootstrap'));
+  // the alert must not lie: the BOOTSTRAP_NOTICE fires exactly when the
+  // branch/snapshot was absent — and does NOT fire when a snapshot was found
+  assert.ok(out1.actions.some(a => a.type === 'BOOTSTRAP_NOTICE'), 'absent -> the honest bootstrap notice');
+  ok(out1.state, 'cold-start-1');
+  // the fresh epoch carries the documented mode default (F-B2 genesis half)
+  assert.equal(out1.state.project.mode, 'mock');
+  // IDEMPOTENT: a second cold start on a STILL-absent branch (the first
+  // commit was lost / the watchdog re-primed into the void) produces another
+  // clean genesis — no crash, no duplicate-id corruption, no lying alert
+  const clock2 = makeNow(T0 + 60_000);
+  const out2 = conductorTick({
+    cur: null, queue: [], controlQueue: [], ev: tickEv('watchdog-reprime'),
+    now: clock2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out2.noop, undefined);
+  assert.ok(out2.journal.some(j => j.kind === 'RECOVERY' && j.reason === 'bootstrap'));
+  assert.ok(out2.actions.some(a => a.type === 'BOOTSTRAP_NOTICE'));
+  ok(out2.state, 'cold-start-2');
+  // contrast: a FOUND snapshot is NOT a cold start — the notice is the
+  // recovery one, never the bootstrap one (the alert stays truthful)
+  let good = boot();
+  good = apply(good, ctlEv('pause'), iso(T0), NM).state;
+  const out3 = conductorTick({
+    cur: null, queue: [], controlQueue: [], ev: tickEv('backstop'),
+    now: makeNow(T0 + 5_000).now, nextMilestone: NM,
+    recover: () => ({ state: structuredClone(good), reason: 'history-walk' }),
+    makeGenesis,
+  });
+  assert.ok(!out3.actions.some(a => a.type === 'BOOTSTRAP_NOTICE'),
+    'a found snapshot is a RECOVERY, never a bootstrap — the notice does not lie');
+  assert.ok(out3.actions.some(a => a.type === 'RECOVERY_NOTICE'));
+});

@@ -5,7 +5,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { genesis, apply, applyEvent, clock, invariants, rebuild, mkTask, INFRA_RETRY_MAX } from '../lib/fsm.mjs';
+import { genesis, apply, applyEvent, clock, invariants, rebuild, mkTask, INFRA_RETRY_MAX, GENESIS_MODES, law6Violations } from '../lib/fsm.mjs';
+import { ENVELOPE_MODES } from '../lib/worker-contract.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
 const T0 = '2026-09-06T10:00:00.000Z';
@@ -776,4 +777,329 @@ test('T45/F-A: rebuild KEEPS-LAST on duplicate ids — last content wins, replay
   const recs3 = [...recs, { ts: step(6000), applied: true, kind: 'CONTROL', command: 'pause' }];
   const reb3 = rebuild(g, recs3);
   assert.equal(reb3.chain.paused, true, 'an id-less record still replays');
+});
+
+// ---------------------------------------------------------------------------
+// T46/F-B1: the FIVE-CLASS receiver — the contract's status classes get FSM
+// handlers (work_failed / deadline / poison joined done / infra_failed).
+// ---------------------------------------------------------------------------
+
+test('T46/F-B1: work_failed — the ALIAS of legacy failed (byte-identical transition, attempt-burn)', () => {
+  let s = boot({ max_parallel: 2 });
+  let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r.state.tasks.A2.lease.token;
+  // pure applyEvent: failed (terminal) — the retry-scan moves it on next clock
+  const rw = applyEvent(r.state, report('A2', lease, { status: 'work_failed', error: 'bad-output' }, step(5000), 'run-w', 'evt-wf-1'), step(5000));
+  ok(rw.state, 'work-failed-pure');
+  assert.equal(rw.applied, true);
+  assert.equal(rw.state.tasks.A2.status, 'failed', 'attempt-burn: the work ladder, not the infra void');
+  assert.equal(rw.state.tasks.A2.attempts, 1, 'the attempt STAYS burned');
+  assert.equal(rw.state.tasks.A2.lease, null, 'failed is terminal — lease cleared');
+  assert.equal(rw.state.tasks.A2.last_result.status, 'work_failed', 'last_result records the vocabulary the worker used');
+  assert.equal(rw.eventOut.kind, 'REPORT');
+  assert.equal(rw.eventOut.to, 'failed');
+  assert.equal(rw.eventOut.reason, undefined, 'work-class reports carry no reason (the legacy shape)');
+  // the composite apply(): retry-scan -> ready -> SAME pass reassigns
+  const r2 = apply(r.state, report('A2', lease, { status: 'work_failed', error: 'bad-output' }, step(5000), 'run-w', 'evt-wf-2'), step(5000), NM);
+  ok(r2.state, 'work-failed-composite');
+  assert.equal(r2.state.tasks.A2.status, 'assigned', 'reassigned in the same clock pass');
+  assert.equal(r2.state.tasks.A2.attempts, 2);
+  assert.equal(r2.state.stats.retries, 1);
+  assert.ok(r2.journal.some(j => j.kind === 'RETRY' && j.task === 'A2'), 'the retry-scan record lands');
+});
+
+test('T46/F-B1: work_failed PARITY — the alias produces the identical state+journal as legacy failed', () => {
+  // two parallel worlds, identical except the report vocabulary
+  const drive = (status) => {
+    let s = boot({ max_parallel: 1 });
+    let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+    const lease = r.state.tasks.A1.lease.token;
+    r = apply(r.state, report('A1', lease, { status, error: 'x' }, step(5000), 'run-1', 'evt-1'), step(5000), NM);
+    return r;
+  };
+  const legacy = drive('failed');
+  const alias = drive('work_failed');
+  ok(legacy.state, 'legacy'); ok(alias.state, 'alias');
+  // the journal is byte-identical modulo the random lease TOKENS (each boot
+  // mints fresh uuid tokens — normalize them, keep every other byte)
+  const normJ = (js) => js.map(j => ({ ...j, lease: j.lease ? '<token>' : j.lease }));
+  assert.deepEqual(normJ(alias.journal), normJ(legacy.journal));
+  // the state projection is identical except last_result.status and the
+  // random lease TOKENS (fresh uuid per boot — normalize both)
+  const proj = (st) => {
+    const c = structuredClone(st);
+    for (const t of Object.values(c.tasks)) {
+      t.last_result = t.last_result ? { ...t.last_result, status: '<vocab>' } : null;
+      if (t.lease) t.lease = { ...t.lease, token: '<token>' };
+    }
+    return c;
+  };
+  assert.deepEqual(proj(alias.state), proj(legacy.state));
+  assert.equal(alias.state.tasks.A1.last_result.status, 'work_failed');
+  assert.equal(legacy.state.tasks.A1.last_result.status, 'failed');
+});
+
+test('T46/F-B1: work_failed at max attempts -> quarantined (the alias inherits the ladder)', () => {
+  let s = boot({ max_parallel: 1, max_attempts: 2 });
+  let n = 0;
+  for (let i = 0; i < 2; i++) {
+    let r = apply(s, { kind: 'TICK', event_id: `t-${i}`, ts: step(n), actor: 'chain' }, step(n), NM);
+    s = r.state; n += 1000;
+    const t = s.tasks.A1;
+    assert.ok(t.lease, `A1 leased at round ${i} (status=${t.status})`);
+    const rr = apply(s, report('A1', t.lease.token, { status: 'work_failed', error: 'still-bad' }, step(n), 'run-w', `evt-wf-q-${i}`), step(n), NM);
+    s = rr.state; n += 1000;
+    ok(s, `wf-quarantine-round-${i}`);
+  }
+  assert.equal(s.tasks.A1.status, 'quarantined');
+  assert.equal(s.tasks.A1.attempts, 2);
+  assert.equal(s.stats.quarantined, 1);
+});
+
+test('T46/F-B1: deadline — the SELF-REPORTED reaper (attempt-burn + lease release, TIMEOUT-equivalent)', () => {
+  let s = boot({ max_parallel: 2 });
+  let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r.state.tasks.A1.lease.token;
+  // pure applyEvent: ready + lease RELEASED + attempts BURNED (not voided)
+  const rd = applyEvent(r.state, report('A1', lease, { status: 'deadline', error: 'rc=124' }, step(5000), 'run-d', 'evt-dl-1'), step(5000));
+  ok(rd.state, 'deadline-pure');
+  assert.equal(rd.applied, true);
+  const t = rd.state.tasks.A1;
+  assert.equal(t.status, 'ready', 'requeue (retries remain)');
+  assert.equal(t.lease, null, 'LEASE RELEASED (ready is non-terminal — the explicit clear)');
+  assert.equal(t.attempts, 1, 'attempt-burn: the attempt STAYS counted (unlike the infra void)');
+  assert.equal(t.infra_attempts, undefined, 'deadline is NOT the infra class');
+  assert.equal(rd.state.stats.timeouts, 1, 'counted as the reaper would count it');
+  assert.equal(rd.state.stats.retries, 1);
+  assert.equal(rd.eventOut.kind, 'REPORT');
+  assert.equal(rd.eventOut.to, 'ready');
+  assert.equal(rd.eventOut.reason, 'deadline');
+  assert.equal(rd.eventOut.error, 'rc=124');
+  assert.ok(t.history.some(h => /worker-deadline/.test(h.why)), 'the distinct history why');
+  // the reaper cannot double-fire: the released lease is gone from the clock's view
+  const c = clock(rd.state, step(6000), NM);
+  assert.ok(!c.journal.some(j => j.kind === 'TIMEOUT' && j.task === 'A1'), 'no TIMEOUT follows the self-report');
+  // the composite apply(): ready -> SAME pass reassigns (the timeout-test equivalence)
+  const r2 = apply(r.state, report('A1', lease, { status: 'deadline', error: 'rc=124' }, step(5000), 'run-d', 'evt-dl-2'), step(5000), NM);
+  ok(r2.state, 'deadline-composite');
+  assert.equal(r2.state.tasks.A1.status, 'assigned', 'IMMEDIATE reassign in the same clock pass');
+  assert.equal(r2.state.tasks.A1.attempts, 2);
+  assert.notEqual(r2.state.tasks.A1.lease?.token, lease, 'a FRESH lease');
+  assert.equal(r2.state.stats.timeouts, 1);
+});
+
+test('T46/F-B1: deadline at max attempts -> quarantined (timeouts counted, no retry)', () => {
+  let s = boot({ max_parallel: 1, max_attempts: 2 });
+  let n = 0;
+  for (let i = 0; i < 2; i++) {
+    let r = apply(s, { kind: 'TICK', event_id: `t-${i}`, ts: step(n), actor: 'chain' }, step(n), NM);
+    s = r.state; n += 1000;
+    const t = s.tasks.A1;
+    assert.ok(t.lease, `A1 leased at round ${i} (status=${t.status})`);
+    const rr = apply(s, report('A1', t.lease.token, { status: 'deadline', error: 'rc=124' }, step(n), 'run-d', `evt-dl-q-${i}`), step(n), NM);
+    s = rr.state; n += 1000;
+    ok(s, `dl-quarantine-round-${i}`);
+  }
+  assert.equal(s.tasks.A1.status, 'quarantined', 'the spent ladder quarantines');
+  assert.equal(s.tasks.A1.lease, null);
+  assert.equal(s.stats.timeouts, 2);
+  assert.equal(s.stats.retries, 1, 'only the FIRST deadline requeued');
+});
+
+test('T46/F-B1: poison — the quarantine DOOR, terminal regardless of attempts, reason poison, DISTINCT from infra', () => {
+  let s = boot({ max_parallel: 2 });
+  let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r.state.tasks.A1.lease.token;
+  const rp = apply(r.state, report('A1', lease, { status: 'poison', error: 'prompt-injection-detected' }, step(5000), 'run-p', 'evt-po-1'), step(5000), NM);
+  ok(rp.state, 'poison');
+  assert.equal(rp.applied, true);
+  const t = rp.state.tasks.A1;
+  assert.equal(t.status, 'quarantined', 'the quarantine door');
+  assert.equal(t.attempts, 1, 'terminal at attempt 1 — retrying an anomalous prompt is pointless burn');
+  assert.equal(t.lease, null, 'terminal — lease cleared');
+  assert.equal(t.infra_attempts, undefined, 'DISTINCT from infra exhaustion (no infra counter)');
+  assert.equal(t.last_result.status, 'poison');
+  const rec = rp.journal.find(j => j.kind === 'REPORT' && j.task === 'A1');
+  assert.equal(rec.to, 'quarantined');
+  assert.equal(rec.reason, 'poison', 'the DISTINCT reason on the audit trail');
+  assert.equal(rec.error, 'prompt-injection-detected');
+  assert.ok(t.history.some(h => /worker-poison/.test(h.why)));
+  assert.equal(rp.state.stats.quarantined, 1);
+  assert.equal(rp.state.stats.infra_retries, 0);
+  // the detail vocabulary from classifyOutcome is accepted too (error<-detail)
+  let s2 = boot({ max_parallel: 2 });
+  let r2 = apply(s2, { kind: 'TICK', event_id: 't2', ts: T0, actor: 'chain' }, T0, NM);
+  const rp2 = apply(r2.state, report('A1', r2.state.tasks.A1.lease.token, { status: 'poison', detail: 'wb-violation(.github)' }, step(5000), 'run-p', 'evt-po-2'), step(5000), NM);
+  assert.equal(rp2.state.tasks.A1.status, 'quarantined');
+  assert.equal(rp2.journal.find(j => j.kind === 'REPORT' && j.task === 'A1').error, 'wb-violation(.github)');
+});
+
+test('T46/F-B1: unknown outcome statuses still reject bad-outcome (fail-closed receiver)', () => {
+  let s = boot({ max_parallel: 2 });
+  let r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const lease = r.state.tasks.A1.lease.token;
+  for (const status of ['exploded', 'DONE', 'ok', 'cancelled', 'quarantined']) {
+    const rr = apply(r.state, report('A1', lease, { status }, step(5000), 'run-x', `evt-bad-${status}`), step(5000), NM);
+    assert.equal(rr.applied, false, `status=${status} must reject`);
+    assert.match(rr.reason, new RegExp(`^bad-outcome\\(${status}\\)$`));
+    assert.equal(rr.state.tasks.A1.status, 'assigned', 'no state damage');
+  }
+  ok(r.state, 'bad-outcome');
+});
+
+test('T46/F-B1: rebuild parity — ALL FIVE classes replay identically from journals (the F8 contract)', () => {
+  let s = boot({ max_parallel: 2 });
+  const gen = structuredClone(s);
+  const journal = [];
+  let n = 0;
+  const drive = (ev) => {
+    const r = apply(s, ev, step(1000 * (++n)), NM);
+    s = r.state;
+    journal.push(...r.journal);
+    ok(s, `f8-five-step-${n}`);
+    return r;
+  };
+  drive({ kind: 'TICK', event_id: 't1', ts: step(1000), actor: 'chain' });
+  // A1: done
+  drive(report('A1', s.tasks.A1.lease.token, { status: 'done', artifact: 'x' }, step(2000), 'r1', 'evt-1'));
+  // A2: work_failed -> retry-scan ready -> reassign -> deadline (self-reported reaper)
+  drive(report('A2', s.tasks.A2.lease.token, { status: 'work_failed', error: 'bad' }, step(3000), 'r2', 'evt-2'));
+  drive(report('A2', s.tasks.A2.lease.token, { status: 'deadline', error: 'rc=124' }, step(4000), 'r2b', 'evt-2b'));
+  // A2 reassigned; report poison on the fresh lease
+  drive(report('A2', s.tasks.A2.lease.token, { status: 'poison', error: 'anomaly' }, step(5000), 'r2c', 'evt-2c'));
+  // A3 (poison behavior, legacy vocab): failed twice -> quarantined via the ladder
+  for (let i = 0; i < 3 && s.tasks.A3.status !== 'quarantined'; i++) {
+    if (!s.tasks.A3.lease) drive({ kind: 'TICK', event_id: `t-${i}`, ts: step(1000 * (++n)), actor: 'chain' });
+    if (s.tasks.A3.lease) drive(report('A3', s.tasks.A3.lease.token, { status: 'failed', error: 'poison-always' }, step(1000 * (++n)), 'r3', `evt-3-${i}`));
+  }
+  // an infra flap on A5 (net-zero) then done
+  drive(report('A5', s.tasks.A5.lease.token, { status: 'infra_failed', error: 'lane-429' }, step(1000 * (++n)), 'r5', 'evt-5a'));
+  drive(report('A5', s.tasks.A5.lease.token, { status: 'done', artifact: 'y' }, step(1000 * (++n)), 'r5b', 'evt-5b'));
+  // A4 was unlocked by A1-done; give it a deadline-to-quarantine via max_attempts
+  // (drive enough deadline reports to spend the ladder)
+  for (let i = 0; i < 3 && s.tasks.A4.status !== 'quarantined' && s.tasks.A4.status !== 'ready'; i++) {
+    if (s.tasks.A4.lease) drive(report('A4', s.tasks.A4.lease.token, { status: 'deadline', error: 'rc=124' }, step(1000 * (++n)), 'r4', `evt-4-${i}`));
+  }
+  // sanity: the live state exercised all five classes
+  assert.equal(s.tasks.A1.status, 'done');
+  assert.equal(s.tasks.A2.status, 'quarantined');
+  assert.equal(s.tasks.A3.status, 'quarantined');
+  assert.ok(s.stats.timeouts >= 1);
+  assert.ok(journal.some(j => j.kind === 'REPORT' && j.reason === 'deadline'));
+  assert.ok(journal.some(j => j.kind === 'REPORT' && j.reason === 'poison'));
+  assert.ok(journal.some(j => j.kind === 'REPORT' && j.reason === 'infra-retry'));
+  assert.ok(journal.some(j => j.kind === 'RETRY'));
+  // the projection: rebuild(genesis, journal) === live
+  const reb = rebuild(gen, journal);
+  const proj = (st) => ({
+    tasks: Object.fromEntries(Object.entries(st.tasks).map(([id, t]) => [id, {
+      status: t.status, attempts: t.attempts, lease: t.lease ? t.lease.token : null, infra: t.infra_attempts ?? 0,
+    }])),
+    stats: st.stats,
+    chain: { seq: st.chain.seq },
+    version: st.version,
+  });
+  assert.deepEqual(proj(reb), proj(s), 'rebuild parity across all five report classes');
+  // NOTE: dedup is deliberately NOT compared — applied REPORT records do not
+  // journal their event_id, so the runtime dedup window is not reconstructible
+  // from the journal (the pre-existing F8 semantics; the store's exactly-once
+  // drain covers re-delivery after recovery, and the window is bounded)
+});
+
+// ---------------------------------------------------------------------------
+// T46/F-B2 (fsm half): the genesis mode param (the epoch's harness lane).
+// ---------------------------------------------------------------------------
+
+test('T46/F-B2: genesis mode — default mock rides project.mode; cc for the X21 synthetic epoch', () => {
+  const s = genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'c-mode', now: T0 });
+  assert.equal(s.project.mode, 'mock', 'the default (every legacy epoch)');
+  const cc = genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'c-x21', now: T0, mode: 'cc' });
+  assert.equal(cc.project.mode, 'cc');
+  ok(cc, 'genesis-cc');
+  // bad mode fails closed at the boundary
+  for (const mode of ['monk', '', 42, null]) {
+    assert.throws(() => genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1 }, chainId: 'x', now: T0, mode }),
+      /genesis: mode must be one of/);
+  }
+  // ONE vocabulary: fsm's GENESIS_MODES === worker-contract's ENVELOPE_MODES
+  assert.deepEqual(GENESIS_MODES, ENVELOPE_MODES, 'the receiver and the envelope speak the same mode vocabulary');
+});
+
+test('T46/F-B2: rebuild replays the mode from a reset genesisSpec (legacy specs default to mock)', () => {
+  const g = boot({ max_parallel: 1 });
+  const tasks = fastProject().m1;
+  const mk = (mode) => [
+    { id: 'e1', ts: step(1000), applied: true, kind: 'CONTROL', command: 'reset', genesisSpec: { config: { max_parallel: 1, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 }, tasks, milestones: 2, chainId: 'c-reset', now: step(1000), journal_seq: 1, ...(mode ? { mode } : {}) } },
+  ];
+  const cc = rebuild(g, mk('cc'));
+  assert.equal(cc.project.mode, 'cc', 'the W-B reset spec carries the epoch mode');
+  const legacy = rebuild(g, mk(undefined));
+  assert.equal(legacy.project.mode, 'mock', 'a legacy spec (no mode field) defaults to mock');
+});
+
+// ---------------------------------------------------------------------------
+// T46/F-M3 (law 6): the pointer-only journal invariant, NEW-class scoped.
+// ---------------------------------------------------------------------------
+
+test('T46/F-M3: ASSIGN records + DISPATCH actions carry task_ref pointers; no inline specs', () => {
+  let s = boot({ max_parallel: 2 });
+  const r = apply(s, { kind: 'TICK', event_id: 't1', ts: T0, actor: 'chain' }, T0, NM);
+  const assigns = r.journal.filter(j => j.kind === 'ASSIGN');
+  assert.equal(assigns.length, 2);
+  for (const j of assigns) {
+    assert.deepEqual(j.task_ref, { kind: 'state-task', id: j.task }, 'the NEW-class pointer');
+    for (const k of ['prompt', 'spec', 'body', 'title', 'tasks']) {
+      assert.equal(j[k], undefined, `ASSIGN must not inline ${k} (payload stays in the state.json task record)`);
+    }
+  }
+  const dispatches = r.actions.filter(a => a.type === 'DISPATCH_WORKER');
+  assert.equal(dispatches.length, 2);
+  for (const d of dispatches) {
+    assert.deepEqual(d.task_ref, { kind: 'state-task', id: d.task });
+  }
+});
+
+test('T46/F-M3: law6Violations — NEW-class records only; legacy inline-spec records untouched', () => {
+  // a REAL journal from a full drive: new ASSIGN records (task_ref) + legacy
+  // MILESTONE records (inline specs BY DESIGN — rebuild replays them)
+  let s = boot({ max_parallel: 2 });
+  const journal = [];
+  let n = 0;
+  const drive = (ev) => {
+    const r = apply(s, ev, step(1000 * (++n)), NM);
+    s = r.state; journal.push(...r.journal);
+  };
+  drive({ kind: 'TICK', event_id: 't1', ts: step(1000), actor: 'chain' });
+  drive(report('A1', s.tasks.A1.lease.token, { status: 'done', artifact: 'x' }, step(2000), 'r1', 'evt-1'));
+  // push to milestone 2 (the legacy inline-spec MILESTONE record class)
+  drive(report('A2', s.tasks.A2.lease.token, { status: 'done', artifact: 'x' }, step(3000), 'r2', 'evt-2'));
+  drive(report('A3', s.tasks.A3.lease.token, { status: 'done', artifact: 'x' }, step(4000), 'r3', 'evt-3'));
+  drive(report('A5', s.tasks.A5.lease.token, { status: 'done', artifact: 'x' }, step(5000), 'r5', 'evt-5'));
+  drive(report('A4', s.tasks.A4.lease.token, { status: 'done', artifact: 'x' }, step(6000), 'r4', 'evt-4'));
+  assert.ok(journal.some(j => j.kind === 'MILESTONE' && Array.isArray(j.tasks)), 'a legacy inline-spec MILESTONE record is in the journal');
+  // the SCOPED audit: clean on the mixed journal (new pointers OK, legacy specs exempt)
+  assert.deepEqual(law6Violations(journal), [], 'the F-M3 scoping: legacy records are not flagged');
+  // strict mode for post-T46 journals: every ASSIGN must carry the pointer
+  assert.deepEqual(law6Violations(journal, { requireAssignTaskRef: true }), []);
+  // a synthetic NEW-class violation: task_ref PLUS an inline payload
+  const bad = [
+    ...journal,
+    { id: 'e99', ts: step(9999), applied: true, kind: 'ASSIGN', task: 'Z9', from: 'ready', to: 'assigned', lease: 'l-1', expires: step(99999), attempt: 1, behavior: 'succeed', task_ref: { kind: 'state-task', id: 'Z9' }, prompt: 'do the thing inline' },
+  ];
+  assert.deepEqual(law6Violations(bad), ['e99:inline-spec(prompt)']);
+  // a malformed pointer + a mismatched pointer
+  assert.deepEqual(law6Violations([{ id: 'e1', kind: 'ASSIGN', task: 'Z9', task_ref: { kind: 'issue', id: 9 } }]), ['e1:bad-task-ref({"kind":"issue","id":9})']);
+  assert.deepEqual(law6Violations([{ id: 'e2', kind: 'ASSIGN', task: 'A', task_ref: { kind: 'state-task', id: 'B' } }]), ['e2:task-ref-mismatch(A!=B)']);
+  // an ASSIGN missing its pointer (the minting regression) — only in strict mode
+  const noPtr = [{ id: 'e3', kind: 'ASSIGN', task: 'Z9', from: 'ready', to: 'assigned', lease: 'l-1', expires: step(99999), attempt: 1, behavior: 'succeed' }];
+  assert.deepEqual(law6Violations(noPtr), [], 'legacy-shaped (pre-T46) records stay legal by default');
+  assert.deepEqual(law6Violations(noPtr, { requireAssignTaskRef: true }), ['e3:assign-without-task-ref']);
+  // a purely LEGACY journal (hand-crafted pre-T46 shape, inline specs everywhere)
+  const legacyJournal = [
+    { id: 'e1', ts: step(1000), applied: true, kind: 'TICK', seq: 1, actor: 'chain' },
+    { id: 'e2', ts: step(2000), applied: true, kind: 'ASSIGN', task: 'A1', from: 'ready', to: 'assigned', lease: 'l-1', expires: step(99999), attempt: 1, behavior: 'succeed' },
+    { id: 'e3', ts: step(3000), applied: true, kind: 'TASK_CREATED', task: 'N1', spec: { id: 'N1', title: 't', behavior: 'succeed' } },
+    { id: 'e4', ts: step(4000), applied: true, kind: 'MILESTONE', milestone: 2, tasks: [{ id: 'B1', title: 'b', behavior: 'succeed' }] },
+  ];
+  assert.deepEqual(law6Violations(legacyJournal), [], 'the unscoped pin-test would FAIL here — this is the F-M3 kill');
 });
