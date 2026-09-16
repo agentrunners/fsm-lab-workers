@@ -508,12 +508,16 @@ function scenarioMatrix() {
     `done=${d.state.stats.done}/10 degraded=${phaseRec?.degraded === true}`);
 
   // the W2 seam: every dispatch rode the full envelope (assembleDispatchPayload minted)
+  // X21 ox shape: the envelope rides payload.ox — checked THROUGH the
+  // worker's own gate (the real consumer), not raw fields
   const badPayload = d.dispatches.filter(x => {
-    const p2 = x.payload;
-    return !(typeof p2.prompt === 'string' && p2.prompt.includes('Task ')
-      && Number.isFinite(p2.deadline_ms) && p2.deadline_ms > 0
-      && (p2.mode === 'mock') && typeof p2.session === 'string'
-      && p2.budget?.max_turns === 40 && Number.isFinite(p2.budget?.wall_ms) && p2.budget?.lane_attempts === 3);
+    const g = envelopeFromDispatch(x.payload, Date.parse(x.payload.expires) - 60_000);
+    if (!g.ok) return true;
+    const e = g.envelope;
+    return !(typeof e.prompt === 'string' && e.prompt.includes('Task ')
+      && Number.isFinite(e.deadline_ms) && e.deadline_ms > 0
+      && (e.mode === 'mock') && typeof e.session === 'string'
+      && e.budget?.max_turns === 40 && Number.isFinite(e.budget?.wall_ms) && e.budget?.lane_attempts === 3);
   });
   p('the W2 envelope rode every dispatch (prompt+brief/deadline_ms/mode/session/budget)',
     badPayload.length === 0 && d.dispatches.length > 10
@@ -562,13 +566,16 @@ function scenarioLaw1() {
   p('terminal via infra-exhausted (the lane-death quarantine, NOT task-poison)',
     d.taskJournal('gate1').some(j => j.kind === 'REPORT' && j.reason === 'infra-exhausted'),
     `reasons=${[...new Set(d.taskJournal('gate1').map(j => j.reason))].join(',')}`);
+  // X21 ox shape: the envelope fields ride payload.ox (the 10-property
+  // dispatch limit); the legacy expires stays top-level
+  const oxOf = (x) => JSON.parse(x.payload.ox);
   p('every dispatch minted a PAST deadline (the 1-min lease vs the 2-min margin)',
-    d.dispatches.length === 3 && d.dispatches.every(x => x.payload.deadline_ms <= x.payload.expires ? false : true)
-    && d.dispatches.every(x => {
+    d.dispatches.length === 3 && d.dispatches.every(x => {
+      const ox = oxOf(x);
       const leaseMs = Date.parse(x.payload.expires);
-      return x.payload.deadline_ms === leaseMs - 120_000 && x.payload.deadline_ms < Date.parse(x.payload.expires) - 60_000;
+      return ox.deadline_ms === leaseMs - 120_000 && ox.deadline_ms < leaseMs - 60_000;
     }),
-    `minted=[${d.dispatches.map(x => new Date(x.payload.deadline_ms).toISOString()).join(', ')}]`);
+    `minted=[${d.dispatches.map(x => new Date(oxOf(x).deadline_ms).toISOString()).join(', ')}]`);
 }
 
 // ---------------------------------------------------------------------------
