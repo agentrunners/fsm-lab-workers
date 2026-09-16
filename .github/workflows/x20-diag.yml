@@ -1,0 +1,69 @@
+# x20-diag — ONE-OFF diagnostic: which model-env mechanism does claude-code
+# 2.1.273 accept for non-Anthropic models over a custom ANTHROPIC_BASE_URL?
+# Run 3 of x20-cc-smoke failed with [claude-code:unrecognized_model] on
+# ANTHROPIC_MODEL=<openrouter-slug>; the direct bridge probe (POST
+# /api/v1/messages) returns 200 — the rejection is CLI-side.
+# Variants: (A) ANTHROPIC_DEFAULT_SONNET_MODEL remap + --model sonnet,
+# (B) --model <slug> flag (env unset), (C) env form again + --debug for the
+# full error. Throwaway — delete after the answer.
+name: x20-diag
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: x20-diag
+  cancel-in-progress: true
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [A-default-sonnet-remap, B-model-flag, C-env-plus-debug]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install CLI
+        run: npm install -g @anthropic-ai/claude-code@latest && claude --version
+      - name: Variant ${{ matrix.variant }}
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SLUG: dots-studio/dots-3-note-preview:free
+        run: |
+          cd /tmp
+          case "${{ matrix.variant }}" in
+            A-default-sonnet-remap)
+              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+                ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
+                ANTHROPIC_DEFAULT_SONNET_MODEL="$SLUG" \
+                ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
+                DISABLE_TELEMETRY=1 \
+                timeout 90 claude -p "Reply with exactly: DIAG-A-OK" --model sonnet --output-format json --max-turns 1 --disallowedTools WebFetch,WebSearch \
+                > /tmp/out.json 2>/tmp/err.txt || true
+              ;;
+            B-model-flag)
+              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+                ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
+                ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
+                DISABLE_TELEMETRY=1 \
+                timeout 90 claude -p "Reply with exactly: DIAG-B-OK" --model "$SLUG" --output-format json --max-turns 1 --disallowedTools WebFetch,WebSearch \
+                > /tmp/out.json 2>/tmp/err.txt || true
+              ;;
+            C-env-plus-debug)
+              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+                ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
+                ANTHROPIC_MODEL="$SLUG" \
+                ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
+                DISABLE_TELEMETRY=1 \
+                timeout 90 claude -p "Reply with exactly: DIAG-C-OK" --debug --output-format json --max-turns 1 --disallowedTools WebFetch,WebSearch \
+                > /tmp/out.json 2>/tmp/err.txt || true
+              ;;
+          esac
+          echo "=== EXIT ==="
+          echo "=== STDERR (first 30 lines) ==="; head -30 /tmp/err.txt
+          echo "=== STDOUT (first 40 lines) ==="; head -40 /tmp/out.json
+          if grep -q '"result"' /tmp/out.json 2>/dev/null; then echo "VARIANT-OK ${{ matrix.variant }}"; else echo "VARIANT-FAIL ${{ matrix.variant }}"; fi
