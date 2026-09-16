@@ -21,10 +21,12 @@
 //               model chain with ONE fallback hop on infra-class failure,
 //               bounded by budget.lane_attempts (the RETIRED hardcoded
 //               minimax/minimax-m3:free slug — live 404 — died here).
-//        cc   → worker/cc-adapter.mjs (W4). Until it ships: a clean stub —
-//               the missing-module import is caught as AdapterNotShipped →
-//               infra_failed 'cc-adapter-missing'. The mode is ROUTABLE
-//               now; the adapter lands in W4 against the same envelope.
+//        cc   → worker/cc-adapter.mjs (T46/W4): the claude-code harness
+//               turn — key-pool × model-chain lanes, the F-M8 bridge env,
+//               the process-group wall kill, transcripts to fsm-sessions
+//               BEFORE the report, the door governance on artifacts.
+//               CC_FAKE_LLM=1 swaps the CLI for worker/fake-cc.mjs (same
+//               argv, deterministic fixtures) — tests never burn fuel.
 //   3. classifyOutcome — the ONE normalizer before report enqueue: every
 //      harness completion (shim return, real-lane raw, routing-level infra
 //      marker) flows through it exactly once; the five-class outcome plus
@@ -170,19 +172,23 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
 }
 
 // ---------------------------------------------------------------------------
-// MODE=cc — the CC harness turn (worker/cc-adapter.mjs, W4 §1d).
+// MODE=cc — the CC harness turn (worker/cc-adapter.mjs, T46/W4 §1d).
 //
-// FOR NOW: the adapter does not exist — the import fails with
-// ERR_MODULE_NOT_FOUND, which ccWork converts to AdapterNotShipped; runTurn
-// catches it and reports infra_failed 'cc-adapter-missing' (the mode is
-// routable, the adapter lands in W4). When it ships, ccTurn(envelope)
-// returns the same contract return the shim returns (the conformance
-// reference — C3 folded into the shim per D1).
+// ccTurn(envelope, opts) returns the SAME contract return the shim implements
+// (the conformance reference — C3 folded into the shim per D1; the adapter
+// passes the same behavior matrix, asserted by worker/conformance-cc.mjs).
+// The lane picker, the F-M8 env contract, the process-group wall kill, the
+// transcript-before-report push and the door governance live THERE; this
+// routing site passes the injected dependencies through (env/runId/now/log —
+// the adapter stays offline-testable through the same seams runTurn exposes).
+// The AdapterNotShipped class is now DEAD CODE by design (the adapter ships
+// with this wave); the catch stays as the guard for a checkout that somehow
+// drops the module — the mode stays routable and reports infra, never throws.
 //
-// F-M8 env contract (documented here — the adapter's spawn surface, W4
-// implements + the fake-CLI conformance asserts it):
+// F-M8 env contract (implemented in the adapter, asserted by the fake-CLI
+// conformance at the spawn boundary):
 //   ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
-//   ANTHROPIC_AUTH_TOKEN=<the lane key>     (key pool × model chain, A5)
+//   ANTHROPIC_AUTH_TOKEN=<the lane key>     (key pool × model chain, A5/D2)
 //   ANTHROPIC_MODEL=<the lane model>        ANTHROPIC_SMALL_FAST_MODEL=<same>
 //   DISABLE_TELEMETRY=1                     OX_AGENT_DEADLINE_UTC=<envelope.deadline_ms>
 // ---------------------------------------------------------------------------
@@ -191,13 +197,13 @@ export class AdapterNotShipped extends Error {
   constructor(msg) { super(msg); this.name = 'AdapterNotShipped'; this.code = 'ADAPTER_NOT_SHIPPED'; }
 }
 
-async function ccWork(envelope) {
+async function ccWork(envelope, opts = {}) {
   try {
     const mod = await import('./cc-adapter.mjs');
-    return await mod.ccTurn(envelope);
+    return await mod.ccTurn(envelope, opts);
   } catch (e) {
     if (e?.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/i.test(String(e?.message ?? ''))) {
-      throw new AdapterNotShipped('worker/cc-adapter.mjs lands in W4 (T46 §1d) — MODE=cc reports infra_failed cc-adapter-missing until then');
+      throw new AdapterNotShipped('worker/cc-adapter.mjs missing from the checkout — MODE=cc reports infra_failed cc-adapter-missing (the adapter ships with T46/W4)');
     }
     throw e;
   }
@@ -295,7 +301,7 @@ export async function runTurn({
     raw = await realWork(envelope, { env, fetchImpl });
   } else if (envelope.mode === 'cc') {
     try {
-      raw = await ccWork(envelope);
+      raw = await ccWork(envelope, { env, runId, now, log });
     } catch (e) {
       if (e instanceof AdapterNotShipped) {
         // the routing-level infra marker (NOT a completion payload — the

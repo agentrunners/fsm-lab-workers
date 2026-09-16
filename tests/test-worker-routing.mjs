@@ -6,8 +6,8 @@
 //     deadline at job start reports infra_failed 'late-start', does NO work,
 //     exits 0 (the lease is never burned on a guaranteed orphan)
 //   - MODE routing: mock → shimInvoke / real → the env-driven model chain
-//     with ONE fallback hop on infra-class failure / cc → the clean stub
-//     (infra_failed 'cc-adapter-missing' until W4's adapter)
+//     with ONE fallback hop on infra-class failure / cc → the REAL adapter
+//     (worker/cc-adapter.mjs in CC_FAKE_LLM mode — T46/W4)
 //   - classifyOutcome as the ONE normalizer before report enqueue (the
 //     five-class round trip through the full turn)
 //   - the write-back door: a done carrying illegal artifact_refs flips to
@@ -176,17 +176,52 @@ test('routing: determinism through the whole turn — same run+attempt → byte-
 });
 
 // ---------------------------------------------------------------------------
-// MODE=cc — the clean stub (the adapter lands in W4).
+// MODE=cc — the REAL adapter through the routing (T46/W4: the stub is dead;
+// these drive worker/cc-adapter.mjs in CC_FAKE_LLM mode — zero network, zero
+// npm install; the adapter suite covers the spawn boundary in depth).
 // ---------------------------------------------------------------------------
 
-test('routing: MODE=cc stub — infra_failed \'cc-adapter-missing\', routable, exit 0', async () => {
-  const h = makeHarness({ cp: legacyCp({ mode: 'cc', behavior: 'fast' }) });
+const ccEnv = () => ({
+  CC_FAKE_LLM: '1',
+  OPENROUTER_API_KEY: 'routing-key-1',
+  OPENROUTER_API_KEY_2: 'routing-key-2',
+});
+
+test('routing: MODE=cc (fake lane) — the adapter completes through the full turn: done + transcript + telemetry', async () => {
+  const h = makeHarness({ cp: legacyCp({ mode: 'cc', behavior: 'fast' }), env: ccEnv() });
   const r = await h.turn();
   assert.equal(r.exitCode, 0);
   assert.equal(r.reported, true);
-  assert.equal(h.enqueued[0].outcome.status, 'infra_failed');
-  assert.equal(h.enqueued[0].outcome.error, 'cc-adapter-missing');
-  assert.equal(h.sleeps.length, 0, 'the stub does no work');
+  const rep = h.enqueued[0];
+  assert.equal(rep.outcome.status, 'done', 'the fake CLI answers → content → done');
+  assert.match(rep.outcome.artifact, /fake-cc ok: completed the task on dots-studio/);
+  assert.equal(rep.outcome.telemetry.lane_attempts_used, 1);
+  assert.equal(rep.outcome.telemetry.lanes?.[0]?.key_index, 1);
+  assert.deepEqual(rep.outcome.models, ['dots-studio/dots-3-note-preview:free']);
+  assert.equal(h.sleeps.length, 0, 'the cc lane enforces its OWN wall — no worker-side sleep');
+  assert.ok(!h.fetches.length, 'zero network through the whole turn');
+});
+
+test('routing: MODE=cc (fake lane) — the deadline kill self-reports deadline (the process-group reaper)', async () => {
+  const h = makeHarness({
+    cp: legacyCp({ mode: 'cc', behavior: 'fast', deadline_ms: NOW + 400, budget: { max_turns: 40, wall_ms: 480_000, lane_attempts: 3 }, prompt: '[fixture:sleep-ms=40000] park' }),
+    env: ccEnv(),
+  });
+  const r = await h.turn();
+  assert.equal(r.exitCode, 0);
+  assert.equal(h.enqueued[0].outcome.status, 'deadline');
+  assert.equal(h.enqueued[0].outcome.error, 'wall-budget-exceeded');
+});
+
+test('routing: W2 payload with mode=cc — the epoch-mode lane reaches the adapter (done, fake mode)', async () => {
+  const h = makeHarness({ cp: { ...w2Payload({}, { mode: 'cc' }) }, env: ccEnv() });
+  const r = await h.turn();
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.reported, true);
+  assert.equal(h.enqueued[0].outcome.status, 'done');
+  assert.match(h.enqueued[0].outcome.artifact, /fake-cc ok/);
+  // the W2-minted prompt (title + quoted brief) is what the CLI received
+  assert.ok(h.enqueued[0].outcome.telemetry.lanes?.length >= 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -468,12 +503,17 @@ test('routing: W2 near-expired lease — deadline minted in the past BY DESIGN (
   assert.equal(h.enqueued[0].outcome.error, 'late-start');
 });
 
-test('routing: W2 payload with mode=cc — the epoch-mode lane reaches the stub (cc-adapter-missing)', async () => {
-  const h = makeHarness({ cp: { ...w2Payload({}, { mode: 'cc' }), behavior: 'fast' } });
-  const r = await h.turn();
-  assert.equal(r.exitCode, 0);
-  assert.equal(h.enqueued[0].outcome.status, 'infra_failed');
-  assert.equal(h.enqueued[0].outcome.error, 'cc-adapter-missing');
+test('routing: W2 payload with mode=cc — the envelope budget bounds the lane chain (lane_attempts rides the dispatch into the adapter)', async () => {
+  const h = makeHarness({
+    cp: { ...w2Payload({}, { mode: 'cc' }), prompt: '[fixture:429] always-rate-limited' },
+    env: ccEnv(),
+  });
+  await h.turn();
+  const rep = h.enqueued[0];
+  assert.equal(rep.outcome.status, 'infra_failed', 'every lane answered 429-text-as-answer → infra hop, hop, exhausted');
+  assert.equal(rep.outcome.telemetry.lane_attempts_used, 3, 'W2 mints lane_attempts:3 — exactly three fake spawns');
+  assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
+  assert.equal(rep.outcome.telemetry.lanes?.[2]?.model, 'cohere/north-mini-code:free', 'key-major flatten: three models on key 1');
 });
 
 test('routing: W2 payload with mode=real — the envelope budget bounds the lane chain (lane_attempts rides the dispatch)', async () => {

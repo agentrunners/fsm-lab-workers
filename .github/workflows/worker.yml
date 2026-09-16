@@ -8,8 +8,13 @@
 #   mode=real — one OpenRouter completion on the env-driven model chain
 #     (OPENROUTER_MODEL, then the free defaults) with one fallback hop on
 #     infra-class failure, bounded by budget.lane_attempts.
-#   mode=cc — the CC adapter (W4); until it ships the turn reports
-#     infra_failed 'cc-adapter-missing'.
+#   mode=cc — the CC adapter (worker/cc-adapter.mjs, T46/W4): the
+#     claude-code CLI turn on the key-pool × model-chain lanes (D2), the
+#     F-M8 OpenRouter bridge env, the process-group wall kill at the
+#     deadline, transcripts to fsm-sessions BEFORE the report, the
+#     write-back door on artifacts. CC_FAKE_LLM=1 swaps the CLI for
+#     worker/fake-cc.mjs (deterministic fixtures — never set in live
+#     dispatches; the X20 smoke is the only real-lane execution).
 # EVERY mode passes the LAW-1 START-GATE first (envelopeFromDispatch): an
 # already-expired deadline → one infra_failed 'late-start' report, exit 0 —
 # the lease is never burned on a guaranteed orphan.
@@ -83,5 +88,14 @@ jobs:
           # nvidia/nemotron-3-ultra-550b-a55b:free, cohere/north-mini-code:free]
           # with ONE fallback hop on infra-class failure).
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || '' }}
+          # T46/W4 §1d (D2): MODE=cc lanes — the KEY POOL (secret #7 primary,
+          # #6 secondary; empty/absent lanes are simply not in the pool) and
+          # the model chain head (OPTIONAL repo variable CC_MODEL; empty = the
+          # free-lane defaults in worker/cc-adapter.mjs). The CLI pin
+          # (OPTIONAL CC_VERSION, default 'latest') + the determinism mode
+          # (CC_FAKE_LLM — NEVER in live dispatches) complete the env surface.
+          OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
+          CC_MODEL: ${{ vars.CC_MODEL || '' }}
+          CC_VERSION: ${{ vars.CC_VERSION || '' }}
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs
