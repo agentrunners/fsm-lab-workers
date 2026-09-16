@@ -511,9 +511,10 @@ function scenarioMatrix() {
   // X21 ox shape: the envelope rides payload.ox — checked THROUGH the
   // worker's own gate (the real consumer), not raw fields
   const badPayload = d.dispatches.filter(x => {
-    const g = envelopeFromDispatch(x.payload, Date.parse(x.payload.expires) - 60_000);
-    if (!g.ok) return true;
-    const e = g.envelope;
+    // direct ox-field check (the gate's late-start semantics don't apply
+    // here — the check evaluates long after mint, the deadline is history)
+    let e;
+    try { e = JSON.parse(x.payload.ox); } catch { return true; }
     return !(typeof e.prompt === 'string' && e.prompt.includes('Task ')
       && Number.isFinite(e.deadline_ms) && e.deadline_ms > 0
       && (e.mode === 'mock') && typeof e.session === 'string'
