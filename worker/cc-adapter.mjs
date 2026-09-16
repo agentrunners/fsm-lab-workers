@@ -190,8 +190,8 @@ async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
     detached: true,   // its own group: a CLI group-kill cannot take the bridge
   });
   let output = '';
-  child.stdout.on('data', (d) => { output += d; });
-  child.stderr.on('data', (d) => { output += d; });
+  child.stdout.on('data', (d) => { output += d; log(`CC-BRIDGE ${String(d).trim().slice(0, 300)}`); });
+  child.stderr.on('data', (d) => { output += d; log(`CC-BRIDGE-ERR ${String(d).trim().slice(0, 300)}`); });
   const t0 = Date.now();
   let port = null;
   while (Date.now() - t0 < timeoutMs) {
@@ -572,7 +572,9 @@ export async function ccTurn(envelope, opts = {}) {
         laneInfo.class = 'work';
         // X20 run-2 lesson: the CLI's stderr IS the diagnosis — log it
         // (the transcript failure must never mask the work-class cause)
-        log(`CC-LANE-EXIT rc=${r.rc} model=${lane.model} stderr=${JSON.stringify(r.stderr.split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 300))}`);
+        let stdoutJson = '';
+        try { const pj = JSON.parse(r.stdout); stdoutJson = ` is_error=${pj.is_error} api_error_status=${pj.api_error_status} subtype=${pj.subtype ?? '-'} result=${String(pj.result ?? '').slice(0, 120)}`; } catch { stdoutJson = ' stdout-unparseable'; }
+        log(`CC-LANE-EXIT rc=${r.rc} model=${lane.model} stderr=${JSON.stringify(r.stderr.split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 300))}${stdoutJson}`);
         return await finalize({
           status: 'work_failed', detail: `cc-exit-${r.rc}(${r.stderr.split('\n')[0].slice(0, 80)})`,
           artifact_refs: [], summary: `cc: task ${taskId} attempt ${attempt} exited ${r.rc} on lane ${i + 1} (${lane.model})`,
