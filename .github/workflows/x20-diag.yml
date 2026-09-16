@@ -37,7 +37,7 @@ jobs:
           cd /tmp
           case "${{ matrix.variant }}" in
             A-default-sonnet-remap)
-              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+              CI=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
                 ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
                 ANTHROPIC_DEFAULT_SONNET_MODEL="$SLUG" \
                 ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
@@ -46,7 +46,7 @@ jobs:
                 > /tmp/out.json 2>/tmp/err.txt || true
               ;;
             B-model-flag)
-              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+              CI=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
                 ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
                 ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
                 DISABLE_TELEMETRY=1 \
@@ -54,7 +54,7 @@ jobs:
                 > /tmp/out.json 2>/tmp/err.txt || true
               ;;
             C-env-plus-debug)
-              CI=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+              CI=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
                 ANTHROPIC_AUTH_TOKEN="$OPENROUTER_API_KEY" \
                 ANTHROPIC_MODEL="$SLUG" \
                 ANTHROPIC_SMALL_FAST_MODEL="$SLUG" \
