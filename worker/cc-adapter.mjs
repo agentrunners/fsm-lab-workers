@@ -291,22 +291,34 @@ function pushSessionsBranch({ env, files, log }) {
   const url = `https://x-access-token:${token}@github.com/${repo}.git`;
   const scratch = mkdtempSync(join(tmpdir(), 'cc-sessions-'));
   const wc = join(scratch, 'wc');
+  // X20 run-2 lesson: BOTH paths need the workdir — `git clone ... .` AND
+  // `git init .` fail with "cannot change to '<wc>'" when it doesn't exist
+  // (the init fallback only ran because the clone failed on the SAME
+  // missing-dir cause, masking the real branch-absence signal)
+  mkdirSync(wc, { recursive: true });
   const git = (args) => spawnSync('git', args, { cwd: wc, encoding: 'utf8' });
+  const fail = (step, r) => new Error(`${step} failed: ${String(r.stderr || r.error || `rc=${r.status}`).trim().slice(0, 160)}`);
   try {
-    let ok = git(['clone', '--depth', '1', '--branch', 'fsm-sessions', '--single-branch', url, '.']).status === 0;
-    if (!ok) {
+    const clone = git(['clone', '--depth', '1', '--branch', 'fsm-sessions', '--single-branch', url, '.']);
+    if (clone.status !== 0) {
       // branch absent → orphan-branch genesis (sessions is not a code branch)
-      if (git(['init', '-b', 'fsm-sessions', '.']).status !== 0) throw new Error('git init failed');
-      if (git(['remote', 'add', 'origin', url]).status !== 0) throw new Error('git remote failed');
+      const init = git(['init', '-b', 'fsm-sessions', '.']);
+      if (init.status !== 0) throw fail('git init', init);
+      const remote = git(['remote', 'add', 'origin', url]);
+      if (remote.status !== 0) throw fail('git remote', remote);
+      log(`CC-SESSIONS-GENESIS fsm-sessions branch absent — orphan genesis (clone stderr: ${String(clone.stderr).trim().slice(0, 120)})`);
     }
     for (const [rel, content] of files) {
       mkdirSync(dirname(join(wc, rel)), { recursive: true });
       writeFileSync(join(wc, rel), content);
     }
-    if (git(['add', ...files.map(([rel]) => rel)]).status !== 0) throw new Error('git add failed');
-    if (git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
-      'commit', '-m', 'transcript: sessions update']).status !== 0) throw new Error('git commit failed');
-    if (git(['push', 'origin', 'fsm-sessions']).status !== 0) throw new Error('git push failed');
+    const add = git(['add', ...files.map(([rel]) => rel)]);
+    if (add.status !== 0) throw fail('git add', add);
+    const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
+      'commit', '-m', 'transcript: sessions update']);
+    if (commit.status !== 0) throw fail('git commit', commit);
+    const push = git(['push', 'origin', 'fsm-sessions']);
+    if (push.status !== 0) throw fail('git push', push);
     log(`CC-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions`);
     return { mode: 'pushed', branch: 'fsm-sessions', files: [...files.keys()] };
   } finally {
@@ -482,6 +494,9 @@ export async function ccTurn(envelope, opts = {}) {
           continue;   // the lane never reached the model — rotate
         }
         laneInfo.class = 'work';
+        // X20 run-2 lesson: the CLI's stderr IS the diagnosis — log it
+        // (the transcript failure must never mask the work-class cause)
+        log(`CC-LANE-EXIT rc=${r.rc} model=${lane.model} stderr=${JSON.stringify(r.stderr.split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 300))}`);
         return await finalize({
           status: 'work_failed', detail: `cc-exit-${r.rc}(${r.stderr.split('\n')[0].slice(0, 80)})`,
           artifact_refs: [], summary: `cc: task ${taskId} attempt ${attempt} exited ${r.rc} on lane ${i + 1} (${lane.model})`,
@@ -600,14 +615,24 @@ export async function ccTurn(envelope, opts = {}) {
         result.transcript = await writeTranscript(envelope, runId, fake, forTranscript, { ...opts, env, now }, log);
         result.transcript.txt = transcriptPaths(envelope, runId).txt;
       } catch (e) {
-        return {
-          status: 'infra_failed',
-          detail: String(e?.message ?? e).slice(0, 200),
-          artifact_refs: result.artifact_refs,
-          summary: `cc: task ${taskId} attempt ${attempt} — the transcript never landed (${String(e?.message ?? e).slice(0, 120)})`,
-          telemetry: result.telemetry, models: result.models,
-          lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
-        };
+        // X20 run-2 lesson: a FAILED turn keeps its work-class result — the
+        // transcript is diagnostic for failures, and the infra escalation
+        // MASKED the CLI's stderr diagnosis (the exact bug run 2 hit). Only
+        // a DONE turn escalates to infra: its report references the
+        // transcript, so a missing one is a contract violation worth a
+        // net-zero retry. Failed turns carry the miss in the summary.
+        if (internalCls.status === 'done') {
+          return {
+            status: 'infra_failed',
+            detail: String(e?.message ?? e).slice(0, 200),
+            artifact_refs: result.artifact_refs,
+            summary: `cc: task ${taskId} attempt ${attempt} — the transcript never landed (${String(e?.message ?? e).slice(0, 120)})`,
+            telemetry: result.telemetry, models: result.models,
+            lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
+          };
+        }
+        log(`CC-TRANSCRIPT-MISSED (best-effort for a ${internalCls.status} turn): ${String(e?.message ?? e).slice(0, 160)}`);
+        result.summary += ` [transcript missed: ${String(e?.message ?? e).slice(0, 80)}]`;
       }
       // the staging seam (W-C): allowed refs stage locally today; the live
       // task-branch commit + remote read-back replaces this when intake ships
