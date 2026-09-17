@@ -357,7 +357,7 @@ function scenarioMatrix() {
   };
   const d = new Sim3Driver({
     label: 's3matrix', project, mode: 'mock', world,
-    config: { max_parallel: 10, lease_minutes: 4, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 10, lease_minutes: 4, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300, prune_tasks_after_ticks: 500 }, // W-C1: prune OFF here — sim3 pins the REPORT ARCS (infra_attempts etc. ride the full records); the prune projection has its own suite
   }).run();
 
   const p = (n, ok, detail) => check(`matrix: ${n}`, ok, detail);
@@ -550,7 +550,7 @@ function scenarioLaw1() {
   const d = new Sim3Driver({
     label: 's3law1', project, mode: 'mock',
     world: { ttlMin: 10, verify: () => ({ keys: null, nowMs: null }) },
-    config: { max_parallel: 4, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 4, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300, prune_tasks_after_ticks: 500 },
   }).run();
 
   const p = (n, ok, detail) => check(`law-1: ${n}`, ok, detail);
@@ -609,7 +609,7 @@ function scenarioLaw4() {
       dropRuns: 1,       // the FIRST dispatch never materializes a run
       verify: (sim) => ({ keys: new Set(sim.seenRunKeys), nowMs: sim.t }),
     },
-    config: { max_parallel: 4, lease_minutes: 15, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 4, lease_minutes: 15, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300, prune_tasks_after_ticks: 500 },
   }).run();
 
   const p = (n, ok, detail) => check(`law-4: ${n}`, ok, detail);

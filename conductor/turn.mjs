@@ -29,14 +29,14 @@
 // 4 and 5, the watchdog re-primes. Every failure state has a handler.
 
 import { Store } from '../lib/store.mjs';
-import { genesis } from '../lib/fsm.mjs';
+import { genesis, apply } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS,
+  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
-import { buildEvent } from '../lib/event-ingest.mjs';
+import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
 const RUN_ID = process.env.GITHUB_RUN_ID || 'local';
@@ -127,6 +127,43 @@ async function postIssueComment(body) {
   return r.status === 201;
 }
 
+// T46/W-C1 (F-8): the budget-pause alert lane — the established
+// fsm-watchdog-alert issue shape (find open → comment; none → open). EVERY
+// POST result is checked (law 5): failure propagates as {ok:false} and the
+// turn goes RED with the chain still self-ticking (the window re-triggers
+// the attempt next tick — the correlated-failure self-heal).
+async function budgetAlertIssue(action) {
+  const body = [
+    '**[fsm-alert] Lane budget exhausted — epoch PARKED.**',
+    '',
+    `Trigger: ${action.backstop ? 'infra-exhausted backstop (a task\'s full infra ladder burned on quota-shaped failures)' : `distinct-tasks (${action.tasks.length} ≥ threshold) with quota-shaped infra reports inside the pause window`}.`,
+    `Tasks: ${action.tasks.join(', ')}`,
+    `Observed detail (verbatim): \`${action.detail}\``,
+    '',
+    'Window (task · detail):',
+    ...(action.window || []).slice(0, 10).map(e => `- ${e.task} · ${e.detail}`),
+    '',
+    'The chain is **paused** — zero further dispatches until resumed. This is the structural fix for the X21 12-task quarantine burn.',
+    '',
+    '**Resume** (after the quota resets — daily UTC rollover for OpenRouter free tiers):',
+    '```',
+    `gh api -X POST repos/${REPO}/dispatches -f event_type=fsm-control -F 'client_payload[command]=resume'`,
+    '```',
+    '(or workflow_dispatch fsm-ops with command=resume)',
+  ].join('\n');
+  const fr = await api(`/repos/${REPO}/issues?state=open&labels=fsm-watchdog-alert&per_page=10`);
+  if (fr.status !== 200 || !Array.isArray(fr.data)) return { ok: false, where: 'search' };
+  if (fr.data.length) {
+    const cr = await api(`/repos/${REPO}/issues/${fr.data[0].number}/comments`, 'POST', { body });
+    return cr.status === 201 ? { ok: true, issue: fr.data[0].number } : { ok: false, where: 'comment' };
+  }
+  const or = await api(`/repos/${REPO}/issues`, 'POST', {
+    title: '[fsm-alert] lane budget exhausted — epoch parked',
+    body, labels: ['fsm-watchdog-alert'],
+  });
+  return or.status === 201 && or.data?.number ? { ok: true, issue: or.data.number } : { ok: false, where: 'open' };
+}
+
 // ---------------------------------------------------------------------------
 
 function summaryMd(state, applied, reason, actions) {
@@ -162,10 +199,29 @@ async function main() {
   // genesis() validates it (GENESIS_MODES); a bad value fails the genesis —
   // loud, never a silent wrong-mode epoch.
   const EPOCH_MODE = process.env.EPOCH_MODE || 'mock';
-  const makeGenesis = ({ config } = {}) => {
+  // T46/W-C1 (§2e/F-5): makeGenesis gained the SPEC + ISSUE params — the
+  // intake rollover and reset {from_queue} build the epoch from a queued
+  // spec (validated at the door); the plain paths keep mockProject. The
+  // spec's own mode (validated against GENESIS_MODES at the door) wins;
+  // absent → the operator's EPOCH_MODE env (the X21 switch, unchanged).
+  const makeGenesis = ({ config, spec, issue, bodySha8 } = {}) => {
     const cfg = config || DEFAULT_CFG();
-    const mp = mockProject();
     const chainId = `c-${Date.now()}`;
+    if (spec) {
+      // specToTask (conductor-core) is the CANONICAL mapper — the door's
+      // pure half parity-pins the same shape at integration.
+      // T46/W-C1-R (lens-1 BLOCKING-1 adapter half): spec epochs carry
+      // milestones_total=1 — the task IS the project; the clock's
+      // milestones_total bound (fsm.mjs pass 5) then NEVER consults the
+      // mock drill's generator for an intake epoch (the live sprout bug:
+      // every intake epoch ran the mock M2+M3 — ~10 phantom dispatches —
+      // before the rollover could fire). The spec's `milestone` key stays
+      // door-validated metadata for W-D's multi-task epochs (inert here).
+      const task = specToTask(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
+      const g = genesis({ config: cfg, project: { tasks: [task], milestones: 1 }, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
+      return { state: g, spec: { tasks: [task], milestones: 1, chainId, mode: g.project.mode } };
+    }
+    const mp = mockProject();
     const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now(), mode: EPOCH_MODE });
     return { state: g, spec: { tasks: mp.m1, milestones: 3, chainId, mode: g.project.mode } };
   };
@@ -245,10 +301,21 @@ async function main() {
     }
   }
   const out = await Promise.resolve(store.commit({
-    mutate: (cur, queue, controlQueue, queueBad, ctlBad) => conductorTick({
-      cur, queue, controlQueue, queueBad, ctlBad, ev, now,
+    mutate: (cur, queue, controlQueue, queueBad, ctlBad, intakeQueue, intakeBad) => conductorTick({
+      cur, queue, controlQueue, queueBad, ctlBad, intakeQueue, intakeBad, ev, now,
       nextMilestone: NM, recover, makeGenesis,
       seenDispatchKeys, verifyNowMs,
+      // T46/W-C1 (F-10): the dispatch budget — slot count from the JOB
+      // deadline, self-tick reserve carved FIRST (R3 D1-M2). The fn receives
+      // the SPENT slot count (tick-wide + pass): each assign+dispatch pair
+      // spends DISPATCH_COST_MS of remaining. Exhausted → tasks stay READY
+      // (never assigned — the skip-left-assigned class is dead). The
+      // arithmetic lives in conductor-core's dispatchBudgetFromWall (the
+      // W-C1-R MUT-c fold: extracted so the pin bites the REAL code, not a
+      // string-shape source check).
+      dispatchBudgetFn: (spent) => dispatchBudgetFromWall({
+        remainingMs: BUDGET.remaining(), reserveMs: SELF_TICK_RESERVE_MS, costMs: DISPATCH_COST_MS, spent,
+      }),
     }),
   }));
 
@@ -265,7 +332,6 @@ async function main() {
   // 4. execute actions (workers first — parallelism starts ASAP)
   let dispatchFailures = 0;
   let dispatchSkipped = 0;   // F-C: budget-exhausted skips (lease re-covers — loud, not fatal)
-  let dispatchPaced = 0;     // T46/W2 (F-M2): pacing-floor skips (long-lease epochs only)
   const actionList = out.actions || [];
   // T46/W2 (F-B2): the brief rides every dispatch AS QUOTED DATA; the mode
   // comes from the epoch (state.project.mode — W1's genesis field). Read
@@ -276,29 +342,9 @@ async function main() {
     briefMd = fsMod.default.readFileSync('briefs/project.md', 'utf8');
   } catch { /* absent brief — the envelope omits it cleanly */ }
   const epochMode = state.project?.mode || 'mock';
-  // M-3/B (46-R2): the default comes from conductor-core's LIVE exported
-  // PACING_FLOOR_DEFAULT_S (env override wins) — the hardcoded `|| '0'`
-  // made the constant dead code and the hot-fix-2 default revert-survivable.
-  // X21 semantics preserved: default OFF (the skip-left-assigned bug — see
-  // conductor-core).
-  const floorS = resolvePacingFloorS(process.env);
-  let lastDispatchMs = NaN;
   let dispatchIndex = 0;
   for (const a of actionList) {
     if (a.type === 'DISPATCH_WORKER') {
-      // T46/W2 (F-M2): the lease-aware pacing floor — only long-lease
-      // epochs (lease_minutes ≥ 7); a skip is LOUD (the task re-covers next
-      // tick — same doc as F-C's budget skip).
-      const floor = pacingFloorDecision({
-        leaseMinutes: state.config.lease_minutes,
-        floorS, lastDispatchMs, nowMs: Date.now(),
-        isFirstDispatchOfTurn: dispatchIndex === 0,
-      });
-      if (floor.applies) {
-        console.log(`DISPATCH-PACED task=${a.task} floor=${floorS}s elapsed=${Math.round((Date.now() - lastDispatchMs) / 1000)}s (lease_minutes=${state.config.lease_minutes} ≥ 7 — long-lease epoch) — re-covers next tick`);
-        dispatchPaced++;
-        continue;
-      }
       dispatchIndex++;
       // F-C (R3 D1-M2, hardened): the reserve is carved out FIRST — the
       // worker ladder's budget is what remains AFTER the heartbeat window is
@@ -326,8 +372,7 @@ async function main() {
         { nowMs: Date.now(), mode: epochMode },
       );
       const d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
-      if (d.ok) lastDispatchMs = Date.now();
-      else {
+      if (!d.ok) {
         // X21 lesson: 4 dispatchFailures with ZERO logged detail (the 422
         // 10-property limit took a whole debugging round to find) — the
         // failure's STATUS + body slice are always visible now
@@ -345,6 +390,9 @@ async function main() {
 
   // alertable journal records -> ops issue comments (bounded: quarantine is
   // terminal per task; PHASE/MILESTONE fire once each)
+  // T46/W-C1: the scan also serves the intake thread (m-3) — the rollover's
+  // "epoch started" note and the PHASE-done completion comment target the
+  // INTAKE issue (project.issue) in addition to the ops console.
   for (const j of out.journal || []) {
     if (j.kind === 'REPORT' && j.to === 'quarantined') {
       await postIssueComment(`**[fsm-alert]** task ${j.task} QUARANTINED (attempts exhausted) — journal ${j.id}`);
@@ -352,8 +400,21 @@ async function main() {
     if (j.kind === 'TIMEOUT' && j.to === 'quarantined') {
       await postIssueComment(`**[fsm-alert]** task ${j.task} QUARANTINED via lease timeout — journal ${j.id}`);
     }
+    if (j.kind === 'BUDGET') {
+      // F-10: the observable pacing signal — one log line per exhausted tick
+      console.log(`DISPATCH-PACED budget=${j.budget} ready_remaining=${j.ready_remaining} — tasks stay ready, next tick re-assigns (journal ${j.id})`);
+    }
     if (j.kind === 'MILESTONE') {
       await postIssueComment(`**[fsm]** milestone M${j.milestone} STARTED (${j.tasks.length} tasks)`);
+    }
+    if (j.kind === 'CONTROL' && j.command === 'reset' && typeof j.note === 'string' && j.note.startsWith('intake-rollover')) {
+      // m-3: the intake thread's "epoch started" note — rides the rollover's
+      // journal record (one extra POST per epoch boundary, never per tick)
+      const issueN = state.project?.issue;
+      if (issueN) {
+        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch started for this task (chain ${state.chain.id}) — the conductor will dispatch workers and report completion here. ${j.note}` });
+        if (r.status !== 201) console.log(`INTAKE-COMMENT-FAILED issue=${issueN} HTTP=${r.status} (law 5: visible, non-fatal — the epoch still runs)`);
+      }
     }
     if (j.kind === 'PHASE' && j.to === 'done') {
       // R2 quality-gate (T45): a completion dominated by quarantine/cancel is
@@ -364,6 +425,69 @@ async function main() {
       } else {
         await postIssueComment(`**[fsm]** PROJECT COMPLETE — stats ${JSON.stringify(state.stats)}`);
       }
+      // m-3: an intake-born epoch's completion comment targets the intake
+      // issue too (X22's criterion: the operator's thread gets the outcome).
+      const issueN = state.project?.issue;
+      if (issueN) {
+        const taskIds = Object.keys(state.tasks);
+        const dones = Object.values(state.tasks).filter(t => t.status === 'done');
+        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch ${j.degraded ? 'HALTED DEGRADED' : 'COMPLETE'} for this task — done ${state.stats.done}/${taskIds.length}${dones.length && dones[0].last_result?.artifact ? `\n\nResult digest: ${String(dones[0].last_result.artifact).slice(0, 600)}` : ''}\n\n(stats ${JSON.stringify(state.stats)})` });
+        if (r.status !== 201) console.log(`INTAKE-COMMENT-FAILED issue=${issueN} HTTP=${r.status} (law 5: visible, non-fatal)`);
+      }
+    }
+  }
+
+  // T46/W-C1 (F-8): the lane-budget pause — ALERT FIRST, then the pause
+  // event in a SECOND commit. Order: (1) open/comment the fsm-watchdog-alert
+  // issue; (2) failure → the turn goes RED (law 5) with NO pause committed —
+  // the chain self-ticks, the persisted window re-triggers next tick (the
+  // correlated-failure self-heal); (3) success → mint + apply the pause
+  // CONTROL event (id ctl-<alertIssue#>-budget-pause-<ms>) → HOLD_CHAIN.
+  // Honest residual (documented, sim4 scenario 5 pins it): the trigger
+  // tick's already-dispatched in-flight leases expire once under the pause
+  // and the reaper re-queues them — ≤1 work attempt on ≤threshold tasks;
+  // every NOT-yet-dispatched task keeps 0 (the X21 12×3 burn is dead).
+  let pausedNow = false;
+  const pauseAction = actionList.find(a => a.type === 'BUDGET_PAUSE_ALERT');
+  if (pauseAction) {
+    const alert = await budgetAlertIssue(pauseAction);
+    if (!alert.ok) {
+      console.error(`ALERT-POST-FAILED (${alert.where}) — NO pause committed; the chain self-ticks and the window re-triggers next tick (law 5: this run is RED)`);
+      process.exitCode = 1;
+    } else {
+      const pauseEv = {
+        kind: 'CONTROL', command: 'pause',
+        payload: { reason: 'lane-budget-exhausted', window: pauseAction.window },
+        event_id: mintEventId('CONTROL', { nodeId: String(alert.issue), command: 'budget-pause', clockMs: Date.now() }),
+        ts: now(),
+      };
+      let out2;
+      try {
+        out2 = await Promise.resolve(store.commit({
+          mutate: (cur2, q2, cq2) => {
+            // queues that landed between the two commits are NOT consumed —
+            // they rewrite unchanged for the next tick (never dropped).
+            // W-C1-R (lens-2 m1): the store THROWS when CAS retries exhaust
+            // (it never returns a noop commit) — the try/catch makes the
+            // failure observable AS the budget-pause path (log + red +
+            // self-tick + watchdog recovery) instead of the generic
+            // CONDUCTOR-FAILED death with no TURN-COMPLETE.
+            const r = apply(cur2, pauseEv, now(), NM, {});
+            return { state: r.state, journal: r.journal, actions: r.actions, queue: q2, controlQueue: cq2 };
+          },
+        }));
+      } catch (e) {
+        console.error(`BUDGET-PAUSE-COMMIT-FAILED (${String(e?.message ?? e).slice(0, 160)}) — the window re-triggers next tick; run is RED`);
+        process.exitCode = 1;
+        out2 = null;
+      }
+      if (out2 && out2.committed) {
+        pausedNow = true;
+        console.log(`BUDGET-PAUSE applied (alert issue #${alert.issue}, event ${pauseEv.event_id}) — chain PAUSED, zero further dispatches; resume via the alert's command`);
+      } else if (out2) {
+        console.error(`BUDGET-PAUSE-COMMIT-NOT-COMMITTED (${out2.reason}) — the window re-triggers next tick; run is RED`);
+        process.exitCode = 1;
+      }
     }
   }
 
@@ -372,7 +496,7 @@ async function main() {
   // sleep keeps the job occupied (free on public repos) and throttles ticks.
   // F-C: pacing under budget — min(interval-elapsed, remaining-RESERVE, 240s);
   // <= 0 skips pacing (a faster tick is harmless; the throttle is a nicety).
-  const stop = actionList.some(a => a.type === 'STOP_CHAIN' || a.type === 'HOLD_CHAIN');
+  const stop = actionList.some(a => a.type === 'STOP_CHAIN' || a.type === 'HOLD_CHAIN') || pausedNow;
   let chain = { ok: true };
   let selfTickSkipped = false;
   if (!stop) {
@@ -399,7 +523,7 @@ async function main() {
   }
   // summary + compact log line
   const fs = await import('node:fs');
-  const appliedReason = `${out.reason || 'ok'}${dispatchFailures ? ` dispatchFailures=${dispatchFailures}` : ''}${dispatchSkipped ? ` dispatchSkipped=${dispatchSkipped}` : ''}${dispatchPaced ? ` dispatchPaced=${dispatchPaced}` : ''}${selfTickSkipped ? ' selfTick=skipped' : ''}`;
+  const appliedReason = `${out.reason || 'ok'}${dispatchFailures ? ` dispatchFailures=${dispatchFailures}` : ''}${dispatchSkipped ? ` dispatchSkipped=${dispatchSkipped}` : ''}${pausedNow ? ' budgetPaused' : ''}${selfTickSkipped ? ' selfTick=skipped' : ''}`;
   fs.default.appendFileSync(process.env.GITHUB_STEP_SUMMARY || '/dev/null',
     summaryMd(state, true, appliedReason, actionList) + '\n');
   console.log(`TURN-COMPLETE applied=true reason=${appliedReason} v=${state.version} seq=${state.chain.seq} `

@@ -103,6 +103,18 @@ const server = createServer(async (req, res) => {
       return;
     }
     path = u.pathname;
+    // ---- T46/W-C1 (§3d, X21-F-3): the CLI's liveness probe — HEAD
+    // /api/hello. Observed live (X21): the CLI HEADs this route and the 501
+    // unknown-route answer noise-failed the turn's bridge log. A 204 is the
+    // honest "alive" answer for a HEAD (no body by RFC); every OTHER
+    // unmatched route keeps the loud 501 (the bridge must never silently
+    // 404 a route the CLI grows into).
+    if (req.method === 'HEAD' && path === '/api/hello') {
+      res.writeHead(204);
+      res.end();
+      console.log('BRIDGE hello HEAD /api/hello -> 204 (the CLI liveness probe)');
+      return;
+    }
     // ---- the pre-flight: model info (synthesized — 200 + an id is the ask)
     if (req.method === 'GET' && /^\/v1\/models/.test(path)) {
       // m-7 fix (r2 lens C): the DETAIL route (GET /v1/models/{id}) returns

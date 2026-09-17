@@ -15,7 +15,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { genesis, apply, invariants, TERMINAL } from '../lib/fsm.mjs';
+import { genesis, apply, invariants, TERMINAL, rebuild } from '../lib/fsm.mjs';
 import { conductorTick } from '../lib/conductor-core.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
@@ -609,4 +609,264 @@ test('T46/law-7: cold start — an ABSENT state branch (cur=null, no snapshot an
   assert.ok(!out3.actions.some(a => a.type === 'BOOTSTRAP_NOTICE'),
     'a found snapshot is a RECOVERY, never a bootstrap — the notice does not lie');
   assert.ok(out3.actions.some(a => a.type === 'RECOVERY_NOTICE'));
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-C1: the intake drain + epoch ROLLOVER (F-5) + reset flags + pruning
+// ---------------------------------------------------------------------------
+
+// the spec-aware makeGenesis (the adapter's extended contract: {config,
+// spec, issue} — spec births the intake epoch; plain keeps mockProject)
+const mkIntakeG = (() => {
+  let n = 0;
+  return ({ config, spec, issue } = {}) => {
+    const cfg = config || { ...CFG };
+    const chainId = `c-wc1-${++n}`;
+    let tasks, miles = 1, mode = 'mock', iss = null;
+    if (spec) {
+      tasks = [{ id: spec.id || `task-i${issue}`, title: spec.title || `intake ${issue}`, behavior: spec.behavior || 'real', work_ms: 4000, deps: [], spec: { accept: spec.accept, artifacts: spec.artifacts, issue } }];
+      miles = Math.max(spec.milestone ?? 1, 1);
+      iss = issue ?? null;
+    } else {
+      tasks = fastProject().m1; miles = 2;
+    }
+    const g = genesis({ config: cfg, project: { tasks, milestones: miles }, chainId, now: iso(T0 + n), mode, issue: iss });
+    return { state: g, spec: { tasks, milestones: miles, chainId, mode } };
+  };
+})();
+
+test('W-C1/F-5: the halting tick with a queued spec mints the next genesis IN THE SAME TICK (rollover; STOP_CHAIN filtered; queue consumed)', () => {
+  const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  // a done epoch (halted) + one queued spec
+  let s = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-done', now: iso(T0) });
+  s = apply(s, tickEv('r1'), iso(T0), nextMilestoneFactory(ONE)).state;          // assign X
+  s = apply(s, { kind: 'REPORT', event_id: 'rep-done-1', task: 'X', lease: s.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, iso(T0 + 1000), nextMilestoneFactory(ONE)).state;
+  assert.equal(s.project.phase, 'done');
+  assert.equal(s.chain.halted, true);
+  const qline = { issue: 42, body_sha8: 'abcd1234', spec: { title: 'research the frob', accept: 'one paragraph' }, enqueued_at: iso(T0), author: 'operator' };
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('roll'), now: n.now, nextMilestone: nextMilestoneFactory(ONE), recover: noRecover, makeGenesis: mkIntakeG,
+  });
+  // the rollover: a fresh epoch from the spec, in THIS tick
+  assert.equal(out.state.project.phase, 'executing', 'the fresh epoch is live');
+  assert.notEqual(out.state.chain.id, 'c-done', 'a NEW chain');
+  assert.equal(out.state.project.issue, 42, 'm-3: the intake thread rides the project');
+  assert.equal(out.state.tasks['task-i42'].behavior, 'real', 'the accept-spec task (behavior real)');
+  assert.ok(out.state.tasks['task-i42'].spec.accept, 'the accept criteria ride the task');
+  assert.ok(out.actions.some(a => a.type === 'DISPATCH_WORKER' && a.task === 'task-i42'), 'M1 assigned + dispatched in the same tick');
+  assert.ok(!out.actions.some(a => a.type === 'STOP_CHAIN'), 'F-5: the halting STOP_CHAIN is filtered — the chain continues');
+  assert.deepEqual(out.intakeQueue, [], 'consume = rewrite-minus-head (empty rest = file deleted)');
+  const rollRec = out.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset' && String(j.note || '').startsWith('intake-rollover'));
+  assert.ok(rollRec, 'the rollover journals as a CONTROL reset (rebuild replays it with zero new code)');
+  assert.equal(rollRec.actor, 'intake-door:operator');
+  assert.equal(rollRec.genesisSpec.issue, 42, 'the genesisSpec carries the issue');
+  // rebuild parity: replaying the rollover journal reconstructs the fresh epoch
+  const base = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-par', now: iso(T0) });
+  const rb = rebuild(base, out.journal);
+  assert.equal(rb.project.issue, 42, 'rebuild: the intake thread replays');
+  assert.ok(rb.tasks['task-i42'], 'rebuild: the spec task replays');
+});
+
+test('W-C1/F-5: an ACTIVE epoch parks the queue (no journals, no consume — quiesce while live)', () => {
+  const s = boot();
+  const qline = { issue: 7, body_sha8: 'ef567890', spec: { title: 'next thing', accept: 'x' }, enqueued_at: iso(T0), author: 'op' };
+  const n = makeNow(T0 + 1000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('park'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: mkIntakeG,
+  });
+  assert.equal(out.state.project.phase, 'executing', 'the active epoch is untouched');
+  assert.equal(out.intakeQueue, undefined, 'm-5: park = no writeback (the file stays as-is in git)');
+  assert.ok(!out.journal.some(j => j.kind === 'CONTROL' && String(j.note || '').includes('intake')), 'a park-only tick journals nothing intake-shaped');
+});
+
+test('W-C1/F-5: reset {from_queue} takes the head; {drop_queue} discards; plain reset parks the queue — BOTH lanes', () => {
+  const qline = (i) => ({ issue: i, body_sha8: `s${i}`, spec: { title: `t${i}`, accept: 'x' }, enqueued_at: iso(T0), author: 'op' });
+  const run = (patch, queue, lane = 'queued') => {
+    const n = makeNow(T0 + 1000);
+    const suffix = Math.random().toString(36).slice(2, 8);
+    // ONE lane per run (direct + queued twins trip the F-1 twin-guard by
+    // design — the e913/e914 shape; each lane is exercised alone here)
+    return conductorTick({
+      cur: structuredClone(boot()), queue: [], controlQueue: lane === 'queued' ? [{ cmd: 'reset', id: `ctl-rq-${suffix}`, ts: iso(T0), sender: 'op', note: 'flag test', patch }] : [], queueBad: [], ctlBad: [],
+      intakeQueue: queue, intakeBad: [],
+      ev: lane === 'direct' ? { kind: 'CONTROL', command: 'reset', event_id: `ctl-direct-rq-${suffix}`, ts: iso(T0), patch } : tickEv('rq'),
+      now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: mkIntakeG,
+    });
+  };
+  // plain reset: queue parks
+  const a = run(undefined, [qline(1), qline(2)]);
+  assert.equal(a.intakeQueue, undefined, 'plain reset: the queue parks (the drill contract is sacred)');
+  assert.ok(!a.state.project.issue, 'a plain reset births no intake thread');
+  // from_queue: head consumed, genesis from the spec
+  const b = run({ from_queue: true }, [qline(1), qline(2)]);
+  assert.equal(b.state.project.issue, 1, 'from_queue: the head spec birthed the epoch');
+  assert.deepEqual(b.intakeQueue, [qline(2)], 'from_queue: consume-minus-head');
+  // drop_queue alone: discards everything, mock genesis
+  const c = run({ drop_queue: true }, [qline(1), qline(2)]);
+  assert.deepEqual(c.intakeQueue, [], 'drop_queue: the queue is discarded');
+  assert.ok(!c.state.project.issue, 'no intake thread');
+  // both: take the head, drop the rest
+  const d = run({ from_queue: true, drop_queue: true }, [qline(1), qline(2)]);
+  assert.equal(d.state.project.issue, 1);
+  assert.deepEqual(d.intakeQueue, [], 'from_queue+drop_queue: the rest discarded');
+  // the DIRECT lane carries the patch too (the F-5 prepend fix)
+  const e = run({ from_queue: true }, [qline(3), qline(4)], 'direct');
+  assert.equal(e.state.project.issue, 3, 'direct dispatch with from_queue: the flag survives the prepend');
+  assert.deepEqual(e.intakeQueue, [qline(4)], 'direct from_queue: consume-minus-head');
+});
+
+test('W-C1/5b: terminal task records PRUNE mid-epoch after N ticks (compact shape, idempotent, dep-satisfaction survives, rebuild re-prunes)', () => {
+  // C never reports (a long-lease in-flight task keeps the epoch EXECUTING
+  // while A/B age terminal — the mid-epoch shape where growth actually
+  // happens; a halted epoch's state is static, replaced by the next genesis)
+  const THREE = { milestones: 1, m1: [
+    { id: 'A', title: 'a', behavior: 'succeed', work_ms: 1 },
+    { id: 'B', title: 'b', behavior: 'succeed', work_ms: 1, deps: ['A'] },
+    { id: 'C', title: 'c', behavior: 'hang', work_ms: 1 },
+  ] };
+  const NM3 = nextMilestoneFactory(THREE);
+  const PCFG = { ...CFG, prune_tasks_after_ticks: 5 };
+  let s = genesis({ config: PCFG, project: { tasks: THREE.m1, milestones: 1 }, chainId: 'c-prune', now: iso(T0) });
+  const n = makeNow(T0);
+  const journalsAll = [];   // the FULL history from genesis (rebuild replays everything)
+  let r0 = apply(s, tickEv('p1'), n.now(), NM3); s = r0.state; journalsAll.push(...r0.journal);          // A + C assigned
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rep-pa', task: 'A', lease: s.tasks.A.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, n.now(), NM3); s = r0.state; journalsAll.push(...r0.journal);  // A done; B unlocks + assigns
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rep-pb', task: 'B', lease: s.tasks.B.lease.token, outcome: { status: 'done', artifact: 'b' }, run_id: 'r' }, n.now(), NM3); s = r0.state; journalsAll.push(...r0.journal);  // B done; C in flight keeps executing
+  assert.equal(s.project.phase, 'executing');
+  assert.ok(!s.tasks.A.pruned, 'freshly terminal: full record');
+  let prunedAt = null;
+  let s2 = structuredClone(s);
+  for (let i = 0; i < 8 && prunedAt == null; i++) {
+    const r = apply(s2, tickEv(`age${i}`), n.now(), NM3);
+    s2 = r.state; journalsAll.push(...r.journal);
+    if (s2.tasks.A.pruned) prunedAt = i;
+  }
+  assert.ok(prunedAt != null, 'A pruned after the tick age (5 + drift)');
+  const prj = journalsAll.find(j => j.kind === 'PRUNE' && j.task === 'A');
+  assert.ok(prj, 'the PRUNE journal record');
+  assert.equal(prj.from_status, 'done');
+  const A = s2.tasks.A;
+  assert.deepEqual(Object.keys(A).sort(), ['attempts', 'done_at', 'id', 'pruned', 'status'].sort(), 'the compact shape {id,status,attempts,done_at,pruned}');
+  assert.equal(A.status, 'done', 'status kept (recount + allTerminal + dep checks survive)');
+  assert.equal(A.attempts, 1);
+  assert.ok(s2.tasks.B.pruned, 'B pruned too (same age)');
+  assert.ok(!s2.tasks.C.pruned && s2.tasks.C.history, 'C (in flight) keeps its full record');
+  assert.deepEqual(invariants(s2), [], 'invariants clean against pruned records');
+  // idempotent: further ticks do not re-journal PRUNE for A
+  const before = journalsAll.filter(j => j.kind === 'PRUNE' && j.task === 'A').length;
+  const r2 = apply(s2, tickEv('age9'), n.now(), NM3);
+  assert.equal([...journalsAll, ...r2.journal].filter(j => j.kind === 'PRUNE' && j.task === 'A').length, before, 'idempotent — no re-prune');
+  // rebuild: reconstructs the FULL record; the prune is a state-level
+  // projection — the next live clock RE-STAMPS terminal_seq and the record
+  // re-prunes after the full N-tick age again (idempotent, bounded drift;
+  // pruning is an optimization, never a correctness property)
+  const base = genesis({ config: PCFG, project: { tasks: THREE.m1, milestones: 1 }, chainId: 'c-par2', now: iso(T0) });
+  const rb = rebuild(base, journalsAll);
+  assert.ok(!rb.tasks.A.pruned && rb.tasks.A.history, 'rebuild: the full record returns');
+  let rb2 = apply(rb, tickEv('post-rb'), n.now(), NM3).state;
+  assert.ok(rb2.tasks.A.terminal_seq != null && !rb2.tasks.A.pruned, 'the post-rebuild clock re-stamps (not yet pruned — the age restarts)');
+  for (let i = 0; i < 7 && !rb2.tasks.A.pruned; i++) {
+    rb2 = apply(rb2, tickEv(`rb-age${i}`), n.now(), NM3).state;
+  }
+  assert.ok(rb2.tasks.A.pruned, 'the record re-prunes after the re-established age (idempotent)');
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-C1-R (lens-1 BLOCKING-1): the ADAPTER-SHAPE rollover pin — the
+// generator is the LIVE wiring (nextMilestoneFactory(mockProject()) — the
+// mock drill's M2/M3), NOT the null every prior pin used. The intake epoch
+// must complete at M1 (milestones_total bound) and roll over — no sprout.
+// ---------------------------------------------------------------------------
+
+test('W-C1-R/BLOCKING-1: an intake epoch with the ADAPTER generator (mock drill wired) completes at M1 — NO mock sprout, rollover fires', () => {
+  // the LIVE adapter wiring, verbatim: conductor/turn.mjs:68
+  const ADAPTER_NM = nextMilestoneFactory(mockProjectForAdapter());
+  function mockProjectForAdapter() { return fastProject(); }
+  const mkG = (() => { let n = 0; return ({ config, spec, issue } = {}) => {
+    const chainId = `c-b1-${++n}`;
+    const tasks = spec ? [{ id: `task-i${issue}`, title: spec.title, behavior: 'real', work_ms: 1, deps: [], spec: { accept: spec.accept, issue } }] : fastProject().m1;
+    const g = genesis({ config: config || { ...CFG }, project: { tasks, milestones: 1 }, chainId, now: iso(T0 + n), mode: 'mock', issue: issue ?? null });
+    return { state: g, spec: { tasks, milestones: 1, chainId } };
+  }; })();
+  const qline = { issue: 55, body_sha8: 'b1abcd12', spec: { title: 'the real thing', accept: 'criteria' }, enqueued_at: iso(T0), author: 'op' };
+  const n = makeNow(T0 + 1000);
+  // a DONE plain epoch + the queue -> the rollover births the intake epoch
+  // (the bootstrap path always mints a plain genesis; intake epochs arrive
+  // ONLY via the rollover / reset from_queue — by design)
+  const ONE = { m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  let pre = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-b1pre', now: iso(T0) });
+  pre = apply(pre, tickEv('b1s'), iso(T0), nextMilestoneFactory(ONE)).state;
+  pre = apply(pre, { kind: 'REPORT', event_id: 'rep-b1x', task: 'X', lease: pre.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r0' }, iso(T0 + 500), nextMilestoneFactory(ONE)).state;
+  assert.equal(pre.project.phase, 'done');
+  const out = conductorTick({
+    cur: structuredClone(pre), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('b1'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  // the epoch births and assigns its ONE task
+  assert.ok(out.state.project.issue === 55, 'the intake thread');
+  assert.equal(Object.keys(out.state.tasks).length, 1, 'ONE task — no sprout at genesis');
+  assert.equal(out.state.project.milestones_total, 1, 'milestones_total=1 (the adapter half of the fold)');
+  // the task completes INSIDE the next tick's drain (the REAL halting shape)
+  const t0 = out.state.tasks['task-i55'];
+  const doneReport = { kind: 'REPORT', event_id: 'rep-b1', task: 'task-i55', lease: out.state.tasks['task-i55'].lease.token, outcome: { status: 'done', artifact: 'the result' }, run_id: 'r1' };
+  const out2 = conductorTick({
+    cur: structuredClone(out.state), queue: [doneReport], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [], intakeBad: [],
+    ev: tickEv('b1d'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  // THE BLOCKING-1 ASSERTIONS: phase done at M1 (no M2 sprout), the PHASE
+  // record landed, the task set is still the ONE intake task
+  assert.equal(out2.state.project.phase, 'done', 'completed — the generator was never consulted');
+  assert.equal(out2.state.project.milestone, 1, 'still at M1');
+  assert.equal(Object.keys(out2.state.tasks).length, 1, 'NO mock M2/M3 tasks sprouted (the live sprout bug)');
+  assert.ok(out2.journal.some(j => j.kind === 'PHASE' && j.to === 'done'), 'the PHASE record');
+  assert.ok(out2.actions.some(a => a.type === 'STOP_CHAIN'), 'STOP_CHAIN minted (nothing queued to roll over to)');
+  // and WITH a queued second spec: the rollover replaces the stop
+  const out3 = conductorTick({
+    cur: structuredClone(out.state), queue: [doneReport], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [{ issue: 56, body_sha8: 'b2', spec: { title: 'next', accept: 'x' }, enqueued_at: iso(T0), author: 'op' }], intakeBad: [],
+    ev: tickEv('b1r'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  assert.ok(!out3.actions.some(a => a.type === 'STOP_CHAIN'), 'M4 (lens-1 ask#7a): the REAL-shape STOP_CHAIN filter — the halting drain minted a STOP and the rollover removed it');
+  assert.equal(out3.state.project.issue, 56, 'the second spec rolled over in the same tick');
+  assert.deepEqual(out3.intakeQueue, []);
+});
+
+// T46/W-C1-R (lens-1 ask#7c): the prune idempotence pin EXTENDED — aged past
+// N+1 post-prune ticks (the pre-fold pin aged ONE tick; the mutation's damage
+// needs N+1 — a second PRUNE + done_at wiped to undefined every N+1 ticks).
+test('W-C1-R/mut-c: prune idempotence EXTENDED — 8 post-prune ticks, exactly ONE PRUNE, done_at stable, compact shape stable', () => {
+  const THREE = { m1: [
+    { id: 'A', title: 'a', behavior: 'succeed', work_ms: 1 },
+    { id: 'B', title: 'b', behavior: 'succeed', work_ms: 1, deps: ['A'] },
+    { id: 'C', title: 'c', behavior: 'hang', work_ms: 1 },
+  ] };
+  const NM3 = nextMilestoneFactory(THREE);
+  const PCFG = { ...CFG, prune_tasks_after_ticks: 5 };
+  let s = genesis({ config: PCFG, project: { tasks: THREE.m1, milestones: 1 }, chainId: 'c-prx', now: iso(T0) });
+  const n = makeNow(T0);
+  const J = [];
+  let r0 = apply(s, tickEv('x1'), n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rxa', task: 'A', lease: s.tasks.A.lease.token, outcome: { status: 'done' }, run_id: 'r' }, n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rxb', task: 'B', lease: s.tasks.B.lease.token, outcome: { status: 'done' }, run_id: 'r' }, n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  let pruned = false, firstDoneAt = null;
+  for (let i = 0; i < 20 && !pruned; i++) {
+    const r = apply(s, tickEv(`xa${i}`), n.now(), NM3); s = r.state; J.push(...r.journal);
+    if (s.tasks.A.pruned) { pruned = true; firstDoneAt = s.tasks.A.done_at; }
+  }
+  assert.ok(pruned, 'A pruned');
+  // THE EXTENSION: 8 MORE ticks past the prune — idempotence must hold
+  for (let i = 0; i < 8; i++) {
+    const r = apply(s, tickEv(`xb${i}`), n.now(), NM3); s = r.state; J.push(...r.journal);
+  }
+  const pruneCount = J.filter(j => j.kind === 'PRUNE' && j.task === 'A').length;
+  assert.equal(pruneCount, 1, `exactly ONE PRUNE record for A (got ${pruneCount} — the mutation's damage was a second PRUNE + done_at wipe)`);
+  assert.equal(s.tasks.A.done_at, firstDoneAt, 'done_at stable across the extended age');
+  assert.deepEqual(Object.keys(s.tasks.A).sort(), ['attempts', 'done_at', 'id', 'pruned', 'status'].sort(), 'the compact shape stable');
 });

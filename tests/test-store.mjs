@@ -832,3 +832,229 @@ test('T45/F-G(d2): enqueue onto a queue holding a bad line PRESERVES it; the dra
     assert.equal(st.readQueueEx().bad.length, 0);
   } finally { lab.cleanup(); }
 });
+
+// ---------------------------------------------------------------------------
+// T46/W-C1 §4b (lane B): the THIRD queue — state/intake-queue.jsonl, the
+// intake door's parking lot. Same discipline as the control queue: strict
+// presence (F-G(d)), merge-reserialize (F-G(d2)), consume = rewrite-minus-
+// head or DELETE-on-empty (m-5), park = the file untouched.
+// ---------------------------------------------------------------------------
+
+const irec = (issue, sha, extra = {}) => ({
+  issue, body_sha8: sha,
+  spec: { title: `task from issue #${issue}`, accept: 'do the thing' },
+  enqueued_at: '2026-09-17T10:00:00.000Z', author: 'alice', ...extra,
+});
+
+test('T46/§4b: intake round-trip — enqueueIntake lands the line; readIntakeQueue reads it back', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    const r = st.enqueueIntake(irec(42, 'ab12cd34'));
+    assert.equal(r.ok, true, `enqueue ok: ${r.err}`);
+    st.fetch();
+    const ex = st.readIntakeQueueEx();
+    assert.equal(ex.items.length, 1);
+    assert.equal(ex.items[0].issue, 42);
+    assert.equal(ex.items[0].body_sha8, 'ab12cd34');
+    assert.equal(ex.items[0].spec.title, 'task from issue #42');
+    assert.equal(ex.bad.length, 0);
+    assert.equal(st.readIntakeQueue().length, 1, 'readIntakeQueue is the items view');
+  } finally { lab.cleanup(); }
+});
+
+test('T46/§4b (m-5): drain-consume — mutate returns intakeQueue MINUS HEAD -> file REWRITTEN (the rollover shape)', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.enqueueIntake(irec(1, 'aaaaaaaa'));
+    st.enqueueIntake(irec(2, 'bbbbbbbb'));
+    st.fetch();
+    assert.equal(st.readIntakeQueue().length, 2);
+    // the conductor's epoch-rollover shape (§5, lane A): consume the head,
+    // keep the tail parked for the NEXT halt
+    st.commit({
+      mutate: (cur, queue, controlQueue, queueBad, ctlBad, intakeQueue, intakeBad) => {
+        assert.equal(intakeQueue.length, 2, 'param 6 = intake items');
+        assert.equal(intakeBad.length, 0, 'param 7 = intake bad lines');
+        assert.equal(intakeQueue[0].issue, 1, 'head is issue #1 (FIFO)');
+        return { state: cur, journal: [], intakeQueue: intakeQueue.slice(1), message: 'rollover consumed head' };
+      },
+    });
+    st.fetch();
+    const q = st.readIntakeQueue();
+    assert.equal(q.length, 1, 'rewrite-minus-head landed');
+    assert.equal(q[0].issue, 2, 'the TAIL survived (issue #2 now at the head)');
+  } finally { lab.cleanup(); }
+});
+
+test('T46/§4b (m-5): consume-to-EMPTY — intakeQueue: [] DELETES the file from the branch', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.enqueueIntake(irec(7, 'cafef00d'));
+    st.fetch();
+    assert.equal(st.readIntakeQueue().length, 1);
+    st.commit({
+      mutate: (cur, _q, _cq, _qb, _cb, intakeQueue) => {
+        assert.equal(intakeQueue.length, 1);
+        return { state: cur, journal: [], intakeQueue: [], message: 'drain all' };
+      },
+    });
+    st.fetch();
+    assert.equal(st.readIntakeQueueEx().items.length, 0);
+    assert.equal(st.readIntakeQueueEx().bad.length, 0);
+    assert.equal(st.readFile('state/intake-queue.jsonl'), null, 'the file is ABSENT on the branch (DELETE, not empty-file)');
+  } finally { lab.cleanup(); }
+});
+
+test('T46/§4b: park + backward compat — an OLD-shape mutate (5 params, no intakeQueue key) leaves the file UNTOUCHED', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.enqueueIntake(irec(9, 'deadbeef'));
+    st.fetch();
+    const before = st.readFile('state/intake-queue.jsonl');
+    assert.ok(before, 'the intake line landed');
+    // the PRE-W-C1 caller shape verbatim: five declared params, no
+    // intakeQueue in the return — the park case (an active epoch never
+    // touches the queue; extra args are simply not declared)
+    st.commit({
+      mutate: (cur, queue, controlQueue, queueBad, ctlBad) => {
+        const now = '2026-09-06T10:00:05Z';
+        const r = apply(cur, { kind: 'TICK', actor: 'chain', ts: now, event_id: 'evt-park' }, now, NM);
+        return { state: r.state, journal: r.journal, message: 'tick while parked' };
+      },
+    });
+    st.fetch();
+    assert.equal(st.readFile('state/intake-queue.jsonl'), before, 'the intake file is BYTE-IDENTICAL (park = untouched)');
+    assert.equal(st.readIntakeQueue().length, 1, 'the parked line is still readable');
+  } finally { lab.cleanup(); }
+});
+
+test('T46/§4b: bad intake lines surface via readIntakeQueueEx; enqueueIntake PRESERVES them (F-G(d2))', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    const g0 = boot('2026-09-06T10:00:00Z');
+    st.init(g0);
+    plumbCommit(st, {
+      'state/state.json': JSON.stringify(g0, null, 1) + '\n',
+      'state/intake-queue.jsonl': JSON.stringify(irec(1, 'aaaaaaaa')) + '\nNOT JSON AT ALL[[[\n',
+    }, 'damaged intake queue (one bad line)');
+    st.fetch();
+    const ex = st.readIntakeQueueEx();
+    assert.equal(ex.items.length, 1);
+    assert.equal(ex.items[0].issue, 1);
+    assert.equal(ex.bad.length, 1, 'the bad line is surfaced, not silently skipped');
+    assert.match(ex.bad[0], /NOT JSON AT ALL/);
+    // the door CAS-appends onto the damaged queue: the bad line survives
+    const enq = st.enqueueIntake(irec(2, 'bbbbbbbb'));
+    assert.equal(enq.ok, true);
+    st.fetch();
+    const raw = st.readFile('state/intake-queue.jsonl');
+    const lines = raw.split('\n').map(s => s.trim()).filter(Boolean);
+    assert.equal(lines.length, 3, `the bad line SURVIVED the merge (got ${lines.length} lines)`);
+    assert.match(lines[0], /NOT JSON AT ALL/, 'bad line preserved VERBATIM ahead of the records');
+    assert.match(lines[1], /"issue":1/);
+    assert.match(lines[2], /"issue":2/);
+    // and the mutate-side view agrees: items 2, bad 1
+    const ex2 = st.readIntakeQueueEx();
+    assert.equal(ex2.items.length, 2);
+    assert.equal(ex2.bad.length, 1);
+  } finally { lab.cleanup(); }
+});
+
+test('T46/§4b: intake CAS-conflict retry — a rival door push mid-commit re-reads and lands (no lost update)', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.enqueueIntake(irec(1, 'aaaaaaaa'));
+    // simulate a mid-flight competing DOOR: while OUR rollover commit runs,
+    // another intake push lands. Forced by having mutate() enqueue a rival
+    // line on the FIRST attempt only, then return a consume-head mutation.
+    let sabotaged = false;
+    const out = st.commit({
+      mutate: (cur, _q, _cq, _qb, _cb, intakeQueue) => {
+        if (!sabotaged) {
+          sabotaged = true;
+          const st2 = new Store({ cwd: lab.clone });
+          st2.fetch();
+          const r2 = st2.enqueueIntake(irec(2, 'bbbbbbbb'));
+          assert.equal(r2.ok, true, 'the rival door push landed');
+        }
+        // consume the head WHATEVER it currently is — the CAS retry re-reads
+        // the rival's queue and re-decides against it (no lost update)
+        return { state: cur, journal: [], intakeQueue: intakeQueue.slice(1), message: 'rollover' };
+      },
+    });
+    assert.equal(out.committed, true, 'CAS retry landed the rollover');
+    st.fetch();
+    const q = st.readIntakeQueue();
+    // attempt 1 read [issue#1]; the rival appended issue#2 mid-flight; the
+    // retry re-read [issue#1, issue#2] and consumed the HEAD (#1) — issue#2
+    // (enqueued AFTER our read but BEFORE our push) SURVIVED.
+    assert.equal(q.length, 1, `exactly the rival's line survived: ${JSON.stringify(q.map(l => l.issue))}`);
+    assert.equal(q[0].issue, 2, 'the rival intake line was not lost to the CAS race');
+  } finally { lab.cleanup(); }
+});
+
+// T46/W-C1-R (lens-2 MUT-b): the PAUSE COMMIT's queue-preservation pin.
+// The adapter's second commit (conductor/turn.mjs's BUDGET-PAUSE block)
+// returns {queue: q2, controlQueue: cq2} — queues that landed between the
+// two commits rewrite UNCHANGED for the next tick (never dropped). The
+// pre-fold shape had NO pin: mutating to {queue: []} passed 323/323 +
+// sim4 51/51 (sim4's driver bypasses the store entirely). This pin drives
+// the REAL store through the REAL two-commit shape with a report landing
+// in between.
+test('W-C1-R/MUT-b: the pause commit preserves interleaved queues (the two-commit protocol, store-level)', () => {
+  const lab = mkLab();
+  try {
+    const store = new Store({ cwd: lab.clone });
+    store.init();
+    const now = () => new Date().toISOString();
+    const NMq = nextMilestoneFactory(fastProject());
+    // commit 1: bootstrap + a tick (the plain shape)
+    const out1 = store.commit({
+      mutate: (cur, q, cq, qb, cb) => conductorTick({
+        cur, queue: q, controlQueue: cq, queueBad: qb, ctlBad: cb,
+        ev: { kind: 'TICK', actor: 'seed', event_id: `tick-mutb-${Date.now()}`, ts: now() },
+        now, nextMilestone: NMq, recover: () => null,
+        makeGenesis: () => { const g = genesis({ config: cfg, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'mut-b', now: now() }); return { state: g, spec: { tasks: fastProject().m1, milestones: 2, chainId: 'mut-b' } }; },
+      }),
+    });
+    assert.ok(out1.committed, 'commit 1 lands');
+    // a worker report lands BETWEEN the commits (the interleaving)
+    const assigned = Object.values(out1.state.tasks).find(t => t.status === 'assigned');
+    assert.ok(assigned, 'a task is assigned after the seed tick');
+    store.enqueueReport({ event_id: 'rep-mutb-1', task: assigned.id, lease: assigned.lease.token, outcome: { status: 'progress' }, run_id: 'run-mutb' });
+    // commit 2: the pause shape VERBATIM from the adapter (queue: q2 preserved)
+    const pauseEv = { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: `ctl-901-budget-pause-${Date.now()}`, ts: now() };
+    const out2 = store.commit({
+      mutate: (cur2, q2, cq2) => {
+        const r = apply(cur2, pauseEv, now(), NMq, {});
+        return { state: r.state, journal: r.journal, actions: r.actions, queue: q2, controlQueue: cq2 };
+      },
+    });
+    assert.ok(out2.committed, 'commit 2 lands (the pause)');
+    assert.equal(out2.state.chain.paused, true);
+    // THE PIN: the interleaved report SURVIVES the pause commit — the next
+    // tick drains it (mutating the pause shape to {queue: []} drops it)
+    const peek = store.readQueue();
+    assert.equal(peek.length, 1, 'the interleaved report is preserved on the queue file');
+    assert.equal(peek[0].event_id, 'rep-mutb-1');
+    // and the next tick drains it against the PAUSED chain (at-least-once)
+    const out3 = store.commit({
+      mutate: (cur, q, cq, qb, cb) => conductorTick({
+        cur, queue: q, controlQueue: cq, queueBad: qb, ctlBad: cb,
+        ev: { kind: 'TICK', actor: 'after', event_id: `tick-mutb2-${Date.now()}`, ts: now() },
+        now, nextMilestone: NMq, recover: () => null,
+        makeGenesis: () => { const g = genesis({ config: cfg, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'mut-b2', now: now() }); return { state: g, spec: { tasks: fastProject().m1, milestones: 2, chainId: 'mut-b2' } }; },
+      }),
+    });
+    assert.ok(out3.committed || out3.noop, 'the post-pause tick runs');
+    assert.ok((out3.journal || []).some(j => j.kind === 'REPORT'), 'the preserved report DRAINED (in_progress on the assigned task)');
+    assert.equal(store.readQueue().length, 0, 'the queue is empty after the drain');
+  } finally {
+    lab.cleanup();
+  }
+});
