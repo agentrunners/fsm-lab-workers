@@ -477,8 +477,11 @@ test('adapter wiring (source-pinned): the law-4 scan, the floor constant, the ru
   assert.ok(src.includes('VERIFY-SCAN-PAGE-FULL'), 'the full-page tail signal is logged');
   assert.ok(!src.includes('per_page=20'), 'the old 20-run page is gone');
   assert.ok(!/\^task-\(\.\+\?\) · /.test(src), 'the name regex lives in the core now (one source)');
-  // M-3/B: the floor default is the exported constant, not the '0' literal
-  assert.ok(src.includes('resolvePacingFloorS('), 'the floor default is resolved from conductor-core');
+  // M-3/B → W-C1 F-10: the floor is DELETED — the adapter now wires the
+  // dispatchBudgetFn (spent-aware); the floor resolver is gone with the concept
+  assert.ok(src.includes('dispatchBudgetFn:'), 'the dispatch budget fn is wired (the floor\'s replacement)');
+  assert.ok(src.includes('DISPATCH_COST_MS'), 'the adapter consumes the core\'s cost constant');
+  assert.ok(!src.includes('resolvePacingFloorS('), 'the floor resolver is deleted with the concept');
   assert.ok(!/PACING_FLOOR_S\s*\|\|\s*'0'/.test(src), 'the hardcoded floor literal is gone');
   // A-2: run_id rides the dispatch action
   assert.ok(/\{\s*\.\.\.a,\s*chain:\s*state\.chain\.id,\s*run_id:\s*RUN_ID\s*\}/.test(src), 'the dispatch action carries run_id: RUN_ID');
