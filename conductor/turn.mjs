@@ -33,7 +33,8 @@ import { genesis } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, VERIFY_WINDOW_MS,
+  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS,
+  verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { buildEvent } from '../lib/event-ingest.mjs';
 
@@ -200,6 +201,13 @@ async function main() {
   // stale peek fails OPEN (no flip, the reaper backstops — same doc as the
   // quiet guard). Matching key: worker.yml's run-name
   // `task-<id> · <behavior> · a<attempt>` → `${taskId}#a${attempt}`.
+  // M-A1/M-B1 (46-R2, convergent): the scan is per_page=100 with a
+  // created>= floor at (oldest in-window lease issued_at − 900s) and the
+  // keys are TIME-CORRELATED against each task's lease.issued_at —
+  // name-only, page-1-only matching was blind at every reset (prior-epoch
+  // id reuse suppressed the flip) and wrong under churn (a 21st newer run
+  // pushed the in-window run off the old 20-run page and flipped a LIVE
+  // task). See verifyScanRunsPath/seenKeysFromRuns in conductor-core.
   let seenDispatchKeys = null;
   let verifyNowMs = null;
   {
@@ -207,21 +215,30 @@ async function main() {
     const peek = store.readState();
     const st = peek && peek.state;
     const preWindowMs = VERIFY_WINDOW_MS / 2;
-    const needsScan = !!(st && st.tasks && Object.values(st.tasks).some(t =>
-      (t.status === 'assigned' || t.status === 'in_progress') && t.lease
-      && Number.isFinite(Date.parse(t.lease.issued_at || ''))
-      && (Date.now() - Date.parse(t.lease.issued_at)) > preWindowMs));
-    if (needsScan) {
-      const rr = await api(`/repos/${REPO}/actions/workflows/worker.yml/runs?per_page=20`);
-      if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
-        const keys = new Set();
-        for (const run of rr.data.workflow_runs) {
-          const m = /^task-(.+?) · .+? · a(\d+)$/.exec(run.name || '');
-          if (m) keys.add(`${m[1]}#a${m[2]}`);
+    let oldestIssuedMs = NaN;   // the created>= floor anchor
+    let needsScan = false;
+    for (const t of (st && st.tasks ? Object.values(st.tasks) : [])) {
+      if ((t.status === 'assigned' || t.status === 'in_progress') && t.lease) {
+        const issuedMs = Date.parse(t.lease.issued_at || '');
+        if (Number.isFinite(issuedMs) && (Date.now() - issuedMs) > preWindowMs) {
+          needsScan = true;
+          if (!Number.isFinite(oldestIssuedMs) || issuedMs < oldestIssuedMs) oldestIssuedMs = issuedMs;
         }
-        seenDispatchKeys = keys;
+      }
+    }
+    if (needsScan) {
+      const rr = await api(verifyScanRunsPath(REPO, oldestIssuedMs));
+      if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
+        const runs = rr.data.workflow_runs;
+        seenDispatchKeys = seenKeysFromRuns(runs, (st && st.tasks) || {});
         verifyNowMs = Date.now();
-        console.log(`VERIFY-SCAN runs=${rr.data.workflow_runs.length} keys=${keys.size} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
+        console.log(`VERIFY-SCAN runs=${runs.length} keys=${seenDispatchKeys.size} created-floor=${Number.isFinite(oldestIssuedMs) ? new Date(oldestIssuedMs - VERIFY_SCAN_SLACK_MS).toISOString() : 'none'} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
+        if (runs.length >= VERIFY_SCAN_PER_PAGE) {
+          // the observable signal of the un-paginated tail. NO pagination
+          // loop: the created floor keeps the in-window tail covered and a
+          // bounded tick matters more.
+          console.log(`VERIFY-SCAN-PAGE-FULL runs=${runs.length} per_page=${VERIFY_SCAN_PER_PAGE} — runs past this page are invisible to the scan (created floor covers the in-window tail; no pagination loop, the bounded tick wins)`);
+        }
       } else {
         console.log(`VERIFY-SCAN-SKIPPED runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
       }
@@ -259,7 +276,12 @@ async function main() {
     briefMd = fsMod.default.readFileSync('briefs/project.md', 'utf8');
   } catch { /* absent brief — the envelope omits it cleanly */ }
   const epochMode = state.project?.mode || 'mock';
-  const floorS = parseInt(process.env.PACING_FLOOR_S || '0', 10);   // X21: default OFF (the skip-left-assigned bug — see conductor-core)
+  // M-3/B (46-R2): the default comes from conductor-core's LIVE exported
+  // PACING_FLOOR_DEFAULT_S (env override wins) — the hardcoded `|| '0'`
+  // made the constant dead code and the hot-fix-2 default revert-survivable.
+  // X21 semantics preserved: default OFF (the skip-left-assigned bug — see
+  // conductor-core).
+  const floorS = resolvePacingFloorS(process.env);
   let lastDispatchMs = NaN;
   let dispatchIndex = 0;
   for (const a of actionList) {
@@ -294,8 +316,11 @@ async function main() {
       // (old workers ignore the extras; new workers route through
       // envelopeFromDispatch). prompt carries the brief AS QUOTED DATA;
       // deadline_ms is minted HERE (absolute, queue-delay-proof).
+      // A-2 (46-R2): run_id rides the action so the envelope's session
+      // stops minting the permanent 'pending' run-id (this conductor run's
+      // id — the audit trail's dispatch-turn discriminator).
       const payload = assembleDispatchPayload(
-        { ...a, chain: state.chain.id },
+        { ...a, chain: state.chain.id, run_id: RUN_ID },
         state.tasks[a.task] || null,
         briefMd,
         { nowMs: Date.now(), mode: epochMode },

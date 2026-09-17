@@ -7,11 +7,13 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { genesis, apply, rebuild } from '../lib/fsm.mjs';
 import {
   conductorTick, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, VERIFY_WINDOW_MS, PACING_FLOOR_S,
-  W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
+  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS, PACING_FLOOR_S,
+  PACING_FLOOR_DEFAULT_S, W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
+  verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { envelopeFromDispatch } from '../lib/worker-contract.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
@@ -312,4 +314,185 @@ test('F-1: the direct+queued double-fire shape (the live e913/e914 mechanism) is
   });
   assert.equal(out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset').length, 1);
   assert.equal(out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate').length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 5. M-A1/M-B1 (46-R2, convergent) — law-4 SCAN FIDELITY, pinned against a
+// fixture runs-list. sim3 injects ground-truth seen keys; these are the only
+// tests exercising the scan's own shape (the adapter-side I/O half lens A
+// called "tested by nothing"): the per_page=100 page, the created>= floor,
+// and the created_at-vs-issued_at correlation that kills the prior-epoch
+// false-negative (mockProject regenerates the SAME task ids every reset and
+// attempts restart at 1, so a prior epoch's run yields the SAME key).
+// ---------------------------------------------------------------------------
+
+const runNamed = (name, createdMs) => ({ name, created_at: iso(createdMs) });
+
+test('scan shape: per_page=100 + the created>= floor at (oldest issued − 900s), URL-encoded', () => {
+  assert.equal(VERIFY_SCAN_PER_PAGE, 100, 'the page width is 100 (was 20 — the false-positive class)');
+  assert.equal(VERIFY_SCAN_SLACK_MS, 900_000, 'the correlation slack is 900s');
+  const path = verifyScanRunsPath('claudecode-headless/fsm-lab', T0);
+  assert.ok(path.startsWith('/repos/claudecode-headless/fsm-lab/actions/workflows/worker.yml/runs?'));
+  assert.ok(path.includes(`per_page=${VERIFY_SCAN_PER_PAGE}`), `page widened 20→100 (got ${path})`);
+  const floor = encodeURIComponent(`>=${new Date(T0 - VERIFY_SCAN_SLACK_MS).toISOString()}`);
+  assert.ok(path.includes(`&created=${floor}`), `the created floor rides the query (got ${path})`);
+  // non-finite anchor → no floor (fail-open; the per-task correlation still holds)
+  assert.ok(!verifyScanRunsPath('r', NaN).includes('created='), 'no invented floor without a finite issued_at');
+});
+
+test('scan (a): prior-epoch SAME-KEY run with older created_at -> NOT seen -> the flip still fires (the false-negative killer)', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const keys = seenKeysFromRuns([
+    runNamed('task-A1 · succeed · a1', issuedMs - 45 * 60_000),   // a PRIOR epoch's run — same reused id, created 45min before this lease
+    runNamed('task-B9 · fast · a1', issuedMs - 90 * 60_000),      // another prior-epoch run (unknown task — fail-open name-only, irrelevant)
+  ], state.tasks);
+  assert.ok(!keys.has('A1#a1'), 'a run created before issued_at−900s must NOT suppress the flip');
+  const evs = dispatchVerificationEvents({ state, seenKeys: keys, nowMs: T0 });
+  assert.equal(evs.length, 1, 'the stale prior-epoch run does not blind law-4 at epoch starts');
+  assert.equal(evs[0].outcome.error, 'dispatch-unverified');
+});
+
+test('scan (b): the in-window run at position 25 -> seen (per_page=100 shape; the OLD 20-run page flipped a LIVE task)', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const runs = [];
+  for (let i = 0; i < 24; i++) runs.push(runNamed(`task-STORM-${i} · fast · a1`, issuedMs + (24 - i) * 60_000));  // a flap/burst storm of 24 NEWER runs
+  runs.push(runNamed('task-A1 · succeed · a1', issuedMs + 60_000));   // position 25 — the LIVE in-window run
+  runs.push(runNamed('task-STORM-25 · fast · a1', issuedMs + 30_000));
+  const keys = seenKeysFromRuns(runs, state.tasks);
+  assert.ok(keys.has('A1#a1'), 'the in-window run is seen at position 25');
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: keys, nowMs: T0 }).length, 0, 'no false flip — the run is verified');
+  // the OLD page-1 shape on the SAME fixture: the M-B1 false-positive, reproduced
+  const oldPage = seenKeysFromRuns(runs.slice(0, 20), state.tasks);
+  assert.ok(!oldPage.has('A1#a1'), 'the fixture reproduces the old 20-run page-1 blindness');
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: oldPage, nowMs: T0 }).length, 1, 'the old shape voided a LIVE lease (why per_page went 20→100)');
+});
+
+test('scan (c): boundary — created_at exactly at issued_at−900s -> seen (inclusive); one ms older -> dropped', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const atBoundary = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - VERIFY_SCAN_SLACK_MS)], state.tasks);
+  assert.ok(atBoundary.has('A1#a1'), 'created_at == issued_at−900s is IN the correlation window (>=)');
+  const justBefore = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - VERIFY_SCAN_SLACK_MS - 1)], state.tasks);
+  assert.ok(!justBefore.has('A1#a1'), 'created_at one ms older is dropped');
+  // an in-window run created AFTER the lease (the normal shape) is seen
+  const normal = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs + 120_000)], state.tasks);
+  assert.ok(normal.has('A1#a1'));
+  // fail-open edges: unparseable created_at / task without a lease keep the name-only match
+  const noCreated = seenKeysFromRuns([{ name: 'task-A1 · succeed · a1' }], state.tasks);
+  assert.ok(noCreated.has('A1#a1'), 'a run without created_at fails OPEN (cannot prove staleness)');
+  const noLease = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - 45 * 60_000)], { A1: { id: 'A1', status: 'ready' } });
+  assert.ok(noLease.has('A1#a1'), 'a task without a lease keeps the name-only match (no correlation possible)');
+});
+
+// ---------------------------------------------------------------------------
+// 4b. M-A2 (46-R2 lens A) — the NOTELESS twin: null-vs-'' note normalization
+// ---------------------------------------------------------------------------
+// The two control lanes encoded an absent note differently (direct buildEvent
+// `?? null` vs queued ops/turn.mjs `|| ''`), so the noteless direct+queued
+// twin — the README-documented minimal reset — applied BOTH resets. The guard
+// now normalizes both sides; the fixtures below cover every encoding mix,
+// including the PRE-fix queued encoding (a mixed-deploy queue record).
+
+test('M-A2: the NOTELESS direct+queued twin (e913/e914 shape without note) -> 1 applied + 1 rejected', () => {
+  const s = boot();
+  const n = makeNow(T0);
+  const directEv = { kind: 'CONTROL', command: 'reset', actor: 'op', note: null, event_id: 'ctl-direct-nl', ts: iso(T0) };
+  const queuedTwin = { cmd: 'reset', id: 'ctl-queued-nl', ts: iso(T0 + 500), sender: 'op', note: '' };  // the PRE-fix ops encoding — the guard must absorb it
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [], controlQueue: [queuedTwin], queueBad: [], ctlBad: [],
+    ev: directEv, now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: makeGenesisFor(),
+  });
+  const resets = out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset');
+  const rejects = out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate');
+  assert.equal(resets.length, 1, 'exactly ONE reset applied (the noteless twin hole is closed)');
+  assert.equal(rejects.length, 1, 'the noteless twin is rejected');
+  assert.equal(rejects[0].event_id, 'ctl-queued-nl');
+  // journal encoding: an absent note records as null on BOTH lanes now
+  assert.equal(resets[0].note, null);
+  assert.equal(rejects[0].note, null, 'the REJECTED record normalizes "" to null too');
+});
+
+test('M-A2: every noteless encoding mix twins; both-null and both-empty stay guarded', () => {
+  const pairs = [
+    [null, null],   // post-fix both lanes
+    ['', ''],       // queued-queued noteless (guarded even pre-fix — must stay)
+    ['', null],     // the reverse mix
+  ];
+  for (const [a, b] of pairs) {
+    const s = boot();
+    const n = makeNow(T0);
+    const out = conductorTick({
+      cur: structuredClone(s), queue: [], controlQueue: [
+        { cmd: 'reset', id: 'ctl-q1', ts: iso(T0), sender: 'op', note: a },
+        { cmd: 'reset', id: 'ctl-q2', ts: iso(T0 + 500), sender: 'op', note: b },
+      ], queueBad: [], ctlBad: [],
+      ev: tickEv(), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: makeGenesisFor(),
+    });
+    assert.equal(out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE applied`);
+    assert.equal(out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE rejected`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6. M-3/B (46-R2) — the pacing-floor DEFAULT is live exported code
+// ---------------------------------------------------------------------------
+
+test('M-3/B: the floor default is the exported PACING_FLOOR_DEFAULT_S (0 = hot-fix-2 semantics); env override wins', () => {
+  assert.equal(PACING_FLOOR_DEFAULT_S, 0, 'hot-fix 2: the floor default is OFF until the W-C dispatchBudget');
+  assert.equal(resolvePacingFloorS({}), 0, 'no env -> the exported default (not a hardcoded literal)');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '' }), 0, 'empty env -> the default');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '300' }), 300, 'the env override wins');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '0' }), 0, 'explicit 0 = disabled');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: 'garbage' }), 0, 'unparseable env -> fail-open default (floor-disabled)');
+  // the decision stays the pure half it always was
+  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({ PACING_FLOOR_S: '300' }), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, true);
+  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({}), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false, 'default 0 = floor-disabled');
+});
+
+// ---------------------------------------------------------------------------
+// 7. A-2 (46-R2) — run_id rides the dispatch action (no more pending sessions)
+// ---------------------------------------------------------------------------
+
+test('A-2: a dispatch action carrying run_id mints a real session; the no-run_id fallback keeps pending', () => {
+  const p = JSON.parse(assembleDispatchPayload({ ...ACT, chain: 'chain-x', run_id: '34073438112' }, TASK, null, { nowMs: T0 }).ox);
+  assert.equal(p.session, 'chain-x/A1/34073438112-a2', 'the session carries the dispatching run id');
+  assert.ok(!p.session.includes('pending'));
+  // the local/manual fallback (no run_id) keeps the pending marker — compat, not a regression
+  const q = JSON.parse(assembleDispatchPayload({ ...ACT, chain: 'chain-x' }, TASK, null, { nowMs: T0 }).ox);
+  assert.equal(q.session, 'chain-x/A1/pending-a2');
+  // the wire payload is UNCHANGED: run_id rides the ACTION, not the client_payload (9 properties, ≤10)
+  const wire = assembleDispatchPayload({ ...ACT, chain: 'chain-x', run_id: '34073438112' }, TASK, null, { nowMs: T0 });
+  assert.equal(Object.keys(wire).length, 9, 'the dispatch 422 class stays closed');
+  assert.ok(!('run_id' in wire));
+});
+
+// ---------------------------------------------------------------------------
+// 9. adapter wiring (source-pinned) — conductor/turn.mjs and ops/turn.mjs are
+// self-executing I/O scripts (not importable in a test), so their seams are
+// pinned by source shape: the scan consumes the core builders, the floor
+// consumes the exported constant, run_id rides the dispatch action, and the
+// ops note encoding matches the direct lane. A revert of any wiring fails
+// here. (The I/O half was the repo's named trap: "integration logic lives
+// in turn-files" — lens A finding (c).)
+// ---------------------------------------------------------------------------
+
+test('adapter wiring (source-pinned): the law-4 scan, the floor constant, the run_id action, and the ops note encoding', () => {
+  const src = readFileSync(new URL('../conductor/turn.mjs', import.meta.url), 'utf8');
+  // law-4: the adapter consumes the core's scan builders (no inline per_page/name-regex anymore)
+  assert.ok(src.includes('verifyScanRunsPath('), 'the scan path comes from conductor-core');
+  assert.ok(src.includes('seenKeysFromRuns('), 'the seen-keys build comes from conductor-core (time-correlated)');
+  assert.ok(src.includes('VERIFY-SCAN-PAGE-FULL'), 'the full-page tail signal is logged');
+  assert.ok(!src.includes('per_page=20'), 'the old 20-run page is gone');
+  assert.ok(!/\^task-\(\.\+\?\) · /.test(src), 'the name regex lives in the core now (one source)');
+  // M-3/B: the floor default is the exported constant, not the '0' literal
+  assert.ok(src.includes('resolvePacingFloorS('), 'the floor default is resolved from conductor-core');
+  assert.ok(!/PACING_FLOOR_S\s*\|\|\s*'0'/.test(src), 'the hardcoded floor literal is gone');
+  // A-2: run_id rides the dispatch action
+  assert.ok(/\{\s*\.\.\.a,\s*chain:\s*state\.chain\.id,\s*run_id:\s*RUN_ID\s*\}/.test(src), 'the dispatch action carries run_id: RUN_ID');
+  // M-A2: the queued lane encodes an absent note exactly like the direct lane
+  const ops = readFileSync(new URL('../ops/turn.mjs', import.meta.url), 'utf8');
+  assert.ok(ops.includes('note: cp.note ?? null'), 'ops/turn.mjs note encoding is ?? null (was || \'\')');
+  assert.ok(!ops.includes('cp.note || \'\''), 'the old || \'\' encoding is gone');
 });

@@ -72,13 +72,26 @@ jobs:
         with:
           node-version: '22'   # T46/X21: claude-code 2.1.273 requires >=22 (the adapter's npx spawns on the system node)
 
-      - name: Install the CC CLI (once per job — the adapter's npx then resolves instantly)
+      - name: Install the CC CLI (cc-mode dispatches only — once per job)
         # X21 live finding: a fresh npx download took ~7 MINUTES on the worker
         # runner (vs 4-9s via npm install -g in the X20 smoke) — the wall
-        # budget must buy WORK, not package downloads
-        run: npm install -g @anthropic-ai/claude-code@${CC_VERSION:-latest} && claude --version || true
+        # budget must buy WORK, not package downloads.
+        # m-9/C (R2-FIX): the ox envelope's mode gates the install (mock
+        # dispatches skip it); unparseable/absent ox = legacy dispatch =
+        # install anyway, fail-safe. m-2/C: no `|| true` — a failed install
+        # fails the job LOUDLY (the lease re-covers; a silent failure pays
+        # the 7-min npx tax inside the wall instead). The payload rides ENV
+        # (never ${{ }}-interpolated into the shell — injection-safe).
         env:
           CC_VERSION: ${{ vars.CC_VERSION }}
+          OX_RAW: ${{ github.event.client_payload.ox || '' }}
+        run: |
+          MODE=$(printf '%s' "$OX_RAW" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(typeof o==="object"&&o?String(o.mode||""):"")}catch{console.log("")}})')
+          if [ "$MODE" = "cc" ] || [ -z "$MODE" ]; then
+            npm install -g @anthropic-ai/claude-code@${CC_VERSION:-latest} && claude --version
+          else
+            echo "INSTALL-SKIPPED mode=$MODE (non-cc dispatch — no CC CLI needed)"
+          fi
 
       - name: Work the task
         env:
