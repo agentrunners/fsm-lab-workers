@@ -3,7 +3,7 @@
 #   1. YAML parse of every workflow
 #   2. node --check of every mjs
 #   3. the full test suites (fsm + store + conductor-core)
-#   4. the offline simulations (run-sim.mjs 7 scenarios + run-sim2.mjs — the
+#   4. the offline simulations (run-sim + run-sim2 + run-sim3 + run-sim4 —
 #      T44 wave-3 shim-driven suite)
 #   5. the conductor smoke (REAL adapter against a local bare origin) —
 #      OPT-IN via FSM_SMOKE=1 (it shells git + node heavily; keep CI-like
