@@ -289,3 +289,62 @@ active window only. rebuild() parity: pruning is a state-level projection
 6. **quiet-lab hosts the pinger** — public repo = free minutes, zero secrets
    (the R3 surface), org-adjacent (good-enough de-correlation for v1; the
    true external pinger stays the runbook line).
+
+---
+
+## v2 fold (2026-09-17 — both review lenses: 4 BLOCKING / 15 MAJOR / 21 MINOR folded)
+
+Reviewers: 46-WC-R-1 (trust/state-machine, `/home/z/lab/probe-46/wc-r-lens-1.md`) + 46-WC-R-2 (integration, `/home/z/lab/probe-46/wc-r-lens-2.md`). Both converged on the security-contract violation (L1-B2 ≡ L2-M5) from independent lenses. The adjudications:
+
+### BLOCKING folds
+
+**F-1 (L1-B1): deps are CUT from v1.** Per-issue epochs make cross-epoch deps structurally incoherent (every enqueue-legal dep is a drain-time ghost), and the unspecified failure path dead-loops the chain (the missing-dep invariant throws pre-commit; the queue line never consumes — poison-loop + latch). The door REJECTS `deps:` with a one-line "deps arrive with multi-task epochs (W-D)" comment. The FSM's TASK_CREATED receiver keeps its unknown-dep door for the future.
+
+**F-2 (L1-B2 ≡ L2-M5): the security contract is re-adjudicated PER-WORKFLOW, not per-repo.** The standing rule ("never issue_comment/issues triggers on a PAT-holding repo") was written when one workflow ran everything. v2: intake.yml + ops-console.yml are **provably secrets-free** — no `secrets.*` mapping anywhere in their env, GITHUB_TOKEN only, least-privilege `permissions:` blocks (intake: issues:write+contents:read; console: issues:write). LAB_PAT stays exclusively in conductor.yml (dispatch/schedule triggers only). The README contract line is REWRITTEN to the per-workflow form. The stranger-wake cost is documented honestly: every public issue/comment wakes a ~5s runner (GitHub has no pre-job gate); the in-run author gate is the compute firewall; the wake itself is the accepted cost of a public door.
+
+**F-3 (L2-B1): the pinger lives on the USER ACCOUNT (`xfnwfpho1/pinger`, public, cron */15), not quiet-lab.** Cross-repo dispatch needs a PAT (X1 physics); quiet-lab is zero-secrets BY CONSTRAINT; same-org cron is the correlated class (X5). The user-account public repo gives: free minutes, a genuinely de-correlated schedule, and a PAT secret posture identical to mirror-runner (already holds the PAT). The dispatch payload is `{reason:'pinger'}` (L2-M4: `note` is invisible — run names, mints, and the duty all key on `reason`). X24's criterion: the fsm-tick run named `pinger · conductor` + journal `tick-pinger-<ms>`. quiet-lab stays the rehearsal surface (R3's original shape).
+
+**F-4 (L2-B2 + M-7): task branches fork from MAIN, named `tasks/<id>`, base_sha CUT.** The dispatch commit lives on the orphan fsm-state branch — forking there produces unrelated-history PRs that would merge the state tree into main and mutually conflict. v2: the worker's artifact commit branches from its checkout (main) — clean diffs, mergeable pairs, the door's existing `TASK_BRANCH_RE` (`^tasks/<id>`) matches both live call sites unchanged. Epoch freshness rides the chain id already in the envelope's session (the PR body carries it; the conductor correlates) — the ancestry check was near-vacuous anyway (FF-only history).
+
+### MAJOR folds
+
+**F-5 (L1-M1 + L2-m7): the epoch ROLLOVER replaces reset-pops-queue.** `reset` keeps its exact current meaning (fresh mock/drill epoch — the X16-X23 drill contract is sacred). The queue drains on NATURAL completion: the halting tick (phase=done detected in the report drain) with a non-empty queue mints the next genesis IN THE SAME TICK instead of STOP_CHAIN (the rollover); empty queue → STOP_CHAIN as today. `reset {from_queue: true}` opts into queue-head genesis explicitly; `drop_queue: true` discards. The second spec's start latency = one tick (not hours — the halted-chain handoff dies).
+
+**F-6 (L1-M2 + L2-M3): the pause trigger is class-based with an OR-backstop.** Trigger = **(≥3 distinct tasks with quota-shaped infra reports) OR (≥1 infra-exhausted quarantine with a quota detail)** inside a PERSISTED window (state field `budget_window: [{ts, task, detail}]`, config `budget_pause_window_min` default 15 — NOT the rolling dedup window, which is epoch-wiped). Quota-shaped = detail matches `lane-exhausted(`, `lane-429`, or the error-as-answer rate-limit marker (the rc=0 text class). The backstop catches the sequential burn (max_parallel=1: one task's full ladder → 1 infra-exhausted → immediate pause, zero further tasks dispatched).
+
+**F-7 (L1-M7): the pause is a JOURNALED EVENT (the F8 law).** The conductor mints CONTROL `ctl-<alert-issue#>-budget-pause-<clockMs>` (nodeId = the alert issue — the table's shape) with payload `{reason:'lane-budget-exhausted', window}`; the existing CONTROL receiver applies paused; rebuild() replays it. `paused_reason` rides the chain record (projection). Un-pause = the existing resume control (same receiver).
+
+**F-8 (L1-M8): alert-FIRST-then-pause, fail-loud, self-retrying.** Order: (1) open the alert issue (label fsm-watchdog-alert, body = task list + 429 detail verbatim + key indexes + resume command); (2) POST failure → the tick FAILS (red run, law 5) with NO pause committed — the chain self-ticks, the persisted window re-triggers the attempt next tick (the correlated-failure case — a 5xx storm that killed the alert POST also paused the world's API — self-heals); (3) alert open → mint the pause event → commit → HOLD_CHAIN. The alert is the ONLY exit and it EXISTS before the world goes quiet.
+
+**F-9 (L1-M3): law-4's verify pass skips on paused OR halted** (both hold states — the quiesced-noop contract holds across the board).
+
+**F-10 (L1-M4): dispatchBudget is wall-clock-recomputed per iteration.** `budget = min(count_cap, floor(remaining_ms / DISPATCH_COST_MS))` recomputed before each assign+dispatch; the dispatchRetry ladder's Retry-After waits count against remaining (a 60-120s RA at low remaining → budget 0 → stop). The honest residual, documented: a tick dying mid-ladder leaves assigned-but-undispatched tasks — exactly law-4's class (the 720s flip recovers them net-zero); the ASSIGN-in-mutate + dispatch-in-IO split makes the mid-kill state safe BY CONSTRUCTION (already deployed semantics, now stated).
+
+**F-11 (L1-M5): intake re-delivery = intentional re-run.** The mint `task-<issue>-<sha8>` dedupes within an epoch (TASK_CREATED's receiver); across epochs (a done task's issue re-opened with the same body), the fresh genesis re-runs it — that is the operator's "run it again". The dedup window's epoch-wipe is irrelevant to the queue's semantics (the queue file is the cross-tick surface). Documented as the operator contract.
+
+**F-12 (L1-M6): the console's two-layer id.** The queue record's id = `console-<comment_node_id>` (free-form, the ops-queue lane); the CONTROL event minted at drain = the table's `ctl-<nodeId>-<command>-<clockMs>` with nodeId = the comment node_id. Both layers documented; the mint guards stay untouched.
+
+**F-13 (L1-M6c): the console's `status` reply pins the GH_TOKEN lane** — GITHUB_TOKEN-authored comments never fire issue_comment (anti-recursion law) → the reply cannot wake the console. Test-pinned.
+
+**F-14 (L2-M1): conductor.yml gains `pull-requests: write`** + the repo setting "Allow GitHub Actions to create and approve pull requests" is flipped (API) as an X22 precondition; PRs created by GITHUB_TOKEN trigger no PR workflows (documented — human review is the product).
+
+**F-15 (L2-M2): the watchdog NEVER writes fsm-state (charter kept).** The transcript-GC pass: (a) placement BEFORE the halted/paused exits (a completed epoch is the GC's primary target); (b) the fsm-sessions deletion commit IS the audit (branch history retains deletions — no journal record, no state write); (c) runtime bail-out: tree >5000 files → `GC-DEFERRED` log, no commit; (d) the deletion CAS uses the proven 3-way-refresh (law 15) against live transcript pushes.
+
+**F-16 (L2-M6 + L1's sim4 list): sim4's scenario list, enumerated to sim3's bar:** (1) happy pause loop; (2) window boundary (2-in + 1-aged-out → no pause); (3) distinct-task counting (one task's 3 reports → backstop pause only at exhaustion); (4) single-task ladder (max_parallel=1 → backstop fires at 1 infra-exhausted); (5) pause-with-inflight (reports drain during pause; resume → the reaper burns the expired in-flight leases — the honest residual, asserted); (6) alert-failure (tick red, no pause, window persists, next tick retries); (7) reset-vs-queue (from_queue both values + drop_queue); (8) the epoch rollover (drain-on-halt in the same tick); (9) re-opened-spec re-run; (10) the console mint round-trip + the GH_TOKEN no-recursion pin.
+
+### MINOR folds (one line each)
+- **m-1 (L2):** §3c re-scoped — the TTL-lease ceiling EXISTS (conductor-core min(lease, TTL)); W-C1 ships only the pin test.
+- **m-2 (L2):** the journal retention contract stated honestly (4×500-record tail; pruning + rotation = evidence window is the tail).
+- **m-3 (L2):** the queue line carries `issue` → genesis → completion comments target the INTAKE issue (new comment action, issue-numbered).
+- **m-4 (L2):** intake artifacts bind to `^tasks/<minted-id>/` (foreign-task paths rejected at the door AND at the write-back door).
+- **m-5 (L2):** the parked-queue writeback contract in store.mutate (consume = rewrite-minus-head; park keeps the file; a park-only tick journals nothing → quiesce while live — stated).
+- **m-6 (L2):** W-C1's gate names the offline/live split (routing shapes offline; the permission API + comment contracts are X-proof surfaces).
+- **m-7 (L2):** folded into F-5 (the rollover).
+- **m-8 (L2):** the ops anchor issue number is a repo var (`OPS_ISSUE`), #1 documented as load-bearing.
+- **L1's minors** (branch naming — folded F-4; trigger-types pin — folded F-2; the rest) are build-time hygiene named in the wave briefs.
+
+### The wave map after the fold
+- **W-C1 (conductor core):** §3 as folded (F-6/F-7/F-8/F-9/F-10 + F-6's persisted window) + the intake door (§2 minus deps, F-1/F-2) + the rollover (F-5) + pruning (§5b) + sim4 (F-16's ten scenarios) + the TTL pin (m-1). Offline-provable except the door's live halves (m-6).
+- **W-C2 (artifact+ops):** the task-branch/PR flow as folded (F-4/F-14 + m-3/m-4) + transcript GC (F-15) + the ops console (F-12/F-13 + m-8).
+- **W-C3 (availability):** the pinger on the user account (F-3) + the watch-the-watcher duty.
+- **X22-X24:** as §9 with F-3/F-4's corrected criteria (X23 = machinery proof with a wall-condition appendix per L2's schedulability analysis).
