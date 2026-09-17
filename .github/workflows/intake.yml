@@ -1,0 +1,46 @@
+# fsm-intake — the DOOR (issue → validated task spec → the intake queue).
+# T46/W-C1 (§4d, F-2/F-2a): the human-plane entry. An issue carrying a
+# fenced ```fsm-task spec block, opened by a write-class collaborator,
+# becomes a queued task spec on the state branch; the conductor's drain
+# births the epoch from it (the rollover) and reports completion back to
+# the issue.
+#
+# SECURITY CONTRACT (the F-2 per-workflow form — see README):
+#   - GITHUB_TOKEN ONLY. NO secrets.* anywhere in this workflow — the door
+#     is provably secrets-free, which is what makes an issues-trigger on a
+#     public repo acceptable (hostile inputs can never reach a PAT).
+#   - The in-run author gate is the compute firewall: every public issue
+#     wakes a ~5s runner (GitHub has no pre-job gate) — the accepted cost
+#     of a public door, stated honestly.
+#   - permissions: least privilege — issues:write (the door's comments) +
+#     contents:write (the queue CAS push to fsm-state — the F-2a amendment;
+#     the door WRITES state/intake-queue.jsonl, read alone was impossible).
+name: fsm-intake
+
+run-name: "intake · #${{ github.event.issue.number }} ${{ github.event.action }}"
+
+on:
+  issues:
+    types: [opened, reopened]
+
+concurrency:
+  group: fsm-intake
+  cancel-in-progress: false
+
+permissions:
+  issues: write    # the door's comments (reject reasons / position notes)
+  contents: write  # the intake-queue CAS push (F-2a)
+
+jobs:
+  door:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Intake door
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ toJSON(github.event) }}
+          GH_TOKEN: ${{ github.token }}
+        run: node intake/turn.mjs

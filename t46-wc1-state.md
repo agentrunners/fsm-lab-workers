@@ -1,0 +1,6 @@
+
+## lane B (completed by the orchestrator after the agent died mid-lane)
+- Landed by the agent before death: store's third queue (readIntakeQueueEx/readIntakeQueue/enqueueIntake + commit's intakeQueue/intakeBad params + out.intakeQueue rewrite handling, F-G(d) strict presence mirrored) + 24 store round-trip tests + lib/intake.mjs's pure half (parseSpecBlock with 3/4-backtick tolerance + comment-strip/quote-unwrap/list-literal value parsing; validateSpec's full fail-closed rule matrix incl the '..' traversal fold; doorDecide's 6-row decision table; howToComment; bodySha8).
+- Finished by the orchestrator: intake/turn.mjs (the I/O half — permission API fail-closed, law-5 checked comments, position note once-at-enqueue, GITHUB_TOKEN nudge with one retry, exit codes 2/3), intake.yml (F-2a: issues:write + contents:write, GITHUB_TOKEN only), tests/test-intake.mjs (24 pins), test-ttl-sync's m-1 ceiling pin (3 shapes), README's F-2 per-workflow security rewrite.
+- Agent-bug fixed in completion: parseSpecBlock's key-aware bare-value → list normalization for deps/artifacts (the doc + validateSpec's error text promised it; parseValue alone was key-agnostic — found by the test matrix).
+- Open at integration: intake.mjs's specToTask duplicates conductor-core's canonical mapper — unify (re-export) on the t46/wc1 merge.
