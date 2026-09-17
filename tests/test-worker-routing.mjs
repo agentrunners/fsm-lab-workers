@@ -117,7 +117,10 @@ test('routing: mock fast — ok envelope → work happens, done report with the 
   assert.equal(rep.outcome.status, 'done');
   assert.equal(typeof rep.outcome.artifact, 'string');
   assert.ok(Array.isArray(rep.outcome.artifact_refs) && rep.outcome.artifact_refs.every(p => p.startsWith('tasks/A3/')));
-  assert.deepEqual(rep.outcome.telemetry, { turns: rep.outcome.telemetry.turns, wall_ms: 10, lane_attempts_used: 1 });
+  // turns: the seeded shim's DETERMINISTIC output for this run identity
+  // (seedFromRunId('99881','1') → intIn(rng,1,4) = 2) — a concrete pin, not
+  // a self-reference: a mint/seed drift that changes the turn count fails here
+  assert.deepEqual(rep.outcome.telemetry, { turns: 2, wall_ms: 10, lane_attempts_used: 1 });
   assert.equal(rep.event_id, 'rep-99881-a1');
   assert.ok(h.logs.some(l => l.startsWith('WORKER-DONE') && l.includes('outcome=done')));
 });

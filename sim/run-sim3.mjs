@@ -255,7 +255,16 @@ class Sim3Driver {
 
   enqueue(rec) {
     this.queue.push(rec);
-    this.reports.push({ task: rec.task, event_id: rec.event_id, cls: rec.outcome.status, lease: rec.lease, fate: null, fateReason: null });
+    // the projection the checks read: identity (event_id + the run that
+    // minted it, so checks can round-trip through the ONE mint table),
+    // class, and the evidence fields the worker composes onto the wire
+    // (error text, artifact_refs — the door/gate evidence carriers)
+    this.reports.push({
+      task: rec.task, event_id: rec.event_id, cls: rec.outcome.status, lease: rec.lease,
+      run_id: rec.run_id ?? null, error: rec.outcome?.error ?? null,
+      artifact_refs: Array.isArray(rec.outcome?.artifact_refs) ? rec.outcome.artifact_refs : null,
+      fate: null, fateReason: null,
+    });
   }
 
   // the delivery audit: every enqueued report reaches applied | rejected
@@ -383,10 +392,6 @@ function scenarioMatrix() {
     badClass.length ? `offenders=${badClass.map(r => `${r.task}:${r.cls}`).join(',')}` : `${d.reports.length} reports`);
   const appliedReports = d.reports.filter(r => r.fate === 'applied');
   const byClass = {};
-  for (const r of appliedReports) {
-    const j = d.taskJournal(r.task).find(j => j.kind === 'REPORT' && j.lease === r.lease && j.event_id === undefined ? false : (j.kind === 'REPORT' && j.lease === r.lease));
-    void j;
-  }
   // map each applied report to its journal dest via (task, lease) pairs
   for (const r of appliedReports) {
     const recs = d.journalAll.filter(j => j.kind === 'REPORT' && j.task === r.task && j.lease === r.lease);
@@ -487,18 +492,19 @@ function scenarioMatrix() {
     const reps = d.taskReports('wb1');
     const j = d.taskJournal('wb1');
     const rec = j.find(x => x.kind === 'REPORT' && x.reason === 'poison');
+    // mirrors tests/test-worker-routing.mjs's wb-violation evidence pins
+    // (class flip + BOTH violation kinds in the error text + the refs riding
+    // the report), asserted here END-TO-END: the evidence survives the
+    // worker's compose AND the drain into the audit journal (rec.error)
     p('wb-violation → the DOOR flips the done to poison (terminal quarantine, reason poison, violations as evidence)',
       t.status === 'quarantined' && t.attempts === 1 && reps.length === 1
       && reps[0].cls === 'poison' && reps[0].fate === 'applied' && rec != null
-      && /write-back-door\(deny-dotgit\(\.github\/workflows\/evil\.ylyml\)|write-back-door\(deny-dotgit/.test(reps[0].cls) === false
-      && true,
-      `error=${slice(String(d.taskReports('wb1')[0]?.cls))}`);
-  }
-  {
-    // the door evidence, precisely: the report's error text + the refs
-    const rec = d.reports.find(r => r.task === 'wb1');
-    const err = rec ? String(rec.err ?? '') : '';
-    void err;
+      && /write-back-door\(.*deny-dotgit\(\.github\/workflows\/evil\.yml\)/.test(String(reps[0].error ?? ''))
+      && /root-not-declared\(evil\.txt\)/.test(String(reps[0].error ?? ''))
+      && (reps[0].artifact_refs ?? []).includes('.github/workflows/evil.yml')
+      && /write-back-door\(.*deny-dotgit\(\.github\/workflows\/evil\.yml\)/.test(String(rec?.error ?? ''))
+      && /root-not-declared\(evil\.txt\)/.test(String(rec?.error ?? '')),
+      `error=${slice(String(reps[0].error ?? rec?.error ?? ''))}`);
   }
 
   // the degraded completion gate: done 4/10 → PHASE degraded + STOP project-degraded
@@ -554,10 +560,16 @@ function scenarioLaw1() {
     `cycles=${d.cycleCount} status=${t?.status}`);
   p('the shim was NEVER invoked (zero work across the whole epoch)',
     (d.shimCalls['gate1'] ?? 0) === 0, `shimCalls=${d.shimCalls['gate1'] ?? 0}`);
+  // the ids are REAL minted REPORT ids: each equals what the ONE mint table
+  // produces for the run that reported it (string + `rep-<runId>-a<attempt>`
+  // shape, verified by round-trip rather than a hand-rolled regex), and the
+  // three flap reports are PAIRWISE DISTINCT (the probe6 mint-collision class
+  // — colliding ids would dedup-swallow a legitimate flap report)
   p('every report is infra_failed \'late-start\' (the law-1 vocabulary, renamed from deadline-in-past)',
     reps.length === 3 && reps.every(r => r.cls === 'infra_failed' && r.fate === 'applied')
-    && reps.every(r => r.event_id === r.event_id),
-    `reports=${reps.length} classes=${reps.map(r => r.cls).join(',')}`);
+    && reps.every(r => typeof r.event_id === 'string' && r.event_id === mintEventId('REPORT', { runId: r.run_id, attempt: '1' }))
+    && new Set(reps.map(r => r.event_id)).size === reps.length,
+    `reports=${reps.length} classes=${reps.map(r => r.cls).join(',')} ids=${reps.map(r => r.event_id).join(',')}`);
   p('the gate reports carry the late-start error (checked via the journal error text)',
     d.taskJournal('gate1').filter(j => j.kind === 'REPORT' && j.error === 'late-start').length === 3,
     `errors=${d.taskJournal('gate1').map(j => j.error).join(',')}`);
