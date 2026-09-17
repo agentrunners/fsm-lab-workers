@@ -28,6 +28,19 @@
 //   [fixture:exit-transport]  rc 1, transport-shaped stderr (connect
 //                             ECONNREFUSED…) — the non-zero-exit infra class
 //   [fixture:exit-app]        rc 2, plain app stderr — non-zero-exit WORK class
+//   [fixture:exit-api-<status>]
+//                             rc 1, stdout = the REAL CLI error-exit result
+//                             JSON: is_error:true + NUMERIC
+//                             api_error_status:<status> + the API Error
+//                             text (X21-final VERBATIM for 429: "API Error:
+//                             Request rejected (429) · Rate limit exceeded:
+//                             free-models-per-day-high-balance") — the B-1
+//                             shape: infra lane-<status>, rotation
+//   [fixture:exit-api-<status>-if:<substr>]
+//                             the same error-exit shape ONLY when
+//                             ANTHROPIC_AUTH_TOKEN contains <substr> — the
+//                             rotation-RECOVERY fixture (key-1 lanes exit
+//                             with the API error, a key-2 lane completes)
 //   [fixture:sleep-ms=<n>]    sleeps <n> REAL ms (spawning a same-group
 //                             grandchild that sleeps longer — the group-kill
 //                             proof), then normal done
@@ -75,6 +88,13 @@ const ENVS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL',
 const marker = (name) => prompt.includes(`[fixture:${name}]`);
 const sleepMatch = /\[fixture:sleep-ms=(\d+)\]/.exec(prompt);
 const ifMatch = /\[fixture:429-if:([^\]]+)\]/.exec(prompt);
+// the REAL CLI error-exit family (B-1): -if wins over the plain form
+const apiExitIf = /\[fixture:exit-api-(\d{3})-if:([^\]]+)\]/.exec(prompt);
+const apiExitPlain = !apiExitIf ? /\[fixture:exit-api-(\d{3})\]/.exec(prompt) : null;
+const apiExitStatus = apiExitIf ? parseInt(apiExitIf[1], 10)
+  : (apiExitPlain ? parseInt(apiExitPlain[1], 10) : null);
+const apiExitArmed = apiExitStatus !== null
+  && (!apiExitIf || String(process.env.ANTHROPIC_AUTH_TOKEN || '').includes(apiExitIf[2]));
 
 // ---- the artifact-writing fixtures (the write-back surface) ---------------
 // The adapter hands the CLI a temp workdir and scans it after the turn; these
@@ -129,6 +149,7 @@ if (process.env.FAKE_CC_ECHO_PATH) {
     fixtures: [
       ...(sleepMatch ? [`sleep-ms=${sleepMatch[1]}`] : []),
       ...(ifMatch ? [`429-if:${ifMatch[1]}`] : []),
+      ...(apiExitStatus !== null ? [`exit-api-${apiExitStatus}${apiExitIf ? `-if:${apiExitIf[2]}` : ''}`] : []),
       ...['429', 'auth-text', 'reasoning', 'fail', 'exit-transport', 'exit-app', 'dup-report', 'max-turns', 'artifacts', 'scratch', 'wb-violation'].filter(m => marker(m)),
     ],
   }, null, 2));
@@ -149,6 +170,19 @@ if (marker('exit-transport')) {
 if (marker('exit-app')) {
   process.stderr.write('fixture app error: deterministic non-transport failure (exit 2)\n');
   process.exit(2);
+}
+if (apiExitArmed) {
+  // the REAL CLI error-exit (X21-final): the result JSON rides STDOUT and
+  // the process exits rc 1 — is_error + NUMERIC api_error_status + the
+  // verbatim API Error text for 429 (B-1's classification input)
+  process.stdout.write(JSON.stringify({
+    type: 'result', subtype: 'api_error', is_error: true,
+    api_error_status: apiExitStatus,
+    result: apiExitStatus === 429
+      ? 'API Error: Request rejected (429) · Rate limit exceeded: free-models-per-day-high-balance'
+      : `API Error: Request rejected (${apiExitStatus})`,
+  }));
+  process.exit(1);
 }
 if (marker('max-turns')) {
   emit({ type: 'result', subtype: 'error_max_turns', is_error: true, result: 'Max turns reached!', num_turns: 40 });

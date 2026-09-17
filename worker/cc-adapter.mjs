@@ -170,6 +170,35 @@ export function ccLaneEnv(lane, envelope, extra = {}) {
 const TRANSPORT_STDERR_RE = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|fetch failed|network|socket|tunneling|connect/i;
 
 // ---------------------------------------------------------------------------
+// The CLI error-exit stdout parse (B-1 — the X21-final F-1 fix).
+// On a NON-ZERO exit the CLI prints its result JSON on STDOUT (is_error /
+// api_error_status / subtype / result); the CC-LANE-EXIT log has parsed it
+// since X20 (log-only — the F-1 bug). These helpers are that parse, lifted
+// so the classifier consumes the same data.
+// ---------------------------------------------------------------------------
+
+// the result JSON the CLI prints on stdout, or null when stdout is not a
+// JSON object (the text-only stderr shape — the real work failures)
+export function ccExitJson(stdout) {
+  try {
+    const p = JSON.parse(String(stdout));
+    return p !== null && typeof p === 'object' && !Array.isArray(p) ? p : null;
+  } catch { return null; }
+}
+
+// the infra trigger: a NUMERIC api_error_status on the exit JSON. ANY status
+// — 429/401/402/5xx/400/404 — is an API-conditioned failure (the CLI's API
+// errors are never "the work failed"); a numeric STRING coerces (CLI-drift
+// tolerance). Everything else is null → the work class.
+export function ccApiErrorStatus(exitJson) {
+  if (exitJson === null) return null;
+  const v = exitJson.api_error_status;
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // The LOCAL bridge lifecycle (real mode only — X20 run-3 root cause fix).
 // Spawns worker/cc-bridge.mjs with the LANE's key+model, waits for the port
 // file, and returns {url, stop()}. The key never rides the CLI's env.
@@ -569,12 +598,30 @@ export async function ccTurn(envelope, opts = {}) {
           lastClass = 'lane-transport';
           continue;   // the lane never reached the model — rotate
         }
-        laneInfo.class = 'work';
-        // X20 run-2 lesson: the CLI's stderr IS the diagnosis — log it
-        // (the transcript failure must never mask the work-class cause)
-        let stdoutJson = '';
-        try { const pj = JSON.parse(r.stdout); stdoutJson = ` is_error=${pj.is_error} api_error_status=${pj.api_error_status} subtype=${pj.subtype ?? '-'} result=${String(pj.result ?? '').slice(0, 120)}`; } catch { stdoutJson = ' stdout-unparseable'; }
+        // B-1 (the X21-final F-1 fix — 12/16 tasks burned as work_failed on
+        // a lane-quota 429): the CLI's error-exit prints its result JSON on
+        // STDOUT — parse it BEFORE classifying (the same parse the
+        // CC-LANE-EXIT log below runs). A NUMERIC api_error_status is an
+        // API-conditioned failure: 429/401/402/5xx/400/404 ALL rotate (the
+        // CLI's API errors are never "the work failed"), the status rides
+        // the detail for the audit, and lane exhaustion then reports
+        // infra_failed lane-exhausted (net-zero, its own budget). Text-only
+        // stderr (stdout unparseable) stays WORK — the real work failures.
+        const exitJson = ccExitJson(r.stdout);
+        const apiStatus = ccApiErrorStatus(exitJson);
+        // X20 run-2 lesson: the CLI's stderr/stdout IS the diagnosis — log
+        // every non-transport error exit (the transcript failure must never
+        // mask the work-class cause)
+        const stdoutJson = exitJson
+          ? ` is_error=${exitJson.is_error} api_error_status=${exitJson.api_error_status} subtype=${exitJson.subtype ?? '-'} result=${String(exitJson.result ?? '').slice(0, 120)}`
+          : ' stdout-unparseable';
         log(`CC-LANE-EXIT rc=${r.rc} model=${lane.model} stderr=${JSON.stringify(r.stderr.split('\n').filter(Boolean).slice(0, 3).join(' | ').slice(0, 300))}${stdoutJson}`);
+        if (apiStatus !== null) {
+          laneInfo.class = 'infra';
+          lastClass = `lane-${apiStatus}`;
+          continue;   // the API error surface — rotate the lane
+        }
+        laneInfo.class = 'work';
         return await finalize({
           status: 'work_failed', detail: `cc-exit-${r.rc}(${r.stderr.split('\n')[0].slice(0, 80)})`,
           artifact_refs: [], summary: `cc: task ${taskId} attempt ${attempt} exited ${r.rc} on lane ${i + 1} (${lane.model})`,

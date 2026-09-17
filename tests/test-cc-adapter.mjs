@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
+  ccExitJson, ccApiErrorStatus,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
@@ -290,6 +291,72 @@ test('cc classify: non-zero rc — transport-shaped stderr hops, app-shaped stde
   assert.match(app.result.detail, /cc-exit-2/);
   assert.equal(app.result.lane_attempts_used, 1, 'a deterministic app error does NOT rotate');
   app.roots.cleanup();
+});
+
+test('cc classify (B-1): the REAL CLI error-exit shape — rc≠0 + stdout JSON with numeric api_error_status → infra lane-<status>, ROTATION', async () => {
+  const logs = [];
+  const { result, roots } = await turn(fakeEnv(), {
+    prompt: '[fixture:exit-api-429] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 2 },
+  }, { log: (...a) => logs.push(a.join(' ')) });
+  // the X21-final F-1 fix: the API error surface (rc 1 + the result JSON on
+  // stdout) is INFRA with the status in the detail — never the terminal
+  // work_failed that burned 12/16 tasks on a lane-quota 429
+  assert.equal(result.status, 'infra_failed');
+  assert.match(result.detail, /lane-exhausted\(2\/6 lanes, last lane-429\)/, 'the status rides the detail for the audit');
+  assert.equal(result.lane_attempts_used, 2, 'the lane rotated instead of terminating');
+  assert.deepEqual(result.telemetry.lanes.map(l => l.class), ['infra', 'infra']);
+  assert.equal(result.telemetry.lanes[0].rc, 1);
+  // the CC-LANE-EXIT evidence log fired with the parsed api_error_status
+  assert.ok(logs.some(l => l.includes('CC-LANE-EXIT') && l.includes('api_error_status=429')),
+    'the diagnosis log rode the rotation');
+  roots.cleanup();
+});
+
+test('cc classify (B-1): EVERY numeric api_error_status rotates — 400/401/402/404/5xx (the whole F-1 family, not just 429)', async () => {
+  for (const status of [400, 401, 402, 404, 500, 502, 503]) {
+    const { result, roots } = await turn(fakeEnv(), {
+      prompt: `[fixture:exit-api-${status}] go`,
+      budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 2 },
+    });
+    assert.equal(result.status, 'infra_failed', `api_error_status ${status} is infra`);
+    assert.ok(result.detail.includes(`lane-exhausted(2/6 lanes, last lane-${status})`), `status ${status} rides the detail (detail=${result.detail})`);
+    assert.equal(result.lane_attempts_used, 2, `status ${status} rotated`);
+    roots.cleanup();
+  }
+});
+
+test('cc rotation (B-1): key-1 exit-api-429 lanes → hops to key 2 and RECOVERS — the F-1 fix end-to-end', async () => {
+  const { result, roots } = await turn(fakeEnv(), {
+    prompt: '[fixture:exit-api-429-if:cc-test-key-one] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
+  });
+  assert.equal(classifyOutcome(result).status, 'done', 'the rotation recovered the turn in-process');
+  assert.equal(result.lane_attempts_used, 4, '3 key-1 lanes exited api-429, the 4th (key 2, first model) completed');
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.class]), [
+    [1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done'],
+  ]);
+  roots.cleanup();
+});
+
+test('cc exit-json helpers (B-1 pure): the stdout parse + the numeric-status trigger', () => {
+  const x21 = JSON.stringify({
+    type: 'result', subtype: 'api_error', is_error: true, api_error_status: 429,
+    result: 'API Error: Request rejected (429) · Rate limit exceeded: free-models-per-day-high-balance',
+  });
+  assert.equal(ccApiErrorStatus(ccExitJson(x21)), 429, 'the X21-final verbatim stdout shape');
+  assert.equal(ccExitJson('not json at all'), null);
+  assert.equal(ccExitJson('null'), null);
+  assert.equal(ccExitJson('"a string"'), null);
+  assert.equal(ccExitJson('[1,2]'), null, 'an array is not a result object');
+  assert.deepEqual(ccExitJson('{}'), {}, 'an empty object parses (no status → work)');
+  assert.equal(ccApiErrorStatus(null), null);
+  assert.equal(ccApiErrorStatus({}), null);
+  assert.equal(ccApiErrorStatus({ is_error: true, result: 'x' }), null, 'no numeric status → the work class (text-only shape)');
+  assert.equal(ccApiErrorStatus({ api_error_status: '429' }), 429, 'a numeric STRING coerces (CLI-drift tolerance)');
+  assert.equal(ccApiErrorStatus({ api_error_status: 'not-a-number' }), null);
+  assert.equal(ccApiErrorStatus({ api_error_status: null }), null);
+  assert.equal(ccApiErrorStatus({ api_error_status: true }), null, 'booleans are not statuses');
 });
 
 test('cc dup-report: the fixture rides repeat_report — the caller enqueues the SAME payload twice', async () => {
