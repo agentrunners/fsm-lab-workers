@@ -12,6 +12,7 @@ import {
   conductorTick, assembleDispatchPayload, dispatchVerificationEvents,
   pacingFloorDecision, VERIFY_WINDOW_MS, PACING_FLOOR_S,
   W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
+  verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { envelopeFromDispatch } from '../lib/worker-contract.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
@@ -312,4 +313,74 @@ test('F-1: the direct+queued double-fire shape (the live e913/e914 mechanism) is
   });
   assert.equal(out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset').length, 1);
   assert.equal(out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate').length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 5. M-A1/M-B1 (46-R2, convergent) — law-4 SCAN FIDELITY, pinned against a
+// fixture runs-list. sim3 injects ground-truth seen keys; these are the only
+// tests exercising the scan's own shape (the adapter-side I/O half lens A
+// called "tested by nothing"): the per_page=100 page, the created>= floor,
+// and the created_at-vs-issued_at correlation that kills the prior-epoch
+// false-negative (mockProject regenerates the SAME task ids every reset and
+// attempts restart at 1, so a prior epoch's run yields the SAME key).
+// ---------------------------------------------------------------------------
+
+const runNamed = (name, createdMs) => ({ name, created_at: iso(createdMs) });
+
+test('scan shape: per_page=100 + the created>= floor at (oldest issued − 900s), URL-encoded', () => {
+  assert.equal(VERIFY_SCAN_PER_PAGE, 100, 'the page width is 100 (was 20 — the false-positive class)');
+  assert.equal(VERIFY_SCAN_SLACK_MS, 900_000, 'the correlation slack is 900s');
+  const path = verifyScanRunsPath('claudecode-headless/fsm-lab', T0);
+  assert.ok(path.startsWith('/repos/claudecode-headless/fsm-lab/actions/workflows/worker.yml/runs?'));
+  assert.ok(path.includes(`per_page=${VERIFY_SCAN_PER_PAGE}`), `page widened 20→100 (got ${path})`);
+  const floor = encodeURIComponent(`>=${new Date(T0 - VERIFY_SCAN_SLACK_MS).toISOString()}`);
+  assert.ok(path.includes(`&created=${floor}`), `the created floor rides the query (got ${path})`);
+  // non-finite anchor → no floor (fail-open; the per-task correlation still holds)
+  assert.ok(!verifyScanRunsPath('r', NaN).includes('created='), 'no invented floor without a finite issued_at');
+});
+
+test('scan (a): prior-epoch SAME-KEY run with older created_at -> NOT seen -> the flip still fires (the false-negative killer)', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const keys = seenKeysFromRuns([
+    runNamed('task-A1 · succeed · a1', issuedMs - 45 * 60_000),   // a PRIOR epoch's run — same reused id, created 45min before this lease
+    runNamed('task-B9 · fast · a1', issuedMs - 90 * 60_000),      // another prior-epoch run (unknown task — fail-open name-only, irrelevant)
+  ], state.tasks);
+  assert.ok(!keys.has('A1#a1'), 'a run created before issued_at−900s must NOT suppress the flip');
+  const evs = dispatchVerificationEvents({ state, seenKeys: keys, nowMs: T0 });
+  assert.equal(evs.length, 1, 'the stale prior-epoch run does not blind law-4 at epoch starts');
+  assert.equal(evs[0].outcome.error, 'dispatch-unverified');
+});
+
+test('scan (b): the in-window run at position 25 -> seen (per_page=100 shape; the OLD 20-run page flipped a LIVE task)', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const runs = [];
+  for (let i = 0; i < 24; i++) runs.push(runNamed(`task-STORM-${i} · fast · a1`, issuedMs + (24 - i) * 60_000));  // a flap/burst storm of 24 NEWER runs
+  runs.push(runNamed('task-A1 · succeed · a1', issuedMs + 60_000));   // position 25 — the LIVE in-window run
+  runs.push(runNamed('task-STORM-25 · fast · a1', issuedMs + 30_000));
+  const keys = seenKeysFromRuns(runs, state.tasks);
+  assert.ok(keys.has('A1#a1'), 'the in-window run is seen at position 25');
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: keys, nowMs: T0 }).length, 0, 'no false flip — the run is verified');
+  // the OLD page-1 shape on the SAME fixture: the M-B1 false-positive, reproduced
+  const oldPage = seenKeysFromRuns(runs.slice(0, 20), state.tasks);
+  assert.ok(!oldPage.has('A1#a1'), 'the fixture reproduces the old 20-run page-1 blindness');
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: oldPage, nowMs: T0 }).length, 1, 'the old shape voided a LIVE lease (why per_page went 20→100)');
+});
+
+test('scan (c): boundary — created_at exactly at issued_at−900s -> seen (inclusive); one ms older -> dropped', () => {
+  const { state, task } = leasedState(VERIFY_WINDOW_MS + 60_000);
+  const issuedMs = Date.parse(task.lease.issued_at);
+  const atBoundary = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - VERIFY_SCAN_SLACK_MS)], state.tasks);
+  assert.ok(atBoundary.has('A1#a1'), 'created_at == issued_at−900s is IN the correlation window (>=)');
+  const justBefore = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - VERIFY_SCAN_SLACK_MS - 1)], state.tasks);
+  assert.ok(!justBefore.has('A1#a1'), 'created_at one ms older is dropped');
+  // an in-window run created AFTER the lease (the normal shape) is seen
+  const normal = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs + 120_000)], state.tasks);
+  assert.ok(normal.has('A1#a1'));
+  // fail-open edges: unparseable created_at / task without a lease keep the name-only match
+  const noCreated = seenKeysFromRuns([{ name: 'task-A1 · succeed · a1' }], state.tasks);
+  assert.ok(noCreated.has('A1#a1'), 'a run without created_at fails OPEN (cannot prove staleness)');
+  const noLease = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - 45 * 60_000)], { A1: { id: 'A1', status: 'ready' } });
+  assert.ok(noLease.has('A1#a1'), 'a task without a lease keeps the name-only match (no correlation possible)');
 });
