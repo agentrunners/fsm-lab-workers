@@ -612,11 +612,10 @@ test('X20-run-1 lesson: an ISO-string now() clock fails LOUD (the NaN-wall insta
   );
 });
 
-test('X20 run-4 lesson: startBridge spawns, listens on 127.0.0.1, synthesizes the models route, and stops cleanly', async () => {
-  const { startBridge } = await import('../worker/cc-bridge-helper.mjs').catch(() => ({}));
-  // the helper lives in the adapter (not exported) — drive it through a real
-  // lane-less bridge spawn instead: spawn cc-bridge.mjs directly (no network
-  // needed until a request arrives) and check the port-file contract
+test('X20 run-4 lesson: the bridge spawns, listens on 127.0.0.1, synthesizes the models route, and stops cleanly', async () => {
+  // startBridge lives in the adapter (not exported) — drive the bridge
+  // contract directly instead: spawn cc-bridge.mjs (no network needed
+  // until a request arrives) and check the port-file contract
   const { spawn } = await import('node:child_process');
   const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
