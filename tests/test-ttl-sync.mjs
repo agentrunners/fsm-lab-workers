@@ -58,3 +58,41 @@ test('TTL sync: conductor.yml JOB_TTL_MIN === its timeout-minutes', () => {
 
   assert.equal(jobTtl, String(timeoutMin), 'JOB_TTL_MIN env must equal conductor.yml timeout-minutes');
 });
+
+// ---------------------------------------------------------------------------
+// T46/W-C1 m-1 (the L2 fold): the TTL-LEASE CEILING pin — pure arithmetic.
+// The design's §3c re-scope: the ceiling EXISTS (conductor-core's
+// assembleDispatchPayload: deadline = min(lease, now + worker TTL) − margin);
+// W-C1 ships only the pin. Three shapes: the SHORT lease wins, the LONG
+// lease caps at the TTL (a task the job cannot host is never leased past
+// it), and a lease expiring INSIDE the margin mints a PAST deadline — the
+// worker's law-1 start-gate turns that into an immediate infra 'late-start'
+// (cleaner than working past the lease into a guaranteed orphan).
+// ---------------------------------------------------------------------------
+
+test('m-1: the TTL-lease ceiling — deadline = min(leaseMs, dispatch+TTL) − margin, all three shapes', async () => {
+  const { assembleDispatchPayload, W2_ENVELOPE_MARGIN_MS } = await import('../lib/conductor-core.mjs');
+  const T0 = Date.parse('2026-09-17T10:00:00.000Z');
+  const TASK = { id: 'T-1', title: 't', behavior: 'succeed', work_ms: 1 };
+  const iso = (ms) => new Date(ms).toISOString();
+
+  // shape 1: SHORT lease (10min) < TTL (48min) — the lease wins
+  const short = JSON.parse(assembleDispatchPayload(
+    { task: 'T-1', lease: 'l-x', behavior: 'succeed', attempt: 1, expires: iso(T0 + 10 * 60_000), chain: 'c' },
+    TASK, null, { nowMs: T0 }).ox);
+  assert.equal(short.deadline_ms, T0 + 10 * 60_000 - W2_ENVELOPE_MARGIN_MS, 'short lease: deadline = lease − margin');
+
+  // shape 2: LONG lease (120min) > TTL (48min default) — the TTL caps
+  const long = JSON.parse(assembleDispatchPayload(
+    { task: 'T-1', lease: 'l-x', behavior: 'succeed', attempt: 1, expires: iso(T0 + 120 * 60_000), chain: 'c' },
+    TASK, null, { nowMs: T0 }).ox);
+  assert.equal(long.deadline_ms, T0 + 48 * 60_000 - W2_ENVELOPE_MARGIN_MS, 'long lease: the worker TTL caps (a task the job cannot host is never leased past it)');
+
+  // shape 3: lease expiring INSIDE the margin — a PAST deadline (no floor:
+  // the law-1 start-gate handles it as late-start, never a worked orphan)
+  const past = JSON.parse(assembleDispatchPayload(
+    { task: 'T-1', lease: 'l-x', behavior: 'succeed', attempt: 1, expires: iso(T0 + 60_000), chain: 'c' },
+    TASK, null, { nowMs: T0 }).ox);
+  assert.equal(past.deadline_ms, T0 + 60_000 - W2_ENVELOPE_MARGIN_MS, 'in-margin lease: the past deadline mints (the start-gate rejects)');
+  assert.ok(past.deadline_ms < T0, 'it is genuinely in the past');
+});

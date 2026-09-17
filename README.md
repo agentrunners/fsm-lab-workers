@@ -109,7 +109,22 @@ curl -s -X POST -H "Authorization: token $LAB_PAT" \
   proves the wrapping works; the full CC-turn integration is the NEXT step
   (the swarm's agent-turn composite action drops into `worker/turn.mjs`).
 - The public repo holds mock content only; secrets follow the executor
-  security contract (dispatch/schedule triggers only — never
-  `issue_comment`/`pull_request`/`workflow_run` on a repo holding a PAT).
+  security contract — **in its T46/W-C1 per-workflow form (F-2)**:
+  - **Workflows that hold a PAT secret** (conductor.yml: `LAB_PAT`) keep the
+    ABSOLUTE rule: dispatch/schedule/manual triggers ONLY — never
+    `issue_comment`/`issues`/`pull_request`/`workflow_run` (hostile-input
+    surfaces on a workflow that can spend a PAT).
+  - **Workflows that are provably secrets-free** may take hostile-input
+    triggers: `intake.yml` (issues[opened|reopened]) and the ops lanes run on
+    `GITHUB_TOKEN` ONLY — no `secrets.*` anywhere in their env, with
+    least-privilege `permissions:` blocks (intake: `issues: write` for the
+    door's comments + `contents: write` for the intake-queue CAS push — the
+    F-2a amendment: the door WRITES `state/intake-queue.jsonl`; read-only was
+    impossible against the queue design). The in-run author gate is the
+    compute firewall: strangers get one comment, zero runs, nothing queued.
+  - **The stranger-wake cost, stated honestly**: every public issue-open (or
+    comment on the pinned lanes) wakes a ~5s runner — GitHub has no pre-job
+    gate. That accepted cost is what buys a public door; the fail-closed
+    permission check keeps it from becoming a free compute lane.
 - Live experiment evidence (run IDs, measured cadence, drop rates) lands in
   `EVIDENCE.md` as the experiments complete.
