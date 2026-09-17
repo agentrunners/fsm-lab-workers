@@ -316,8 +316,11 @@ async function main() {
       // (old workers ignore the extras; new workers route through
       // envelopeFromDispatch). prompt carries the brief AS QUOTED DATA;
       // deadline_ms is minted HERE (absolute, queue-delay-proof).
+      // A-2 (46-R2): run_id rides the action so the envelope's session
+      // stops minting the permanent 'pending' run-id (this conductor run's
+      // id — the audit trail's dispatch-turn discriminator).
       const payload = assembleDispatchPayload(
-        { ...a, chain: state.chain.id },
+        { ...a, chain: state.chain.id, run_id: RUN_ID },
         state.tasks[a.task] || null,
         briefMd,
         { nowMs: Date.now(), mode: epochMode },

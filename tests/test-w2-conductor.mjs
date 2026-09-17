@@ -7,6 +7,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { genesis, apply, rebuild } from '../lib/fsm.mjs';
 import {
   conductorTick, assembleDispatchPayload, dispatchVerificationEvents,
@@ -448,4 +449,50 @@ test('M-3/B: the floor default is the exported PACING_FLOOR_DEFAULT_S (0 = hot-f
   // the decision stays the pure half it always was
   assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({ PACING_FLOOR_S: '300' }), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, true);
   assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({}), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false, 'default 0 = floor-disabled');
+});
+
+// ---------------------------------------------------------------------------
+// 7. A-2 (46-R2) — run_id rides the dispatch action (no more pending sessions)
+// ---------------------------------------------------------------------------
+
+test('A-2: a dispatch action carrying run_id mints a real session; the no-run_id fallback keeps pending', () => {
+  const p = JSON.parse(assembleDispatchPayload({ ...ACT, chain: 'chain-x', run_id: '34073438112' }, TASK, null, { nowMs: T0 }).ox);
+  assert.equal(p.session, 'chain-x/A1/34073438112-a2', 'the session carries the dispatching run id');
+  assert.ok(!p.session.includes('pending'));
+  // the local/manual fallback (no run_id) keeps the pending marker — compat, not a regression
+  const q = JSON.parse(assembleDispatchPayload({ ...ACT, chain: 'chain-x' }, TASK, null, { nowMs: T0 }).ox);
+  assert.equal(q.session, 'chain-x/A1/pending-a2');
+  // the wire payload is UNCHANGED: run_id rides the ACTION, not the client_payload (9 properties, ≤10)
+  const wire = assembleDispatchPayload({ ...ACT, chain: 'chain-x', run_id: '34073438112' }, TASK, null, { nowMs: T0 });
+  assert.equal(Object.keys(wire).length, 9, 'the dispatch 422 class stays closed');
+  assert.ok(!('run_id' in wire));
+});
+
+// ---------------------------------------------------------------------------
+// 9. adapter wiring (source-pinned) — conductor/turn.mjs and ops/turn.mjs are
+// self-executing I/O scripts (not importable in a test), so their seams are
+// pinned by source shape: the scan consumes the core builders, the floor
+// consumes the exported constant, run_id rides the dispatch action, and the
+// ops note encoding matches the direct lane. A revert of any wiring fails
+// here. (The I/O half was the repo's named trap: "integration logic lives
+// in turn-files" — lens A finding (c).)
+// ---------------------------------------------------------------------------
+
+test('adapter wiring (source-pinned): the law-4 scan, the floor constant, the run_id action, and the ops note encoding', () => {
+  const src = readFileSync(new URL('../conductor/turn.mjs', import.meta.url), 'utf8');
+  // law-4: the adapter consumes the core's scan builders (no inline per_page/name-regex anymore)
+  assert.ok(src.includes('verifyScanRunsPath('), 'the scan path comes from conductor-core');
+  assert.ok(src.includes('seenKeysFromRuns('), 'the seen-keys build comes from conductor-core (time-correlated)');
+  assert.ok(src.includes('VERIFY-SCAN-PAGE-FULL'), 'the full-page tail signal is logged');
+  assert.ok(!src.includes('per_page=20'), 'the old 20-run page is gone');
+  assert.ok(!/\^task-\(\.\+\?\) · /.test(src), 'the name regex lives in the core now (one source)');
+  // M-3/B: the floor default is the exported constant, not the '0' literal
+  assert.ok(src.includes('resolvePacingFloorS('), 'the floor default is resolved from conductor-core');
+  assert.ok(!/PACING_FLOOR_S\s*\|\|\s*'0'/.test(src), 'the hardcoded floor literal is gone');
+  // A-2: run_id rides the dispatch action
+  assert.ok(/\{\s*\.\.\.a,\s*chain:\s*state\.chain\.id,\s*run_id:\s*RUN_ID\s*\}/.test(src), 'the dispatch action carries run_id: RUN_ID');
+  // M-A2: the queued lane encodes an absent note exactly like the direct lane
+  const ops = readFileSync(new URL('../ops/turn.mjs', import.meta.url), 'utf8');
+  assert.ok(ops.includes('note: cp.note ?? null'), 'ops/turn.mjs note encoding is ?? null (was || \'\')');
+  assert.ok(!ops.includes('cp.note || \'\''), 'the old || \'\' encoding is gone');
 });
