@@ -134,15 +134,21 @@ const server = createServer(async (req, res) => {
     }
     // ---- the main lane: messages passthrough (query string preserved)
     if (req.method === 'POST' && /^\/v1\/messages/.test(path)) {
-      // M-3 auth half: when BRIDGE_AUTH is set, the request must carry
-      // exactly `Authorization: Bearer <BRIDGE_AUTH>` — anything else is a
-      // LOUD 401 and is NOT forwarded. Unset → no check (back-compat).
+      // M-3 auth half: when BRIDGE_AUTH is set, the request must prove it
+      // holds the CLI's dummy — EITHER `Authorization: Bearer <BRIDGE_AUTH>`
+      // (the SDK's auth-token shape) OR `x-api-key: <BRIDGE_AUTH>` (the
+      // API-key shape; the real CLI's exact header depends on which env var
+      // it keyed off — both are accepted rather than betting a live epoch
+      // on one). Anything else is a LOUD 401 and is NOT forwarded. Unset →
+      // no check (back-compat).
       if (BRIDGE_AUTH) {
-        const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
-        if (!m || m[1] !== BRIDGE_AUTH) {
-          console.error(`BRIDGE-AUTH-REJECT ${req.method} ${path} — Authorization missing or wrong (401, NOT forwarded)`);
+        const bearer = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+        const xKey = req.headers['x-api-key'];
+        const ok = (bearer && bearer[1] === BRIDGE_AUTH) || xKey === BRIDGE_AUTH;
+        if (!ok) {
+          console.error(`BRIDGE-AUTH-REJECT ${req.method} ${path} — Authorization/x-api-key missing or wrong (401, NOT forwarded)`);
           res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ type: 'error', error: { type: 'bridge_auth_rejected', message: 'cc-bridge: missing or invalid Authorization (expected: Bearer <BRIDGE_AUTH>)' } }));
+          res.end(JSON.stringify({ type: 'error', error: { type: 'bridge_auth_rejected', message: 'cc-bridge: missing or invalid credentials (expected the CLI dummy via Authorization: Bearer or x-api-key)' } }));
           return;
         }
       }

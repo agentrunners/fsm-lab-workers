@@ -635,11 +635,14 @@ test('X20 run-4 lesson: the bridge spawns, listens on 127.0.0.1, synthesizes the
     try { port = parseInt(readFileSync(portFile, 'utf8').trim(), 10); } catch { /* not yet */ }
   }
   assert.ok(Number.isInteger(port) && port > 0, `the bridge writes its port file (${out.slice(0, 120)})`);
-  // the models route: synthesized, 200, no network
+  // the models DETAIL route: synthesized, 200, no network — the BARE model
+  // object (m-7: the real Anthropic detail shape; the LIST shape lives on
+  // GET /v1/models — reconciled with lane B's bridge at integration)
   const r = await fetch(`http://127.0.0.1:${port}/v1/models/test%2Fmodel%3Afree`);
   assert.equal(r.status, 200);
   const body = await r.json();
-  assert.equal(body.data[0].id, 'test/model:free');
+  assert.equal(body.id, 'test/model:free');
+  assert.equal(body.type, 'model');
   // unknown route: LOUD 501 (never a silent 404 mirror)
   const r2 = await fetch(`http://127.0.0.1:${port}/v1/something-else`, { method: 'POST' });
   assert.equal(r2.status, 501);

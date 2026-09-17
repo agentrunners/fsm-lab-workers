@@ -246,6 +246,11 @@ async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
       OPENROUTER_API_KEY: lane.key,
       CC_LANE_MODEL: lane.model,
       OPENROUTER_BASE: process.env.OPENROUTER_BASE || '',
+      // M-3 (integration wiring): the bridge enforces this exact bearer on
+      // the credential-spending route; the CLI carries the SAME dummy as its
+      // ANTHROPIC_AUTH_TOKEN (ccLaneEnv line above) — the CLI's requests
+      // pass, unrelated local processes cannot silently spend the lane key.
+      BRIDGE_AUTH: 'bridge-local-no-key',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,   // its own group: a CLI group-kill cannot take the bridge
