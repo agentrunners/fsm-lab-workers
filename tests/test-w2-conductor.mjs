@@ -11,8 +11,7 @@ import { readFileSync } from 'node:fs';
 import { genesis, apply, rebuild } from '../lib/fsm.mjs';
 import {
   conductorTick, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS, PACING_FLOOR_S,
-  PACING_FLOOR_DEFAULT_S, W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
+  DISPATCH_COST_MS, isQuotaDetail, VERIFY_WINDOW_MS, W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { envelopeFromDispatch } from '../lib/worker-contract.mjs';
@@ -247,20 +246,19 @@ test('law-4: the flipped task is re-dispatchable in the SAME tick (net-zero reco
 });
 
 // ---------------------------------------------------------------------------
-// 3. F-M2 — pacingFloorDecision
+// 3. F-M2 — pacingFloorDecision — DELETED with the concept (T46/W-C1 F-10):
+// the inter-dispatch delay floor is replaced by the dispatchBudget slot
+// COUNT (see tests/test-budget.mjs). A count cannot skip-and-leave-assigned.
 // ---------------------------------------------------------------------------
-test('F-M2: floor applies ONLY on long-lease epochs (lease_minutes >= 7)', () => {
-  assert.equal(pacingFloorDecision({ leaseMinutes: 4, lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false);
-  const d = pacingFloorDecision({ leaseMinutes: 7, lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false });
-  assert.equal(d.applies, true);
-  assert.ok(d.waitMs > 0 && d.waitMs <= PACING_FLOOR_S * 1000);
-});
 
-test('F-M2: first-of-turn, elapsed, disabled, and unknown-last all fail open', () => {
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: true }).applies, false);
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, lastDispatchMs: T0 - PACING_FLOOR_S * 1000 - 1, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false);
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: 0, lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false);
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, lastDispatchMs: NaN, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false);
+test('W-C1/F-10: the floor is GONE — the exports are dead (count, not delay)', () => {
+  // the regression pin that the concept stays dead: the module must NOT
+  // export the floor vocabulary anymore (a revert would re-import the
+  // skip-left-assigned bug class X21 hot-fix 2 documented).
+  const src = readFileSync(new URL('../lib/conductor-core.mjs', import.meta.url), 'utf8');
+  assert.ok(!src.includes('export const PACING_FLOOR_S'), 'the floor constant must stay deleted');
+  assert.ok(!src.includes('export function pacingFloorDecision'), 'the floor decision must stay deleted');
+  assert.ok(src.includes('export const DISPATCH_COST_MS'), 'the budget constant exists in its place');
 });
 
 // ---------------------------------------------------------------------------
@@ -439,17 +437,10 @@ test('M-A2: every noteless encoding mix twins; both-null and both-empty stay gua
 // 6. M-3/B (46-R2) — the pacing-floor DEFAULT is live exported code
 // ---------------------------------------------------------------------------
 
-test('M-3/B: the floor default is the exported PACING_FLOOR_DEFAULT_S (0 = hot-fix-2 semantics); env override wins', () => {
-  assert.equal(PACING_FLOOR_DEFAULT_S, 0, 'hot-fix 2: the floor default is OFF until the W-C dispatchBudget');
-  assert.equal(resolvePacingFloorS({}), 0, 'no env -> the exported default (not a hardcoded literal)');
-  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '' }), 0, 'empty env -> the default');
-  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '300' }), 300, 'the env override wins');
-  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '0' }), 0, 'explicit 0 = disabled');
-  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: 'garbage' }), 0, 'unparseable env -> fail-open default (floor-disabled)');
-  // the decision stays the pure half it always was
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({ PACING_FLOOR_S: '300' }), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, true);
-  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({}), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false, 'default 0 = floor-disabled');
-});
+// M-3/B: DELETED with the floor (T46/W-C1 F-10) — the default-consumption
+// pin's subject no longer exists (the exports are dead; the deletion pin
+// above guards the concept). The DISPATCH_COST_MS + budget arithmetic pins
+// live in tests/test-budget.mjs.
 
 // ---------------------------------------------------------------------------
 // 7. A-2 (46-R2) — run_id rides the dispatch action (no more pending sessions)
