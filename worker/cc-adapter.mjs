@@ -167,6 +167,32 @@ export function ccLaneEnv(lane, envelope, extra = {}) {
   };
 }
 
+// M-1: the credential denylist — these keys NEVER inherit into the CLI's
+// child env (live-proven /proc/<pid>/environ leak: both pool keys + the
+// contents:write job token rode the plain env copy). The lane overlay then
+// deliberately sets the ONLY auth the CLI holds: the lane key in fake/
+// direct mode, the bridge dummy in bridge mode (the real key lives in the
+// BRIDGE process's env alone — startBridge).
+export const CC_ENV_DENYLIST = [
+  'OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN',
+  'ANTHROPIC_AUTH_TOKEN', 'GL_PAT',
+];
+
+// the merged child env: the caller's env (PATH et al.) MINUS the denylist,
+// then the F-M8 lane overlay. Pure + exported for the M-1 unit pin — fake
+// mode cannot spawn the bridge by design, so the bridge-mode merged env is
+// probed here instead of at the spawn boundary.
+export function ccChildEnv(env, lane, envelope, extra = {}) {
+  const childEnv = {};
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (CC_ENV_DENYLIST.includes(k)) continue;   // credentials never inherit
+    if (typeof v !== 'string') continue;
+    childEnv[k] = v;
+  }
+  Object.assign(childEnv, ccLaneEnv(lane, envelope, extra));
+  return childEnv;
+}
+
 const TRANSPORT_STDERR_RE = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNRESET|EPIPE|fetch failed|network|socket|tunneling|connect/i;
 
 // ---------------------------------------------------------------------------
@@ -545,10 +571,11 @@ export async function ccTurn(envelope, opts = {}) {
         extraEnv.FAKE_CC_ECHO_PATH = join(echoRoot, `lane-${i}.json`);
       }
       try {
-      // env: the caller's env (PATH et al.) with the F-M8 contract overlaid
-      const childEnv = {};
-      for (const [k, v] of Object.entries(env)) if (typeof v === 'string') childEnv[k] = v;
-      Object.assign(childEnv, ccLaneEnv(lane, envelope, extraEnv));
+      // env (M-1): the caller's env (PATH et al.) MINUS the credential
+      // denylist, then the F-M8 overlay — the ONLY auth the CLI child ever
+      // holds is the overlay's deliberate token (the lane key in fake/
+      // direct mode; the bridge dummy in bridge mode)
+      const childEnv = ccChildEnv(env, lane, envelope, extraEnv);
 
       const laneT0 = now();
       if (laneT0 >= wallDeadlineMs) {

@@ -65,10 +65,12 @@
 // mode only), the full invocation record — argv, the F-M8 env subset
 // (ANTHROPIC_BASE_URL / AUTH_TOKEN / MODEL / SMALL_FAST_MODEL /
 // DISABLE_TELEMETRY / OX_AGENT_DEADLINE_UTC + the adapter's
-// OX_AGENT_TASK_ID), cwd, and the pids — is written THERE synchronously at
-// start, BEFORE any fixture action, so even a deadline-killed spawn leaves
-// its boundary record for the conformance assertions. Real mode never sets
-// the var and this file never runs.
+// OX_AGENT_TASK_ID), the SORTED child-env KEY SET (M-1: the secret-absence
+// proof — Object.keys(process.env) of the merged child env), cwd, and the
+// pids — is written THERE synchronously at start, BEFORE any fixture
+// action, so even a deadline-killed spawn leaves its boundary record for
+// the conformance assertions. Real mode never sets the var and this file
+// never runs.
 //
 // This file is TEST MACHINERY, not product surface: the real CLI never emits
 // `reasoning`/`repeat_report`/`num_turns`-as-fixture or FAKE_CC_ECHO_PATH —
@@ -143,6 +145,7 @@ if (process.env.FAKE_CC_ECHO_PATH) {
   writeFileSync(process.env.FAKE_CC_ECHO_PATH, JSON.stringify({
     argv,
     env: Object.fromEntries(ENVS.map(k => [k, process.env[k] ?? null])),
+    env_keys: Object.keys(process.env).sort(),   // M-1: the merged child-env key set
     cwd: process.cwd(),
     pid: process.pid,
     grandchildPid: grandchild?.pid ?? null,

@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
-  ccExitJson, ccApiErrorStatus,
+  ccExitJson, ccApiErrorStatus, ccChildEnv, CC_ENV_DENYLIST,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
@@ -212,6 +212,60 @@ test('ccTurn: no lane keys → infra_failed no-lane-keys, ZERO spawns (a routabl
   assert.deepEqual(result.lane_attempts_used, 0);
   assert.ok(!existsSync(roots.echoDir) || readdirSync(roots.echoDir).length === 0, 'nothing was spawned — no echo records');
   roots.cleanup();
+});
+
+test('M-1: the merged child env carries NO credentials — the /proc/<pid>/environ leak is dead', async () => {
+  // every marker secret a live runner would hold: both pool keys (via
+  // fakeEnv), both GH tokens, a GL_PAT, and a stale caller-side
+  // ANTHROPIC_AUTH_TOKEN — ALL must die at the spawn boundary
+  const { result, roots } = await turn(fakeEnv({
+    GH_TOKEN: 'gh-test-token', GITHUB_TOKEN: 'github-test-token',
+    GL_PAT: 'glpat-test', ANTHROPIC_AUTH_TOKEN: 'stale-caller-auth-that-must-die',
+  }));
+  assert.equal(classifyOutcome(result).status, 'done');
+  const echo = readEcho(roots, 0);
+  const keys = new Set(echo.env_keys);
+  // the raw credentials NEVER ride the CLI's env (the overlay sets
+  // ANTHROPIC_AUTH_TOKEN deliberately — that one is value-pinned below)
+  for (const k of CC_ENV_DENYLIST) {
+    if (k === 'ANTHROPIC_AUTH_TOKEN') continue;
+    assert.equal(keys.has(k), false, `${k} never rides the CLI child env`);
+  }
+  // the ONLY auth the child holds is the overlay's deliberate token — the
+  // lane key in fake/direct mode (the bridge dummy in bridge mode, below);
+  // the caller's stale value is gone
+  assert.equal(echo.env.ANTHROPIC_AUTH_TOKEN, KEY1, 'the overlay token, never the caller\'s');
+  roots.cleanup();
+});
+
+test('M-1 (bridge boundary, pure): the merged bridge-mode env — bridge base + dummy token, denylist dead', () => {
+  // fake mode cannot spawn the bridge by design (zero network), so the
+  // bridge-mode MERGED env — exactly what the spawn would receive — is
+  // probed pure: the CLI needs only the base URL, the DUMMY token and the
+  // model env to reach the bridge; the bridge itself holds the real key
+  const merged = ccChildEnv({
+    PATH: '/usr/bin:/bin', HOME: '/home/worker', CC_FAKE_LLM: '1',
+    OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2,
+    GH_TOKEN: 'gh', GITHUB_TOKEN: 'gh2', GL_PAT: 'gl',
+    ANTHROPIC_AUTH_TOKEN: 'stale-caller-auth',
+  }, { key: KEY1, keyIndex: 1, model: 'm/a' },
+  envelope({ deadline_ms: Date.parse('2026-09-16T12:34:56.000Z') }),
+  { CC_BRIDGE_URL: 'http://127.0.0.1:45678' });
+  assert.equal(merged.ANTHROPIC_BASE_URL, 'http://127.0.0.1:45678', 'the CLI aims at the local bridge');
+  assert.equal(merged.ANTHROPIC_AUTH_TOKEN, 'bridge-local-no-key', 'ONLY the dummy — the real key lives in the bridge process env');
+  for (const k of ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN', 'GL_PAT']) {
+    assert.ok(!(k in merged), `${k} is dead in the merged env`);
+  }
+  assert.equal(merged.PATH, '/usr/bin:/bin', 'the working env (PATH et al.) still rides');
+  assert.equal(merged.HOME, '/home/worker');
+  assert.equal(merged.ANTHROPIC_MODEL, 'm/a');
+  assert.equal(merged.ANTHROPIC_SMALL_FAST_MODEL, 'm/a');
+  assert.ok(!('CC_BRIDGE_URL' in merged), 'the bridge URL is consumed into the base URL, not passed through');
+  // the direct (bridgeless) merged env keeps the lane key as the token
+  const direct = ccChildEnv({ OPENROUTER_API_KEY: KEY1, ANTHROPIC_AUTH_TOKEN: 'stale' },
+    { key: KEY1, keyIndex: 1, model: 'm/a' }, envelope({ deadline_ms: 0 }));
+  assert.equal(direct.ANTHROPIC_AUTH_TOKEN, KEY1, 'direct mode: the overlay lane key (the stale caller value died)');
+  assert.ok(!('OPENROUTER_API_KEY' in direct));
 });
 
 // ---------------------------------------------------------------------------

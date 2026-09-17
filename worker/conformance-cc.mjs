@@ -51,13 +51,19 @@
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ccTurn } from './cc-adapter.mjs';
+import { ccTurn, ccChildEnv } from './cc-adapter.mjs';
 import { shimInvoke, seedFromRunId, SHIM_BEHAVIORS } from '../sim/harness-shim.mjs';
 import { classifyOutcome, writeBackDoor } from '../lib/worker-contract.mjs';
 
 const KEY1 = 'conformance-key-one';
 const KEY2 = 'conformance-key-two';
-const fakeEnv = { CC_FAKE_LLM: '1', OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2 };
+const fakeEnv = {
+  CC_FAKE_LLM: '1', OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2,
+  // M-1 marker secrets: every one of these must DIE at the spawn boundary
+  // (the denylist strip) — they exist here to be provably absent
+  GH_TOKEN: 'conformance-gh-token', GITHUB_TOKEN: 'conformance-github-token',
+  GL_PAT: 'conformance-gl-pat', ANTHROPIC_AUTH_TOKEN: 'conformance-stale-caller-auth',
+};
 
 const results = [];
 function check(name, pass, detail = '') {
@@ -269,6 +275,37 @@ matrix.push(await matrixRow({
   check('boundary: the real argv + the COMPLETE F-M8 env contract', argvOk && envOk && eq(classifyOutcome(result).status, 'done'),
     `argv=${argvOk ? 'ok' : JSON.stringify(echo.argv)} env=${envOk ? 'ok' : JSON.stringify(echo.env)}`);
   rmSync(roots, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// THE CREDENTIAL STRIP (M-1) — the merged child env at the spawn boundary.
+// ---------------------------------------------------------------------------
+
+{
+  const { result, roots } = await adapterTurn(mkEnvelope({ prompt: 'credential strip probe' }), { keepRoots: true });
+  const echo = readEcho(roots, 0);
+  const keys = new Set(echo.env_keys);
+  // the raw credentials never ride the CLI's env; ANTHROPIC_AUTH_TOKEN is
+  // the overlay's deliberate token (value-pinned), never the caller's stale
+  const leaked = ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN', 'GL_PAT']
+    .filter(k => keys.has(k));
+  check('boundary: the credential denylist is DEAD at the spawn boundary (M-1)',
+    leaked.length === 0 && eq(echo.env.ANTHROPIC_AUTH_TOKEN, KEY1) && eq(classifyOutcome(result).status, 'done'),
+    `leaked=[${leaked.join(',')}] auth=${eq(echo.env.ANTHROPIC_AUTH_TOKEN, KEY1) ? 'lane-key (overlay)' : echo.env.ANTHROPIC_AUTH_TOKEN}`);
+  rmSync(roots, { recursive: true, force: true });
+}
+{
+  // the bridge-mode merged env (pure — fake mode cannot spawn the bridge by
+  // design): the CLI aims at the bridge holding ONLY the dummy token
+  const merged = ccChildEnv({ ...fakeEnv, PATH: '/usr/bin:/bin' },
+    { key: KEY1, keyIndex: 1, model: 'dots-studio/dots-3-note-preview:free' },
+    mkEnvelope(), { CC_BRIDGE_URL: 'http://127.0.0.1:45678' });
+  const dead = ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN', 'GL_PAT']
+    .every(k => !(k in merged));
+  check('boundary: bridge-mode merged env — bridge base + dummy token, denylist dead (M-1)',
+    dead && eq(merged.ANTHROPIC_BASE_URL, 'http://127.0.0.1:45678')
+    && eq(merged.ANTHROPIC_AUTH_TOKEN, 'bridge-local-no-key') && eq(merged.PATH, '/usr/bin:/bin'),
+    `dead=${dead} base=${merged.ANTHROPIC_BASE_URL} auth=${merged.ANTHROPIC_AUTH_TOKEN}`);
 }
 
 // ---------------------------------------------------------------------------
