@@ -10,8 +10,8 @@ import assert from 'node:assert/strict';
 import { genesis, apply, rebuild } from '../lib/fsm.mjs';
 import {
   conductorTick, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, VERIFY_WINDOW_MS, PACING_FLOOR_S,
-  W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
+  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS, PACING_FLOOR_S,
+  PACING_FLOOR_DEFAULT_S, W2_ENVELOPE_MARGIN_MS, W2_BRIEF_CAP_BYTES,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { envelopeFromDispatch } from '../lib/worker-contract.mjs';
@@ -432,4 +432,20 @@ test('M-A2: every noteless encoding mix twins; both-null and both-empty stay gua
     assert.equal(out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE applied`);
     assert.equal(out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE rejected`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 6. M-3/B (46-R2) — the pacing-floor DEFAULT is live exported code
+// ---------------------------------------------------------------------------
+
+test('M-3/B: the floor default is the exported PACING_FLOOR_DEFAULT_S (0 = hot-fix-2 semantics); env override wins', () => {
+  assert.equal(PACING_FLOOR_DEFAULT_S, 0, 'hot-fix 2: the floor default is OFF until the W-C dispatchBudget');
+  assert.equal(resolvePacingFloorS({}), 0, 'no env -> the exported default (not a hardcoded literal)');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '' }), 0, 'empty env -> the default');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '300' }), 300, 'the env override wins');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: '0' }), 0, 'explicit 0 = disabled');
+  assert.equal(resolvePacingFloorS({ PACING_FLOOR_S: 'garbage' }), 0, 'unparseable env -> fail-open default (floor-disabled)');
+  // the decision stays the pure half it always was
+  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({ PACING_FLOOR_S: '300' }), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, true);
+  assert.equal(pacingFloorDecision({ leaseMinutes: 15, floorS: resolvePacingFloorS({}), lastDispatchMs: T0 - 1000, nowMs: T0, isFirstDispatchOfTurn: false }).applies, false, 'default 0 = floor-disabled');
 });

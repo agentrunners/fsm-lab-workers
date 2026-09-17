@@ -33,7 +33,7 @@ import { genesis } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  pacingFloorDecision, VERIFY_WINDOW_MS,
+  pacingFloorDecision, resolvePacingFloorS, VERIFY_WINDOW_MS,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { buildEvent } from '../lib/event-ingest.mjs';
@@ -276,7 +276,12 @@ async function main() {
     briefMd = fsMod.default.readFileSync('briefs/project.md', 'utf8');
   } catch { /* absent brief — the envelope omits it cleanly */ }
   const epochMode = state.project?.mode || 'mock';
-  const floorS = parseInt(process.env.PACING_FLOOR_S || '0', 10);   // X21: default OFF (the skip-left-assigned bug — see conductor-core)
+  // M-3/B (46-R2): the default comes from conductor-core's LIVE exported
+  // PACING_FLOOR_DEFAULT_S (env override wins) — the hardcoded `|| '0'`
+  // made the constant dead code and the hot-fix-2 default revert-survivable.
+  // X21 semantics preserved: default OFF (the skip-left-assigned bug — see
+  // conductor-core).
+  const floorS = resolvePacingFloorS(process.env);
   let lastDispatchMs = NaN;
   let dispatchIndex = 0;
   for (const a of actionList) {
