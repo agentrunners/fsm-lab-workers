@@ -383,10 +383,6 @@ function scenarioMatrix() {
     badClass.length ? `offenders=${badClass.map(r => `${r.task}:${r.cls}`).join(',')}` : `${d.reports.length} reports`);
   const appliedReports = d.reports.filter(r => r.fate === 'applied');
   const byClass = {};
-  for (const r of appliedReports) {
-    const j = d.taskJournal(r.task).find(j => j.kind === 'REPORT' && j.lease === r.lease && j.event_id === undefined ? false : (j.kind === 'REPORT' && j.lease === r.lease));
-    void j;
-  }
   // map each applied report to its journal dest via (task, lease) pairs
   for (const r of appliedReports) {
     const recs = d.journalAll.filter(j => j.kind === 'REPORT' && j.task === r.task && j.lease === r.lease);
