@@ -44,7 +44,8 @@
 //                                                 strings
 // Adapter-side shapes beyond the shim matrix (asserted directly): reasoning-
 // first (F-M4), auth-text-as-answer (E11), transport-exit, app-exit,
-// max-turns, the scratch exclusion.
+// max-turns, the scratch exclusion, the REAL CLI error-exit shape (m-1:
+// rc≠0 + stdout result JSON with numeric api_error_status — X21-final).
 //
 // Exit non-zero on ANY mismatch. This is the gate `node worker/conformance-cc.mjs`.
 
@@ -230,6 +231,39 @@ matrix.push(await matrixRow({
     `transport=${transport.result.status}(${transport.result.lane_attempts_used} lanes) app=${classifyOutcome(app.result).status}(${app.result.lane_attempts_used} lanes)`);
   rmSync(transport.roots, { recursive: true, force: true });
   rmSync(app.roots, { recursive: true, force: true });
+}
+{
+  // m-1: the REAL CLI error-exit shape (X21-final verbatim — the shape the
+  // old fixture table lacked, the exact F-1 repro): rc 1 + the result JSON
+  // on stdout with is_error:true + NUMERIC api_error_status:429 + the
+  // "API Error: Request rejected (429) · Rate limit exceeded" text.
+  // B-1: infra lane-<status> + rotation (never the terminal work_failed).
+  const { result, roots } = await adapterTurn(mkEnvelope({
+    prompt: '[fixture:exit-api-429] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 2 },
+  }), { keepRoots: true });
+  const echo = readEcho(roots, 0);
+  const classes = result.telemetry.lanes.map(l => l.class);
+  check('shape:real CLI error-exit (X21-final) — api_error_status → infra lane-<status> + rotation',
+    eq(result.status, 'infra_failed') && result.detail.includes('lane-exhausted(2/6 lanes, last lane-429)')
+    && eq(result.lane_attempts_used, 2) && eq(JSON.stringify(classes), JSON.stringify(['infra', 'infra']))
+    && eq(echo.fixtures[0], 'exit-api-429'),
+    `status=${result.status} detail=${result.detail} lanes=${JSON.stringify(classes)}`);
+  rmSync(roots, { recursive: true, force: true });
+}
+{
+  // m-1 (rotation recovery): the key-1 lanes exit with the API error, the
+  // key-2 lane completes — the F-1 fix recovers the turn in-process
+  const { result, roots } = await adapterTurn(mkEnvelope({
+    prompt: '[fixture:exit-api-429-if:conformance-key-one] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
+  }));
+  check('shape:real CLI error-exit — the rotation RECOVERS (key-2 lane completes)',
+    eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 4)
+    && eq(JSON.stringify(result.telemetry.lanes.map(l => [l.key_index, l.class])),
+      JSON.stringify([[1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done']])),
+    `status=${classifyOutcome(result).status} used=${result.lane_attempts_used}`);
+  rmSync(roots, { recursive: true, force: true });
 }
 {
   const { result, roots } = await adapterTurn(mkEnvelope({ prompt: '[fixture:max-turns] go' }));
