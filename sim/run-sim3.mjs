@@ -492,18 +492,19 @@ function scenarioMatrix() {
     const reps = d.taskReports('wb1');
     const j = d.taskJournal('wb1');
     const rec = j.find(x => x.kind === 'REPORT' && x.reason === 'poison');
+    // mirrors tests/test-worker-routing.mjs's wb-violation evidence pins
+    // (class flip + BOTH violation kinds in the error text + the refs riding
+    // the report), asserted here END-TO-END: the evidence survives the
+    // worker's compose AND the drain into the audit journal (rec.error)
     p('wb-violation → the DOOR flips the done to poison (terminal quarantine, reason poison, violations as evidence)',
       t.status === 'quarantined' && t.attempts === 1 && reps.length === 1
       && reps[0].cls === 'poison' && reps[0].fate === 'applied' && rec != null
-      && /write-back-door\(deny-dotgit\(\.github\/workflows\/evil\.ylyml\)|write-back-door\(deny-dotgit/.test(reps[0].cls) === false
-      && true,
-      `error=${slice(String(d.taskReports('wb1')[0]?.cls))}`);
-  }
-  {
-    // the door evidence, precisely: the report's error text + the refs
-    const rec = d.reports.find(r => r.task === 'wb1');
-    const err = rec ? String(rec.err ?? '') : '';
-    void err;
+      && /write-back-door\(.*deny-dotgit\(\.github\/workflows\/evil\.yml\)/.test(String(reps[0].error ?? ''))
+      && /root-not-declared\(evil\.txt\)/.test(String(reps[0].error ?? ''))
+      && (reps[0].artifact_refs ?? []).includes('.github/workflows/evil.yml')
+      && /write-back-door\(.*deny-dotgit\(\.github\/workflows\/evil\.yml\)/.test(String(rec?.error ?? ''))
+      && /root-not-declared\(evil\.txt\)/.test(String(rec?.error ?? '')),
+      `error=${slice(String(reps[0].error ?? rec?.error ?? ''))}`);
   }
 
   // the degraded completion gate: done 4/10 → PHASE degraded + STOP project-degraded
