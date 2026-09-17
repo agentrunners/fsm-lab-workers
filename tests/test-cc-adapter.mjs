@@ -131,7 +131,9 @@ test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are t
 });
 
 test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output, the SA-5 denies', () => {
-  const argv = ccArgv(envelope({ budget: { max_turns: 12, wall_ms: 60_000, lane_attempts: 3 } }), { max_turns: 12 }, { CC_VERSION: '2.1.273' });
+  // no CC_VERSION: the PINNED default rides the argv (M-4 — live-proven
+  // X20/X21, never 'latest')
+  const argv = ccArgv(envelope({ budget: { max_turns: 12, wall_ms: 60_000, lane_attempts: 3 } }), { max_turns: 12 }, {});
   assert.deepEqual(argv, [
     '-y', '@anthropic-ai/claude-code@2.1.273',
     '-p', 'do the thing',
@@ -140,8 +142,11 @@ test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output
     '--disallowedTools', 'WebFetch,WebSearch',
   ]);
   assert.deepEqual(CC_PERMISSION_DENIES, ['WebFetch', 'WebSearch']);
-  assert.equal(ccCliVersion({}), 'latest', 'the default pin');
+  assert.equal(ccCliVersion({}), '2.1.273', 'the pinned default (M-4 — live-proven X20/X21, never latest)');
+  assert.equal(ccCliVersion({ CC_VERSION: '' }), '2.1.273', 'empty = the pinned default');
   assert.equal(ccCliVersion({ CC_VERSION: ' 2.1.273 ' }), '2.1.273', 'trimmed env pin');
+  assert.equal(ccArgv(envelope({ budget: { max_turns: 12, wall_ms: 60_000, lane_attempts: 3 } }), { max_turns: 12 }, { CC_VERSION: '9.9.999' })[1],
+    '@anthropic-ai/claude-code@9.9.999', 'CC_VERSION overrides the pin');
 });
 
 test('cc lane env: the FULL F-M8 contract shape (pure)', () => {

@@ -9,7 +9,7 @@
 // matrix and asserts parity.
 //
 // THE SPAWN (F-M7 — asserted by the fake-CLI conformance at the boundary):
-//   npx -y @anthropic-ai/claude-code@<CC_VERSION|latest>
+//   npx -y @anthropic-ai/claude-code@<CC_VERSION|2.1.273>   (M-4: pinned)
 //        -p <envelope.prompt>
 //        --max-turns <budget.max_turns>          (the CLI's own turn cap)
 //        --output-format json                    (the parseable result)
@@ -125,8 +125,14 @@ export function ccLanes(env = process.env) {
   return lanes;
 }
 
+// M-4: the CLI pin — the live-proven X20/X21 version is the DEFAULT (the
+// design's "version env-pinned, default recorded at build"). 'latest' was
+// the reproducibility hole: an upstream release renaming a flag or changing
+// the env contract would kill every cc turn as rc≠0 app-class work_failed
+// while every offline gate stayed green (the fake accepts any argv).
+// CC_VERSION still overrides.
 export function ccCliVersion(env = process.env) {
-  return typeof env.CC_VERSION === 'string' && env.CC_VERSION.trim() !== '' ? env.CC_VERSION.trim() : 'latest';
+  return typeof env.CC_VERSION === 'string' && env.CC_VERSION.trim() !== '' ? env.CC_VERSION.trim() : '2.1.273';
 }
 
 // the CLI argument vector AFTER the executable — the npx form. Fake mode

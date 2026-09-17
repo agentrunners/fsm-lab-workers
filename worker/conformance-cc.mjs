@@ -259,7 +259,7 @@ matrix.push(await matrixRow({
   }), { keepRoots: true });
   const echo = readEcho(roots, 0);
   const argvOk = eq(JSON.stringify(echo.argv), JSON.stringify([
-    '-y', '@anthropic-ai/claude-code@latest',
+    '-y', '@anthropic-ai/claude-code@2.1.273',   // M-4: the pinned default
     '-p', 'boundary probe',
     '--max-turns', '11',
     '--output-format', 'json',
@@ -306,6 +306,18 @@ matrix.push(await matrixRow({
     dead && eq(merged.ANTHROPIC_BASE_URL, 'http://127.0.0.1:45678')
     && eq(merged.ANTHROPIC_AUTH_TOKEN, 'bridge-local-no-key') && eq(merged.PATH, '/usr/bin:/bin'),
     `dead=${dead} base=${merged.ANTHROPIC_BASE_URL} auth=${merged.ANTHROPIC_AUTH_TOKEN}`);
+}
+{
+  // M-4: the CC_VERSION override semantics at the spawn boundary — the pin
+  // is the DEFAULT (asserted in the argv check above), the env wins when set
+  const { result, roots } = await adapterTurn(mkEnvelope({ prompt: 'version pin probe' }), {
+    keepRoots: true, env: { ...fakeEnv, CC_VERSION: '9.9.999-conf' },
+  });
+  const echo = readEcho(roots, 0);
+  check('boundary: the CLI pin — @2.1.273 default, CC_VERSION overrides (M-4)',
+    eq(echo.argv[1], '@anthropic-ai/claude-code@9.9.999-conf') && eq(classifyOutcome(result).status, 'done'),
+    `argv[1]=${echo.argv[1]}`);
+  rmSync(roots, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------------------
