@@ -255,7 +255,16 @@ class Sim3Driver {
 
   enqueue(rec) {
     this.queue.push(rec);
-    this.reports.push({ task: rec.task, event_id: rec.event_id, cls: rec.outcome.status, lease: rec.lease, fate: null, fateReason: null });
+    // the projection the checks read: identity (event_id + the run that
+    // minted it, so checks can round-trip through the ONE mint table),
+    // class, and the evidence fields the worker composes onto the wire
+    // (error text, artifact_refs — the door/gate evidence carriers)
+    this.reports.push({
+      task: rec.task, event_id: rec.event_id, cls: rec.outcome.status, lease: rec.lease,
+      run_id: rec.run_id ?? null, error: rec.outcome?.error ?? null,
+      artifact_refs: Array.isArray(rec.outcome?.artifact_refs) ? rec.outcome.artifact_refs : null,
+      fate: null, fateReason: null,
+    });
   }
 
   // the delivery audit: every enqueued report reaches applied | rejected
@@ -550,10 +559,16 @@ function scenarioLaw1() {
     `cycles=${d.cycleCount} status=${t?.status}`);
   p('the shim was NEVER invoked (zero work across the whole epoch)',
     (d.shimCalls['gate1'] ?? 0) === 0, `shimCalls=${d.shimCalls['gate1'] ?? 0}`);
+  // the ids are REAL minted REPORT ids: each equals what the ONE mint table
+  // produces for the run that reported it (string + `rep-<runId>-a<attempt>`
+  // shape, verified by round-trip rather than a hand-rolled regex), and the
+  // three flap reports are PAIRWISE DISTINCT (the probe6 mint-collision class
+  // — colliding ids would dedup-swallow a legitimate flap report)
   p('every report is infra_failed \'late-start\' (the law-1 vocabulary, renamed from deadline-in-past)',
     reps.length === 3 && reps.every(r => r.cls === 'infra_failed' && r.fate === 'applied')
-    && reps.every(r => r.event_id === r.event_id),
-    `reports=${reps.length} classes=${reps.map(r => r.cls).join(',')}`);
+    && reps.every(r => typeof r.event_id === 'string' && r.event_id === mintEventId('REPORT', { runId: r.run_id, attempt: '1' }))
+    && new Set(reps.map(r => r.event_id)).size === reps.length,
+    `reports=${reps.length} classes=${reps.map(r => r.cls).join(',')} ids=${reps.map(r => r.event_id).join(',')}`);
   p('the gate reports carry the late-start error (checked via the journal error text)',
     d.taskJournal('gate1').filter(j => j.kind === 'REPORT' && j.error === 'late-start').length === 3,
     `errors=${d.taskJournal('gate1').map(j => j.error).join(',')}`);
