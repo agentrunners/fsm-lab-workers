@@ -384,3 +384,52 @@ test('scan (c): boundary — created_at exactly at issued_at−900s -> seen (inc
   const noLease = seenKeysFromRuns([runNamed('task-A1 · succeed · a1', issuedMs - 45 * 60_000)], { A1: { id: 'A1', status: 'ready' } });
   assert.ok(noLease.has('A1#a1'), 'a task without a lease keeps the name-only match (no correlation possible)');
 });
+
+// ---------------------------------------------------------------------------
+// 4b. M-A2 (46-R2 lens A) — the NOTELESS twin: null-vs-'' note normalization
+// ---------------------------------------------------------------------------
+// The two control lanes encoded an absent note differently (direct buildEvent
+// `?? null` vs queued ops/turn.mjs `|| ''`), so the noteless direct+queued
+// twin — the README-documented minimal reset — applied BOTH resets. The guard
+// now normalizes both sides; the fixtures below cover every encoding mix,
+// including the PRE-fix queued encoding (a mixed-deploy queue record).
+
+test('M-A2: the NOTELESS direct+queued twin (e913/e914 shape without note) -> 1 applied + 1 rejected', () => {
+  const s = boot();
+  const n = makeNow(T0);
+  const directEv = { kind: 'CONTROL', command: 'reset', actor: 'op', note: null, event_id: 'ctl-direct-nl', ts: iso(T0) };
+  const queuedTwin = { cmd: 'reset', id: 'ctl-queued-nl', ts: iso(T0 + 500), sender: 'op', note: '' };  // the PRE-fix ops encoding — the guard must absorb it
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [], controlQueue: [queuedTwin], queueBad: [], ctlBad: [],
+    ev: directEv, now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: makeGenesisFor(),
+  });
+  const resets = out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset');
+  const rejects = out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate');
+  assert.equal(resets.length, 1, 'exactly ONE reset applied (the noteless twin hole is closed)');
+  assert.equal(rejects.length, 1, 'the noteless twin is rejected');
+  assert.equal(rejects[0].event_id, 'ctl-queued-nl');
+  // journal encoding: an absent note records as null on BOTH lanes now
+  assert.equal(resets[0].note, null);
+  assert.equal(rejects[0].note, null, 'the REJECTED record normalizes "" to null too');
+});
+
+test('M-A2: every noteless encoding mix twins; both-null and both-empty stay guarded', () => {
+  const pairs = [
+    [null, null],   // post-fix both lanes
+    ['', ''],       // queued-queued noteless (guarded even pre-fix — must stay)
+    ['', null],     // the reverse mix
+  ];
+  for (const [a, b] of pairs) {
+    const s = boot();
+    const n = makeNow(T0);
+    const out = conductorTick({
+      cur: structuredClone(s), queue: [], controlQueue: [
+        { cmd: 'reset', id: 'ctl-q1', ts: iso(T0), sender: 'op', note: a },
+        { cmd: 'reset', id: 'ctl-q2', ts: iso(T0 + 500), sender: 'op', note: b },
+      ], queueBad: [], ctlBad: [],
+      ev: tickEv(), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: makeGenesisFor(),
+    });
+    assert.equal(out.journal.filter(j => j.kind === 'CONTROL' && j.command === 'reset').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE applied`);
+    assert.equal(out.journal.filter(j => j.kind === 'REJECTED' && j.reason === 'reset-duplicate').length, 1, `note pair (${JSON.stringify(a)}, ${JSON.stringify(b)}): ONE rejected`);
+  }
+});

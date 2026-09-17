@@ -71,7 +71,11 @@ async function main() {
   const rec = {
     cmd: cp.command,
     patch: cp.patch,
-    note: cp.note || '',
+    // M-A2 (46-R2): `?? null` (was `|| ''`) — the queued lane must encode an
+    // absent note the SAME way the direct lane (buildEvent) does, or the
+    // journal records null-vs-'' for the same operator intent and the F-1
+    // twin-guard saw a noteless direct+queued pair as DIFFERENT resets.
+    note: cp.note ?? null,
     // T45/F-G(c): the SENDER rides the queue record — the CONTROL journal
     // record carries it as `actor` (audit-only; the ops WRITE gate stays
     // GitHub's write-access model)
