@@ -164,6 +164,16 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
       }
       continue;   // the fallback hop
     }
+    // m-6 (R2-FIX): a dead/typo'd model slug (400/404 with "model" in the
+    // error body) is a CONFIG condition, not work failure — the operator's
+    // chain head must not burn the task's attempts. Hop to the next model
+    // (config-infra); exhaustion is infra-class with the dead-model detail.
+    if ((r.status === 400 || r.status === 404) && /model/i.test(String(d?.error?.message || ''))) {
+      if (i === maxTries - 1) {
+        return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last dead-model-${r.status})` });
+      }
+      continue;
+    }
     // deterministic app class (other 4xx) — terminal, no hop
     return finish({ error: { status: r.status } });
   }
