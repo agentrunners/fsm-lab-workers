@@ -997,3 +997,64 @@ test('T46/§4b: intake CAS-conflict retry — a rival door push mid-commit re-re
     assert.equal(q[0].issue, 2, 'the rival intake line was not lost to the CAS race');
   } finally { lab.cleanup(); }
 });
+
+// T46/W-C1-R (lens-2 MUT-b): the PAUSE COMMIT's queue-preservation pin.
+// The adapter's second commit (conductor/turn.mjs's BUDGET-PAUSE block)
+// returns {queue: q2, controlQueue: cq2} — queues that landed between the
+// two commits rewrite UNCHANGED for the next tick (never dropped). The
+// pre-fold shape had NO pin: mutating to {queue: []} passed 323/323 +
+// sim4 51/51 (sim4's driver bypasses the store entirely). This pin drives
+// the REAL store through the REAL two-commit shape with a report landing
+// in between.
+test('W-C1-R/MUT-b: the pause commit preserves interleaved queues (the two-commit protocol, store-level)', () => {
+  const lab = mkLab();
+  try {
+    const store = new Store({ cwd: lab.clone });
+    store.init();
+    const now = () => new Date().toISOString();
+    const NMq = nextMilestoneFactory(fastProject());
+    // commit 1: bootstrap + a tick (the plain shape)
+    const out1 = store.commit({
+      mutate: (cur, q, cq, qb, cb) => conductorTick({
+        cur, queue: q, controlQueue: cq, queueBad: qb, ctlBad: cb,
+        ev: { kind: 'TICK', actor: 'seed', event_id: `tick-mutb-${Date.now()}`, ts: now() },
+        now, nextMilestone: NMq, recover: () => null,
+        makeGenesis: () => { const g = genesis({ config: cfg, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'mut-b', now: now() }); return { state: g, spec: { tasks: fastProject().m1, milestones: 2, chainId: 'mut-b' } }; },
+      }),
+    });
+    assert.ok(out1.committed, 'commit 1 lands');
+    // a worker report lands BETWEEN the commits (the interleaving)
+    const assigned = Object.values(out1.state.tasks).find(t => t.status === 'assigned');
+    assert.ok(assigned, 'a task is assigned after the seed tick');
+    store.enqueueReport({ event_id: 'rep-mutb-1', task: assigned.id, lease: assigned.lease.token, outcome: { status: 'progress' }, run_id: 'run-mutb' });
+    // commit 2: the pause shape VERBATIM from the adapter (queue: q2 preserved)
+    const pauseEv = { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: `ctl-901-budget-pause-${Date.now()}`, ts: now() };
+    const out2 = store.commit({
+      mutate: (cur2, q2, cq2) => {
+        const r = apply(cur2, pauseEv, now(), NMq, {});
+        return { state: r.state, journal: r.journal, actions: r.actions, queue: q2, controlQueue: cq2 };
+      },
+    });
+    assert.ok(out2.committed, 'commit 2 lands (the pause)');
+    assert.equal(out2.state.chain.paused, true);
+    // THE PIN: the interleaved report SURVIVES the pause commit — the next
+    // tick drains it (mutating the pause shape to {queue: []} drops it)
+    const peek = store.readQueue();
+    assert.equal(peek.length, 1, 'the interleaved report is preserved on the queue file');
+    assert.equal(peek[0].event_id, 'rep-mutb-1');
+    // and the next tick drains it against the PAUSED chain (at-least-once)
+    const out3 = store.commit({
+      mutate: (cur, q, cq, qb, cb) => conductorTick({
+        cur, queue: q, controlQueue: cq, queueBad: qb, ctlBad: cb,
+        ev: { kind: 'TICK', actor: 'after', event_id: `tick-mutb2-${Date.now()}`, ts: now() },
+        now, nextMilestone: NMq, recover: () => null,
+        makeGenesis: () => { const g = genesis({ config: cfg, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'mut-b2', now: now() }); return { state: g, spec: { tasks: fastProject().m1, milestones: 2, chainId: 'mut-b2' } }; },
+      }),
+    });
+    assert.ok(out3.committed || out3.noop, 'the post-pause tick runs');
+    assert.ok((out3.journal || []).some(j => j.kind === 'REPORT'), 'the preserved report DRAINED (in_progress on the assigned task)');
+    assert.equal(store.readQueue().length, 0, 'the queue is empty after the drain');
+  } finally {
+    lab.cleanup();
+  }
+});

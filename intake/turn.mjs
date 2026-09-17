@@ -135,7 +135,17 @@ async function main() {
     enqueued_at: new Date().toISOString(),
     author,
   };
-  const r = store.enqueueIntake(rec);
+  // W-C1-R (lens-1 MINOR-4): the dedup predicate rides the CAS loop itself
+  // (store.enqueueIntake re-checks it on every fresh read) — the TOCTOU
+  // double-enqueue of a same-issue+same-body race dies here, not at the
+  // door's pre-read
+  const r = store.enqueueIntake(rec, {
+    matches: (l) => String(l.issue) === String(rec.issue) && l.body_sha8 === rec.body_sha8,
+  });
+  if (r.deduped) {
+    console.log(`INTAKE-DEDUPED issue #${it.number} (the line landed between the read and the push — the race loser exits clean)`);
+    return;
+  }
   console.log(`INTAKE-ENQUEUED issue #${it.number} id=${d.id} sha8=${rec.body_sha8} -> ${r.ok ? 'ok' : 'FAILED: ' + (r.err || 'unknown')}`);
   if (!r.ok) { process.exitCode = 1; return; }
 

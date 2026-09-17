@@ -22,7 +22,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { genesis, apply, rebuild, invariants } from '../lib/fsm.mjs';
 import {
-  conductorTick, isQuotaDetail, specToTask, DISPATCH_COST_MS,
+  conductorTick, isQuotaDetail, specToTask, DISPATCH_COST_MS, dispatchBudgetFromWall,
   dispatchVerificationEvents, VERIFY_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
@@ -355,4 +355,61 @@ test('specToTask: accept-spec -> behavior real + spec.accept; behavior-spec pass
   assert.equal(b.spec.accept, undefined);
   const c = specToTask({ title: 'arts', accept: 'x', artifacts: ['tasks/T-9/report.md'] }, { issue: 9 });
   assert.deepEqual(c.spec.artifacts, ['tasks/T-9/report.md'], 'declared artifacts ride the task spec');
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-C1-R (lens-2 MUT-c): the extracted budget arithmetic pin — the
+// adapter wires dispatchBudgetFromWall DIRECTLY; deleting the spent term
+// must fail HERE (the pre-fold inline lambda survived deletion green).
+// ---------------------------------------------------------------------------
+
+test('W-C1-R/MUT-c: dispatchBudgetFromWall — the spent term is load-bearing (the extraction pin)', () => {
+  // 62s remaining, 30s reserve, 4s cost: unspent slots = floor(32/4) = 8
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 62_000, reserveMs: 30_000 }), 8);
+  // each spent slot consumes one cost: 8-8=0 at spent=8, negative-floored
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 62_000, reserveMs: 30_000, spent: 5 }), 3);
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 62_000, reserveMs: 30_000, spent: 8 }), 0);
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 62_000, reserveMs: 30_000, spent: 99 }), 0, 'never negative');
+  // the reserve is carved FIRST (R3 D1-M2): 40s remaining - 30s reserve = 2 slots
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 40_000, reserveMs: 30_000 }), 2);
+  // less than the reserve -> zero (the heartbeat window outranks dispatch)
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 25_000, reserveMs: 30_000 }), 0);
+  // degenerate inputs fail CLOSED (0, never NaN/Infinity)
+  assert.equal(dispatchBudgetFromWall({}), 0);
+  assert.equal(dispatchBudgetFromWall({ remainingMs: NaN, reserveMs: 30_000 }), 0);
+  assert.equal(dispatchBudgetFromWall({ remainingMs: 62_000, reserveMs: NaN }), 15, 'a NaN reserve is treated as 0 — floor(62s/4s) = 15 slots (degenerate reserve fails OPEN on slots, the real reserve is always finite)');
+  assert.equal(DISPATCH_COST_MS, 4_000);
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-C1-R (lens-1 MAJOR-1): a PAUSED done chain NEVER rolls over —
+// the queue parks; resume's next tick rolls over.
+// ---------------------------------------------------------------------------
+
+test('W-C1-R/MAJOR-1: paused + done + queued spec -> PARK (no un-commanded resume)', () => {
+  const ONE = { m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  const mkG = (() => { let n = 0; return ({ config, spec, issue }) => { const chainId = `c-pr-${++n}`; const tasks = spec ? [{ id: `task-i${issue}`, title: spec.title, behavior: 'real', work_ms: 1, deps: [], spec: { accept: spec.accept, issue } }] : ONE.m1; const g = genesis({ config: config || { ...CFG }, project: { tasks, milestones: 1 }, chainId, now: iso(T0 + n), mode: 'mock', issue: issue ?? null }); return { state: g, spec: { tasks, milestones: 1, chainId } }; }; })();
+  let s = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-pd', now: iso(T0) });
+  s = apply(s, tickEv('pr1'), iso(T0), nextMilestoneFactory(ONE)).state;
+  s = apply(s, { kind: 'REPORT', event_id: 'rep-prx', task: 'X', lease: s.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, iso(T0 + 1000), nextMilestoneFactory(ONE)).state;
+  assert.equal(s.project.phase, 'done');
+  const paused = apply(s, { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: 'ctl-pr-p', ts: iso(T0 + 2000) }, iso(T0 + 2000), nextMilestoneFactory(ONE)).state;
+  assert.equal(paused.chain.paused, true);
+  const qline = { issue: 77, body_sha8: 'zz99', spec: { title: 'held', accept: 'x' }, enqueued_at: iso(T0), author: 'op' };
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(paused), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('pr2'), now: n.now, nextMilestone: nextMilestoneFactory(ONE), recover: noRecover, makeGenesis: mkG,
+  });
+  assert.equal(out.noop, true, 'the held tick quiesces');
+  assert.equal(out.state.chain.paused, true, 'the pause SURVIVES (no rollover wipe)');
+  // resume -> the next tick rolls over
+  const out2 = conductorTick({
+    cur: structuredClone(out.state), queue: [], controlQueue: [{ cmd: 'resume', id: 'ctl-pr-r', ts: iso(T0 + 61_000), sender: 'op', note: null }], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('pr3'), now: n.now, nextMilestone: nextMilestoneFactory(ONE), recover: noRecover, makeGenesis: mkG,
+  });
+  assert.equal(out2.state.chain.paused, false, 'resumed');
+  assert.notEqual(out2.state.project.issue ?? null, null, 'the resume tick rolled the queue over (phase done + unpaused)');
 });

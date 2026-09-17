@@ -775,3 +775,98 @@ test('W-C1/5b: terminal task records PRUNE mid-epoch after N ticks (compact shap
   }
   assert.ok(rb2.tasks.A.pruned, 'the record re-prunes after the re-established age (idempotent)');
 });
+
+// ---------------------------------------------------------------------------
+// T46/W-C1-R (lens-1 BLOCKING-1): the ADAPTER-SHAPE rollover pin — the
+// generator is the LIVE wiring (nextMilestoneFactory(mockProject()) — the
+// mock drill's M2/M3), NOT the null every prior pin used. The intake epoch
+// must complete at M1 (milestones_total bound) and roll over — no sprout.
+// ---------------------------------------------------------------------------
+
+test('W-C1-R/BLOCKING-1: an intake epoch with the ADAPTER generator (mock drill wired) completes at M1 — NO mock sprout, rollover fires', () => {
+  // the LIVE adapter wiring, verbatim: conductor/turn.mjs:68
+  const ADAPTER_NM = nextMilestoneFactory(mockProjectForAdapter());
+  function mockProjectForAdapter() { return fastProject(); }
+  const mkG = (() => { let n = 0; return ({ config, spec, issue } = {}) => {
+    const chainId = `c-b1-${++n}`;
+    const tasks = spec ? [{ id: `task-i${issue}`, title: spec.title, behavior: 'real', work_ms: 1, deps: [], spec: { accept: spec.accept, issue } }] : fastProject().m1;
+    const g = genesis({ config: config || { ...CFG }, project: { tasks, milestones: 1 }, chainId, now: iso(T0 + n), mode: 'mock', issue: issue ?? null });
+    return { state: g, spec: { tasks, milestones: 1, chainId } };
+  }; })();
+  const qline = { issue: 55, body_sha8: 'b1abcd12', spec: { title: 'the real thing', accept: 'criteria' }, enqueued_at: iso(T0), author: 'op' };
+  const n = makeNow(T0 + 1000);
+  // a DONE plain epoch + the queue -> the rollover births the intake epoch
+  // (the bootstrap path always mints a plain genesis; intake epochs arrive
+  // ONLY via the rollover / reset from_queue — by design)
+  const ONE = { m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  let pre = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-b1pre', now: iso(T0) });
+  pre = apply(pre, tickEv('b1s'), iso(T0), nextMilestoneFactory(ONE)).state;
+  pre = apply(pre, { kind: 'REPORT', event_id: 'rep-b1x', task: 'X', lease: pre.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r0' }, iso(T0 + 500), nextMilestoneFactory(ONE)).state;
+  assert.equal(pre.project.phase, 'done');
+  const out = conductorTick({
+    cur: structuredClone(pre), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('b1'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  // the epoch births and assigns its ONE task
+  assert.ok(out.state.project.issue === 55, 'the intake thread');
+  assert.equal(Object.keys(out.state.tasks).length, 1, 'ONE task — no sprout at genesis');
+  assert.equal(out.state.project.milestones_total, 1, 'milestones_total=1 (the adapter half of the fold)');
+  // the task completes INSIDE the next tick's drain (the REAL halting shape)
+  const t0 = out.state.tasks['task-i55'];
+  const doneReport = { kind: 'REPORT', event_id: 'rep-b1', task: 'task-i55', lease: out.state.tasks['task-i55'].lease.token, outcome: { status: 'done', artifact: 'the result' }, run_id: 'r1' };
+  const out2 = conductorTick({
+    cur: structuredClone(out.state), queue: [doneReport], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [], intakeBad: [],
+    ev: tickEv('b1d'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  // THE BLOCKING-1 ASSERTIONS: phase done at M1 (no M2 sprout), the PHASE
+  // record landed, the task set is still the ONE intake task
+  assert.equal(out2.state.project.phase, 'done', 'completed — the generator was never consulted');
+  assert.equal(out2.state.project.milestone, 1, 'still at M1');
+  assert.equal(Object.keys(out2.state.tasks).length, 1, 'NO mock M2/M3 tasks sprouted (the live sprout bug)');
+  assert.ok(out2.journal.some(j => j.kind === 'PHASE' && j.to === 'done'), 'the PHASE record');
+  assert.ok(out2.actions.some(a => a.type === 'STOP_CHAIN'), 'STOP_CHAIN minted (nothing queued to roll over to)');
+  // and WITH a queued second spec: the rollover replaces the stop
+  const out3 = conductorTick({
+    cur: structuredClone(out.state), queue: [doneReport], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [{ issue: 56, body_sha8: 'b2', spec: { title: 'next', accept: 'x' }, enqueued_at: iso(T0), author: 'op' }], intakeBad: [],
+    ev: tickEv('b1r'), now: n.now, nextMilestone: ADAPTER_NM, recover: noRecover, makeGenesis: mkG,
+  });
+  assert.ok(!out3.actions.some(a => a.type === 'STOP_CHAIN'), 'M4 (lens-1 ask#7a): the REAL-shape STOP_CHAIN filter — the halting drain minted a STOP and the rollover removed it');
+  assert.equal(out3.state.project.issue, 56, 'the second spec rolled over in the same tick');
+  assert.deepEqual(out3.intakeQueue, []);
+});
+
+// T46/W-C1-R (lens-1 ask#7c): the prune idempotence pin EXTENDED — aged past
+// N+1 post-prune ticks (the pre-fold pin aged ONE tick; the mutation's damage
+// needs N+1 — a second PRUNE + done_at wiped to undefined every N+1 ticks).
+test('W-C1-R/mut-c: prune idempotence EXTENDED — 8 post-prune ticks, exactly ONE PRUNE, done_at stable, compact shape stable', () => {
+  const THREE = { m1: [
+    { id: 'A', title: 'a', behavior: 'succeed', work_ms: 1 },
+    { id: 'B', title: 'b', behavior: 'succeed', work_ms: 1, deps: ['A'] },
+    { id: 'C', title: 'c', behavior: 'hang', work_ms: 1 },
+  ] };
+  const NM3 = nextMilestoneFactory(THREE);
+  const PCFG = { ...CFG, prune_tasks_after_ticks: 5 };
+  let s = genesis({ config: PCFG, project: { tasks: THREE.m1, milestones: 1 }, chainId: 'c-prx', now: iso(T0) });
+  const n = makeNow(T0);
+  const J = [];
+  let r0 = apply(s, tickEv('x1'), n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rxa', task: 'A', lease: s.tasks.A.lease.token, outcome: { status: 'done' }, run_id: 'r' }, n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  r0 = apply(s, { kind: 'REPORT', event_id: 'rxb', task: 'B', lease: s.tasks.B.lease.token, outcome: { status: 'done' }, run_id: 'r' }, n.now(), NM3); s = r0.state; J.push(...r0.journal);
+  let pruned = false, firstDoneAt = null;
+  for (let i = 0; i < 20 && !pruned; i++) {
+    const r = apply(s, tickEv(`xa${i}`), n.now(), NM3); s = r.state; J.push(...r.journal);
+    if (s.tasks.A.pruned) { pruned = true; firstDoneAt = s.tasks.A.done_at; }
+  }
+  assert.ok(pruned, 'A pruned');
+  // THE EXTENSION: 8 MORE ticks past the prune — idempotence must hold
+  for (let i = 0; i < 8; i++) {
+    const r = apply(s, tickEv(`xb${i}`), n.now(), NM3); s = r.state; J.push(...r.journal);
+  }
+  const pruneCount = J.filter(j => j.kind === 'PRUNE' && j.task === 'A').length;
+  assert.equal(pruneCount, 1, `exactly ONE PRUNE record for A (got ${pruneCount} — the mutation's damage was a second PRUNE + done_at wipe)`);
+  assert.equal(s.tasks.A.done_at, firstDoneAt, 'done_at stable across the extended age');
+  assert.deepEqual(Object.keys(s.tasks.A).sort(), ['attempts', 'done_at', 'id', 'pruned', 'status'].sort(), 'the compact shape stable');
+});

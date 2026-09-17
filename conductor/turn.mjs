@@ -33,7 +33,7 @@ import { genesis, apply } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask,
+  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
@@ -204,15 +204,22 @@ async function main() {
   // spec (validated at the door); the plain paths keep mockProject. The
   // spec's own mode (validated against GENESIS_MODES at the door) wins;
   // absent → the operator's EPOCH_MODE env (the X21 switch, unchanged).
-  const makeGenesis = ({ config, spec, issue } = {}) => {
+  const makeGenesis = ({ config, spec, issue, bodySha8 } = {}) => {
     const cfg = config || DEFAULT_CFG();
     const chainId = `c-${Date.now()}`;
     if (spec) {
       // specToTask (conductor-core) is the CANONICAL mapper — the door's
       // pure half parity-pins the same shape at integration.
-      const task = specToTask(spec, { issue, bodySha8: `i${issue}` });
-      const g = genesis({ config: cfg, project: { tasks: [task], milestones: Math.max(spec.milestone ?? 1, 1) }, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
-      return { state: g, spec: { tasks: [task], milestones: Math.max(spec.milestone ?? 1, 1), chainId, mode: g.project.mode } };
+      // T46/W-C1-R (lens-1 BLOCKING-1 adapter half): spec epochs carry
+      // milestones_total=1 — the task IS the project; the clock's
+      // milestones_total bound (fsm.mjs pass 5) then NEVER consults the
+      // mock drill's generator for an intake epoch (the live sprout bug:
+      // every intake epoch ran the mock M2+M3 — ~10 phantom dispatches —
+      // before the rollover could fire). The spec's `milestone` key stays
+      // door-validated metadata for W-D's multi-task epochs (inert here).
+      const task = specToTask(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
+      const g = genesis({ config: cfg, project: { tasks: [task], milestones: 1 }, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
+      return { state: g, spec: { tasks: [task], milestones: 1, chainId, mode: g.project.mode } };
     }
     const mp = mockProject();
     const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now(), mode: EPOCH_MODE });
@@ -302,8 +309,13 @@ async function main() {
       // deadline, self-tick reserve carved FIRST (R3 D1-M2). The fn receives
       // the SPENT slot count (tick-wide + pass): each assign+dispatch pair
       // spends DISPATCH_COST_MS of remaining. Exhausted → tasks stay READY
-      // (never assigned — the skip-left-assigned class is dead).
-      dispatchBudgetFn: (spent) => Math.max(0, Math.floor((BUDGET.remaining() - SELF_TICK_RESERVE_MS - (spent || 0) * DISPATCH_COST_MS) / DISPATCH_COST_MS)),
+      // (never assigned — the skip-left-assigned class is dead). The
+      // arithmetic lives in conductor-core's dispatchBudgetFromWall (the
+      // W-C1-R MUT-c fold: extracted so the pin bites the REAL code, not a
+      // string-shape source check).
+      dispatchBudgetFn: (spent) => dispatchBudgetFromWall({
+        remainingMs: BUDGET.remaining(), reserveMs: SELF_TICK_RESERVE_MS, costMs: DISPATCH_COST_MS, spent,
+      }),
     }),
   }));
 
@@ -449,19 +461,31 @@ async function main() {
         event_id: mintEventId('CONTROL', { nodeId: String(alert.issue), command: 'budget-pause', clockMs: Date.now() }),
         ts: now(),
       };
-      const out2 = await Promise.resolve(store.commit({
-        mutate: (cur2, q2, cq2) => {
-          // queues that landed between the two commits are NOT consumed —
-          // they rewrite unchanged for the next tick (never dropped)
-          const r = apply(cur2, pauseEv, now(), NM, {});
-          return { state: r.state, journal: r.journal, actions: r.actions, queue: q2, controlQueue: cq2 };
-        },
-      }));
-      if (out2.committed) {
+      let out2;
+      try {
+        out2 = await Promise.resolve(store.commit({
+          mutate: (cur2, q2, cq2) => {
+            // queues that landed between the two commits are NOT consumed —
+            // they rewrite unchanged for the next tick (never dropped).
+            // W-C1-R (lens-2 m1): the store THROWS when CAS retries exhaust
+            // (it never returns a noop commit) — the try/catch makes the
+            // failure observable AS the budget-pause path (log + red +
+            // self-tick + watchdog recovery) instead of the generic
+            // CONDUCTOR-FAILED death with no TURN-COMPLETE.
+            const r = apply(cur2, pauseEv, now(), NM, {});
+            return { state: r.state, journal: r.journal, actions: r.actions, queue: q2, controlQueue: cq2 };
+          },
+        }));
+      } catch (e) {
+        console.error(`BUDGET-PAUSE-COMMIT-FAILED (${String(e?.message ?? e).slice(0, 160)}) — the window re-triggers next tick; run is RED`);
+        process.exitCode = 1;
+        out2 = null;
+      }
+      if (out2 && out2.committed) {
         pausedNow = true;
         console.log(`BUDGET-PAUSE applied (alert issue #${alert.issue}, event ${pauseEv.event_id}) — chain PAUSED, zero further dispatches; resume via the alert's command`);
-      } else {
-        console.error(`BUDGET-PAUSE-COMMIT-FAILED (${out2.reason}) — the window re-triggers next tick; run is RED`);
+      } else if (out2) {
+        console.error(`BUDGET-PAUSE-COMMIT-NOT-COMMITTED (${out2.reason}) — the window re-triggers next tick; run is RED`);
         process.exitCode = 1;
       }
     }
