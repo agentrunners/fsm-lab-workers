@@ -49,6 +49,7 @@ permissions:
   contents: write   # fsm-state branch pushes + repository_dispatch POST (X1a)
   issues: write      # ops-console alert comments (as github-actions[bot])
   actions: read      # T46/W2 law-4 (F-M1): the run-creation verification scans worker.yml runs
+  pull-requests: write   # T46/W-C2 (F-14): the task-branch PR flow — POST /repos/<repo>/pulls for done artifact tasks (GITHUB_TOKEN lane; LAB_PAT is the fallback)
 
 jobs:
   turn:

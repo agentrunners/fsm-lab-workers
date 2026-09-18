@@ -449,6 +449,116 @@ function pushSessionsBranch({ env, files, log }) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// T46/W-C2 (§4/F-4): the task-branch write-back — the door-allowed artifact
+// set commits to refs/heads/tasks/<id> (the branch forks from MAIN per F-4 —
+// never the fsm-state orphan: unrelated-history PRs are unreviewable; an
+// EXISTING branch (a re-attempt) continues: clone it, fast-forward on).
+// ONE commit `task/<id>: artifacts`, pathspec = exactly the door-allowed
+// set (m-4: tasks/<id>/** + declared artifacts only — same door rules,
+// different base ref). The push is followed by the REMOTE TIP READ-BACK
+// (the masked-rc lesson): fetch what the remote NOW holds and verify every
+// committed path EXISTS at the tip with the local byte size — a green rc
+// with a missing/partial tree escalates, never trusts.
+// The worker job's per-task concurrency group (fsm-worker-<task>,
+// cancel-in-progress) serializes same-task writers: a push race is the
+// one-in-a-million shape, and its failure lands as infra_failed
+// 'artifact-push' → net-zero retry (the lane rotates).
+// ---------------------------------------------------------------------------
+// the read-back verification — PURE (extracted so the failure branches
+// are pinnable without hook gymnastics): tip = {path: bytes} parsed from
+// `git ls-tree -r --long FETCH_HEAD`, sizes = the local byte sizes.
+export function verifyReadBack({ committed, sizes, tip }) {
+  for (const rel of committed) {
+    if (!(rel in tip)) return { ok: false, err: `artifact-push read-back: path ${rel} MISSING at the remote tip` };
+    if (tip[rel] !== sizes[rel]) return { ok: false, err: `artifact-push read-back: path ${rel} size drift at tip (${tip[rel]} vs ${sizes[rel]} local)` };
+  }
+  return { ok: true };
+}
+
+// ls-tree output parser — PURE: `mode type sha\tsize\tpath` per line
+// (ls-tree --long shape). Returns {path: bytes}.
+export function parseLsTree(stdout) {
+  const tip = {};
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.match(/^\d+ \w+ [0-9a-f]+\s+(\d+)\t(.+)$/);
+    if (m) tip[m[2]] = parseInt(m[1], 10);
+  }
+  return tip;
+}
+
+export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
+  const repo = env.GITHUB_REPOSITORY;
+  const token = env.GH_TOKEN || env.GITHUB_TOKEN;
+  if (!repo || !token) throw new Error('task-branch push needs GH_TOKEN + GITHUB_REPOSITORY');
+  const url = `https://x-access-token:${token}@github.com/${repo}.git`;
+  const taskId = branch.startsWith('tasks/') ? branch.slice('tasks/'.length) : branch;
+  const scratch = mkdtempSync(join(tmpdir(), 'cc-taskbr-'));
+  const wc = join(scratch, 'wc');
+  mkdirSync(wc, { recursive: true });
+  const git = (args) => spawnSync('git', args, { cwd: wc, encoding: 'utf8' });
+  const fail = (step, r) => new Error(`artifact-push: ${step} failed: ${String(r.stderr || r.error || `rc=${r.status}`).trim().slice(0, 160)}`);
+  try {
+    // existing branch continues; absent branch forks from MAIN (F-4)
+    let clone = git(['clone', '--depth', '1', '--branch', branch, '--single-branch', url, '.']);
+    if (clone.status !== 0) {
+      clone = git(['clone', '--depth', '1', '--branch', 'main', '--single-branch', url, '.']);
+      if (clone.status !== 0) throw fail('git clone main', clone);
+      const co = git(['checkout', '-b', branch]);
+      if (co.status !== 0) throw fail('git checkout -b', co);
+      log(`CC-TASKBRANCH-GENESIS ${branch} from main (branch was absent — clone stderr: ${String(clone.stderr).trim().slice(0, 120)})`);
+    }
+    // copy the door-allowed set from the workdir (m-4: the allowed pathspecs ONLY)
+    const committed = [];
+    const sizes = {};
+    for (const rel of allowed) {
+      const src = join(workdir, rel);
+      const dst = join(wc, rel);
+      try {
+        mkdirSync(dirname(dst), { recursive: true });
+        copyFileSync(src, dst);
+        sizes[rel] = statSync(src).size;
+        committed.push(rel);
+      } catch { /* declared-but-unwritten path — the read-back catches it; the door filtered violations already */ }
+    }
+    if (!committed.length) throw new Error('artifact-push: no door-allowed file exists in the workdir (the turn wrote nothing it declared)');
+    const add = git(['add', '--', ...committed]);
+    if (add.status !== 0) throw fail('git add', add);
+    const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
+      'commit', '-m', `task/${taskId}: artifacts`]);
+    if (commit.status !== 0) throw fail('git commit', commit);
+    const push = git(['push', 'origin', `HEAD:refs/heads/${branch}`]);
+    if (push.status !== 0) throw fail('git push', push);
+    // the REMOTE TIP read-back — never trust the green rc alone
+    const fetch = git(['fetch', '--depth', '1', 'origin', branch]);
+    if (fetch.status !== 0) throw fail('git fetch (read-back)', fetch);
+    const ls = git(['ls-tree', '-r', '--long', 'FETCH_HEAD']);
+    if (ls.status !== 0) throw fail('git ls-tree (read-back)', ls);
+    const vr = verifyReadBack({ committed, sizes, tip: parseLsTree(ls.stdout) });
+    if (!vr.ok) throw new Error(vr.err);
+    log(`CC-TASKBRANCH-PUSHED ${committed.length} file(s) -> ${branch} (remote tip read-back verified)`);
+    return { ok: true, branch, committed };
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+// the DONE-turn escalation composer for a failed artifact push — PURE
+// (extracted for direct pins; mirrors the transcript escalation's shape:
+// a done's PR depends on the artifacts landing, so the turn escalates to
+// infra_failed 'artifact-push' = net-zero retry; failed turns keep their
+// work-class result — the escalation would mask the diagnosis).
+export function artifactPushEscalation(taskId, attempt, err, result) {
+  return {
+    status: 'infra_failed',
+    detail: String(err?.message ?? err).slice(0, 200),
+    artifact_refs: result.artifact_refs,
+    summary: `cc: task ${taskId} attempt ${attempt} — the artifact branch push failed (${String(err?.message ?? err).slice(0, 120)})`,
+    telemetry: result.telemetry, models: result.models,
+    lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
+  };
+}
+
 async function writeTranscript(envelope, runId, fake, result, opts, log) {
   const paths = transcriptPaths(envelope, runId);
   const body = transcriptBody(envelope, runId, fake, result);
@@ -758,11 +868,20 @@ export async function ccTurn(envelope, opts = {}) {
         : classifyOutcome({ content: result.content ?? null, reasoning: result.reasoning ?? null });
       // THE DOOR (D4): violations → poison, BEFORE anything is trusted or
       // staged (runTurn's door is the backstop for callers that bypass here)
+      // T46/W-C2: the door now gets MEASURED sizes (statSync on the workdir
+      // claim) — the byte caps bite on real files (the read-back wave's
+      // actuals; the door's own docstring: "the read-back wave measures
+      // actuals" — this is that wave).
       let door = null;
       if (Array.isArray(result.artifact_refs) && result.artifact_refs.length) {
+        const measured = {};
+        for (const rel of result.artifact_refs) {
+          try { measured[rel] = statSync(join(workdir, rel)).size; } catch { /* unwritten claim: 0 — the read-back catches it */ }
+        }
         door = writeBackDoor({
           branch: `tasks/${taskId}`,
           paths: result.artifact_refs,
+          sizes: measured,
           allowRoot: Array.isArray(opts.allowRoot) ? opts.allowRoot : [],
         });
         if (!door.ok) {
@@ -802,12 +921,37 @@ export async function ccTurn(envelope, opts = {}) {
         log(`CC-TRANSCRIPT-MISSED (best-effort for a ${internalCls.status} turn): ${String(e?.message ?? e).slice(0, 160)}`);
         result.summary += ` [transcript missed: ${String(e?.message ?? e).slice(0, 80)}]`;
       }
-      // the staging seam (W-C): allowed refs stage locally today; the live
-      // task-branch commit + remote read-back replaces this when intake ships
+      // T46/W-C2 (§4): the task-branch write-back — the door-allowed set
+      // commits to refs/heads/tasks/<id> (F-4 from MAIN, m-4 pathspec) with
+      // the remote-tip read-back. REAL mode only; fake mode keeps the local
+      // stage (tests never touch git). A DONE turn whose push/read-back
+      // fails escalates to infra_failed 'artifact-push' (net-zero — the lane
+      // rotates; a done's PR depends on the artifacts landing); a FAILED
+      // turn keeps its work-class result (best-effort log only — the report
+      // is the diagnosis, the escalation would mask it, the transcript
+      // lesson).
       if (door?.ok && door.allowed.length) {
-        const root = stageDir || env.CC_STAGE_DIR || join(tmpdir(), 'fsm-stage');
-        const staged = stageAllowed(door, workdir, root);
-        if (staged.length) log(`CC-STAGED ${staged.length} artifact(s) under ${root} (the W-C task-branch seam)`);
+        if (fake) {
+          const root = stageDir || env.CC_STAGE_DIR || join(tmpdir(), 'fsm-stage');
+          const staged = stageAllowed(door, workdir, root);
+          if (staged.length) log(`CC-STAGED ${staged.length} artifact(s) under ${root} (fake-mode local stage — the determinism lane)`);
+        } else {
+          const pusher = opts.pushTaskBranchImpl || pushTaskBranch;
+          let push = null;
+          try {
+            push = pusher({ env, branch: `tasks/${taskId}`, allowed: door.allowed, workdir, log });
+            if (push && push.ok !== true) throw new Error(`artifact-push: ${String(push.err || push.error || 'rejected').slice(0, 160)}`);
+          } catch (e) {
+            if (internalCls.status === 'done') {
+              return artifactPushEscalation(taskId, attempt, e, result);
+            }
+            log(`CC-TASKBRANCH-MISSED (best-effort for a ${internalCls.status} turn): ${String(e?.message ?? e).slice(0, 160)}`);
+            result.summary += ` [artifact push missed: ${String(e?.message ?? e).slice(0, 80)}]`;
+          }
+          if (push && push.ok) {
+            result.task_branch = { branch: push.branch, committed: push.committed.length };
+          }
+        }
       }
       return result;
     }

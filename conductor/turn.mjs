@@ -37,6 +37,7 @@ import {
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
+import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
 const RUN_ID = process.env.GITHUB_RUN_ID || 'local';
@@ -329,6 +330,29 @@ async function main() {
   }
   const state = out.state;
 
+  // T46/W-C2 (§4/F-4/m-3): the task-branch/PR flow — done cc-tasks with
+  // DECLARED artifacts get their PR opened + stamped HERE (post-commit,
+  // pre-comment: the intake completion comment below carries the link).
+  // The stamp rides a SECOND commit (the two-commit pattern); PR-open
+  // failure alerts (law 5) and NEVER fails the run. Mock epochs skip by
+  // construction (§4c — no declared artifacts). Bounded to PR_MAX_PER_TICK.
+  if (prFlowCandidates(state).length) {
+    try {
+      const prr = await prFlow({
+        state, repo: REPO, api, store,
+        tokenFallback: PAT || null,   // the LAB_PAT lane (PAT PR-creation needs no repo setting — live-proven PR#5)
+        alert: (msg) => postIssueComment(msg),
+        log: console.log,
+      });
+      if (prr.candidates) {
+        console.log(`PR-FLOW candidates=${prr.candidates} opened=${prr.opened} reused=${prr.reused} stamped=${prr.stamped} failures=${prr.failures}`);
+      }
+    } catch (e) {
+      // the flow itself dying must never kill the tick — the epoch still runs
+      console.log(`PR-FLOW-FAILED ${String(e?.message ?? e).slice(0, 200)} (non-fatal — the next tick retries via the reuse lane)`);
+    }
+  }
+
   // 4. execute actions (workers first — parallelism starts ASAP)
   let dispatchFailures = 0;
   let dispatchSkipped = 0;   // F-C: budget-exhausted skips (lease re-covers — loud, not fatal)
@@ -427,11 +451,14 @@ async function main() {
       }
       // m-3: an intake-born epoch's completion comment targets the intake
       // issue too (X22's criterion: the operator's thread gets the outcome).
+      // T46/W-C2: the comment carries the PR link when the task-branch flow
+      // stamped one (prFlow ran pre-comment — the link rides THIS comment).
       const issueN = state.project?.issue;
       if (issueN) {
         const taskIds = Object.keys(state.tasks);
         const dones = Object.values(state.tasks).filter(t => t.status === 'done');
-        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch ${j.degraded ? 'HALTED DEGRADED' : 'COMPLETE'} for this task — done ${state.stats.done}/${taskIds.length}${dones.length && dones[0].last_result?.artifact ? `\n\nResult digest: ${String(dones[0].last_result.artifact).slice(0, 600)}` : ''}\n\n(stats ${JSON.stringify(state.stats)})` });
+        const prLink = dones.length && dones[0].pr ? `\n\n**Pull request**: #${dones[0].pr} — the task's artifacts await review/merge.` : '';
+        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch ${j.degraded ? 'HALTED DEGRADED' : 'COMPLETE'} for this task — done ${state.stats.done}/${taskIds.length}${dones.length && dones[0].last_result?.artifact ? `\n\nResult digest: ${String(dones[0].last_result.artifact).slice(0, 600)}` : ''}${prLink}\n\n(stats ${JSON.stringify(state.stats)})` });
         if (r.status !== 201) console.log(`INTAKE-COMMENT-FAILED issue=${issueN} HTTP=${r.status} (law 5: visible, non-fatal)`);
       }
     }

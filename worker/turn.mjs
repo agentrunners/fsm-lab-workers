@@ -311,7 +311,14 @@ export async function runTurn({
     raw = await realWork(envelope, { env, fetchImpl });
   } else if (envelope.mode === 'cc') {
     try {
-      raw = await ccWork(envelope, { env, runId, now, log });
+      // T46/W-C2 (§4): the DECLARED artifacts pass through as the adapter's
+      // allowRoot (envelopeFromDispatch unwraps ox → cp.artifacts → the
+      // envelope). The adapter's write-back door + task-branch push consume
+      // them; mock/real lanes never see them (the §4c skip).
+      raw = await ccWork(envelope, {
+        env, runId, now, log,
+        allowRoot: Array.isArray(envelope.artifacts) ? envelope.artifacts : [],
+      });
     } catch (e) {
       if (e instanceof AdapterNotShipped) {
         // the routing-level infra marker (NOT a completion payload — the
