@@ -319,3 +319,43 @@ X16: corrupt-state → alert issue #4 opened → marker comment 5690657920 → `
 
 ## X24 (first half) — the pinger lane LIVE (2026-09-17, pinger run 35206612744 → fsm-lab run 35206626620)
 **The rung-4 heartbeat exists and works: xfnwfpho1/pinger (public, user account — the F-3 adjudication) cron */15 → `POST fsm-lab/dispatches {fsm-tick, reason:'pinger'}` on PINGER_PAT (secret set, the mirror-runner posture) → fsm-lab run named `pinger · conductor` (35206626620, repository_dispatch, success — the halted epoch's wake QUIESCED cleanly per F2).** The manual workflow_dispatch rehearsal fired 204 first-try. Remaining X24 legs: the journal `tick-pinger-<ms>` record (lands on a LIVE epoch — this wake quiesced on the halted one, by design) + the executor's watch-the-watcher duty (W-C3's second half, not yet built). Honest physics stands: nominal 15min ≈ effective 15min-2h (the X5 schedule sparsity datum) — this is the de-correlated backstop, not the primary driver.
+
+## X25 — the agentrunners second bucket (2026-09-18, session 18)
+
+The principal created org `agentrunners` (2026-09-17T23:45:54Z; xfnwfpho1 admin).
+Live-proven end-to-end:
+- `agentrunners/fsm-lab-workers` created (public — free minutes + its own
+  20-concurrent-jobs bucket), fsm-lab main pushed, secrets set
+  (OPENROUTER_API_KEY/_2 = the free-lane pool, STATE_REPORT_PAT for the future
+  cross-org report lane), var CC_VERSION=2.1.273.
+- Dispatch 204 (PAT) → run **35292565961** `task-X-25 · fast · a1`
+  completed/success in the second bucket → the report queue landed on the
+  mirror's fsm-state (`rep-35292565961-a1`, outcome done).
+Law-8's quota isolation is DELIVERED as org buckets (not a second-account
+migration): the worker plane can spread across buckets. Remaining (next wave):
+WORKER_REPO dispatch routing + STORE_REPO report routing (the conductor
+dispatches cross-org; the mirror's workers report back to the real fsm-state).
+
+## X22 — the dogfood loop (2026-09-18, session 18) — GREEN after 3 live fixes
+
+Attempt 1 (issue #6, chain c-1789696860858): the loop ran (door → rollover →
+cc epoch → worker 35297656079 → transcript → done 1/1 → the m-3 completion
+comment with the completing epoch's stats) but the ARTIFACT never landed:
+headless `-p` mode DEFERS file-write prompts ("The write needs your
+approval"). **Fix 1**: `--permission-mode acceptEdits` (the workdir sandbox +
+the write-back door are the boundary).
+Attempt 2 (issue #7, chain c-1789697601515): the worker WROTE the artifact
+(run 35298497608), the task branch `tasks/X22-REPORT2` landed with the
+read-back — but no PR on the completing tick. Root causes, live-diagnosed:
+(1) **Fix 2**: store.commit reconstructed its own return and silently DROPPED
+conductorTick's `prCandidates` (the completing tick logged no PR-FLOW line);
+(2) **Fix 3** (lens-1 F4's residual, live-confirmed by verify tick
+35298996619): the QUIESCED early-return preceded the PR flow — a halted
+epoch's PRs would never open. Both folded + pinned (410/410).
+The verify ticks then opened **PR #8** (`tasks/X22-REPORT2` → main, the
+PAT ladder — GITHUB_TOKEN 403'd, the LAB_PAT lane carried it; body = accept
+criteria + result digest + the transcript pointer) and stamped `pr: 8` in
+state. The artifact is real content the CC turn wrote (it read the repo
+context and produced a coherent status report).
+X22-final (issue #9, fired with all three fixes in): the one-pass
+completion-comment-with-link proof.
