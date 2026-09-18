@@ -1,0 +1,253 @@
+{
+ "schema": 1,
+ "version": 5,
+ "journal_seq": 8,
+ "chain": {
+  "id": "c-1789708602108",
+  "seq": 1,
+  "last_tick": "2026-09-18T05:16:42.133Z",
+  "primed_by": "schedule-backstop",
+  "halted": false,
+  "paused": false
+ },
+ "project": {
+  "phase": "executing",
+  "milestone": 1,
+  "milestones_total": 3,
+  "mode": "mock",
+  "issue": null
+ },
+ "config": {
+  "max_parallel": 4,
+  "lease_minutes": 4,
+  "max_attempts": 3,
+  "tick_min_interval_s": 25,
+  "dedup_window": 300,
+  "budget_pause_threshold": 3,
+  "budget_pause_window_min": 15,
+  "prune_tasks_after_ticks": 20
+ },
+ "tasks": {
+  "T-101": {
+   "id": "T-101",
+   "title": "research: state-anchor options",
+   "status": "assigned",
+   "behavior": "succeed",
+   "work_ms": 4000,
+   "deps": [],
+   "attempts": 1,
+   "lease": {
+    "token": "l-8950d4d2585b",
+    "expires": "2026-09-18T05:20:42.109Z",
+    "issued_at": "2026-09-18T05:16:42.109Z"
+   },
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.109Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "ready",
+     "why": "created"
+    },
+    {
+     "at": "2026-09-18T05:16:42.109Z",
+     "status": "assigned",
+     "why": "assigned(attempt=1)"
+    }
+   ],
+   "last_result": null
+  },
+  "T-102": {
+   "id": "T-102",
+   "title": "research: continuity mechanics",
+   "status": "assigned",
+   "behavior": "flaky",
+   "work_ms": 3000,
+   "deps": [],
+   "attempts": 1,
+   "lease": {
+    "token": "l-90c4f765d27f",
+    "expires": "2026-09-18T05:20:42.109Z",
+    "issued_at": "2026-09-18T05:16:42.109Z"
+   },
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.109Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "ready",
+     "why": "created"
+    },
+    {
+     "at": "2026-09-18T05:16:42.109Z",
+     "status": "assigned",
+     "why": "assigned(attempt=1)"
+    }
+   ],
+   "last_result": null
+  },
+  "T-103": {
+   "id": "T-103",
+   "title": "impl: state store CAS",
+   "status": "backlog",
+   "behavior": "succeed",
+   "work_ms": 5000,
+   "deps": [
+    "T-101"
+   ],
+   "attempts": 0,
+   "lease": null,
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.108Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "backlog",
+     "why": "created"
+    }
+   ],
+   "last_result": null
+  },
+  "T-104": {
+   "id": "T-104",
+   "title": "impl: conductor loop",
+   "status": "backlog",
+   "behavior": "succeed",
+   "work_ms": 5000,
+   "deps": [
+    "T-101"
+   ],
+   "attempts": 0,
+   "lease": null,
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.108Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "backlog",
+     "why": "created"
+    }
+   ],
+   "last_result": null
+  },
+  "T-105": {
+   "id": "T-105",
+   "title": "impl: watchdog",
+   "status": "backlog",
+   "behavior": "hang",
+   "work_ms": 900000,
+   "deps": [
+    "T-102"
+   ],
+   "attempts": 0,
+   "lease": null,
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.108Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "backlog",
+     "why": "created"
+    }
+   ],
+   "last_result": null
+  },
+  "T-106": {
+   "id": "T-106",
+   "title": "review: M1",
+   "status": "backlog",
+   "behavior": "succeed",
+   "work_ms": 3000,
+   "deps": [
+    "T-103",
+    "T-104"
+   ],
+   "attempts": 0,
+   "lease": null,
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.108Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "backlog",
+     "why": "created"
+    }
+   ],
+   "last_result": null
+  },
+  "T-107": {
+   "id": "T-107",
+   "title": "edge: duplicate report",
+   "status": "assigned",
+   "behavior": "dup",
+   "work_ms": 3000,
+   "deps": [],
+   "attempts": 1,
+   "lease": {
+    "token": "l-bf0e9834ad46",
+    "expires": "2026-09-18T05:20:42.109Z",
+    "issued_at": "2026-09-18T05:16:42.109Z"
+   },
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.109Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "ready",
+     "why": "created"
+    },
+    {
+     "at": "2026-09-18T05:16:42.109Z",
+     "status": "assigned",
+     "why": "assigned(attempt=1)"
+    }
+   ],
+   "last_result": null
+  },
+  "T-108": {
+   "id": "T-108",
+   "title": "edge: late report (orphan)",
+   "status": "assigned",
+   "behavior": "slow",
+   "work_ms": 330000,
+   "deps": [],
+   "attempts": 1,
+   "lease": {
+    "token": "l-8374ef50b93e",
+    "expires": "2026-09-18T05:20:42.109Z",
+    "issued_at": "2026-09-18T05:16:42.109Z"
+   },
+   "created": "2026-09-18T05:16:42.108Z",
+   "updated": "2026-09-18T05:16:42.109Z",
+   "history": [
+    {
+     "at": "2026-09-18T05:16:42.108Z",
+     "status": "ready",
+     "why": "created"
+    },
+    {
+     "at": "2026-09-18T05:16:42.109Z",
+     "status": "assigned",
+     "why": "assigned(attempt=1)"
+    }
+   ],
+   "last_result": null
+  }
+ },
+ "stats": {
+  "done": 0,
+  "failed": 0,
+  "quarantined": 0,
+  "cancelled": 0,
+  "retries": 0,
+  "orphaned_reports": 0,
+  "rejected_events": 1,
+  "timeouts": 0,
+  "dispatched": 4,
+  "infra_retries": 0
+ },
+ "dedup": [
+  "rep-35292565961-a1",
+  "tick-schedule-backstop-1789708600819"
+ ]
+}
