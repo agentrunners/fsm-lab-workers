@@ -598,3 +598,59 @@ test('verifyReadBack fold (F8): iterates the ALLOWED set — an allowed-but-miss
   assert.equal(vr2.ok, false);
   assert.match(vr2.err, /size drift/);
 });
+
+test('F7 live follow-up (the X22 finding): prCandidates SURVIVES store.commit — the conductor sees the candidates after the commit', async () => {
+  // the live probe: the completing tick logged NO PR-FLOW line — conductorTick
+  // returned prCandidates, but store.commit reconstructed its own return shape
+  // and silently dropped the key. This pin drives the REAL pair.
+  const dir = mkdtempSync(join(tmpdir(), 'prc-pass-'));
+  try {
+    const origin = join(dir, 'origin.git');
+    const g = (a, cwd = dir) => spawnSync('git', a, { cwd, encoding: 'utf8' });
+    g(['init', '-q', '--bare', '-b', 'main', origin]);
+    const seed = join(dir, 'seed'); mkdirSync(seed);
+    const gs = (a) => g(a, seed);
+    gs(['init', '-q', '-b', 'main', '.']);
+    writeFileSync(join(seed, 'README.md'), 'x');
+    gs(['add', '.']); gs(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'seed']);
+    gs(['push', '-q', origin, 'main']);
+    const wc = join(dir, 'wc');
+    spawnSync('git', ['clone', '-q', origin, wc], { cwd: dir, encoding: 'utf8' });
+    const store = new Store({ cwd: wc });
+    // genesis state: cc epoch, one ASSIGNED task with artifacts + a matching done report in the queue
+    const gg = genesis({
+      config: { max_parallel: 2, lease_minutes: 4, max_attempts: 3, tick_min_interval_s: 25 },
+      project: { tasks: [{ id: 'T-900', title: 't', behavior: 'real', work_ms: 1, spec: { artifacts: ['tasks/T-900/report.md'], issue: 7 } }], milestones: 1 },
+      chainId: 'c-live', now: '2026-09-18T00:00:00.000Z', mode: 'cc', issue: 7,
+    });
+    const t = gg.tasks['T-900'];
+    t.status = 'assigned';
+    t.lease = { token: 'L1', issued_at: '2026-09-18T00:00:10Z', expires: '2026-09-18T00:30:00Z' };
+    store.init(gg);
+    // write the done report into the queue the way workers do
+    const qdir = mkdtempSync(join(tmpdir(), 'prc-q-'));
+    writeFileSync(join(qdir, 'queue.jsonl'), JSON.stringify({ event_id: 'rep-live', task: 'T-900', lease: 'L1', outcome: { status: 'done', artifact: 'done', run_id: 'RLIVE' }, run_id: 'RLIVE' }) + '\n');
+    const head = String(g(['--git-dir', origin, 'rev-parse', 'fsm-state']).stdout).trim();
+    const commitTree = spawnSync('git', ['-C', qdir, 'init', '-q', '-b', 'tmp', '.'], { encoding: 'utf8' });
+    // simpler: use the Store's own enqueueReport CAS lane
+    rmSync(qdir, { recursive: true, force: true });
+    const er = store.enqueueReport({ event_id: 'rep-live', task: 'T-900', lease: 'L1', outcome: { status: 'done', artifact: 'done', run_id: 'RLIVE' }, run_id: 'RLIVE' });
+    assert.equal(er.ok, true, 'the report enqueued');
+    // THE integration: conductorTick through store.commit
+    const NM = () => null;
+    const out = await Promise.resolve(store.commit({
+      mutate: (cur, queue, controlQueue, queueBad, ctlBad, intakeQueue, intakeBad) => conductorTick({
+        cur, queue, controlQueue, queueBad, ctlBad, intakeQueue, intakeBad,
+        ev: { kind: 'TICK', event_id: 'tk1', ts: '2026-09-18T00:01:00.000Z' },
+        now: () => '2026-09-18T00:01:00.000Z',
+        nextMilestone: NM, recover: null,
+        makeGenesis: () => { throw new Error('no genesis expected'); },
+      }),
+    }));
+    assert.equal(out.committed, true);
+    assert.equal(out.state.tasks['T-900'].status, 'done', 'the report drained');
+    // THE PIN: the key survived the store's return reconstruction
+    assert.equal(out.prCandidates?.length, 1, `prCandidates must ride the commit's return: ${JSON.stringify(Object.keys(out))}`);
+    assert.equal(out.prCandidates[0].id, 'T-900');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
