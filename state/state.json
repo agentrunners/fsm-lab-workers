@@ -1,11 +1,11 @@
 {
  "schema": 1,
  "version": 30,
- "journal_seq": 54,
+ "journal_seq": 57,
  "chain": {
   "id": "c-1789708602108",
-  "seq": 21,
-  "last_tick": "2026-09-18T05:28:14.001Z",
+  "seq": 22,
+  "last_tick": "2026-09-18T05:28:49.130Z",
   "primed_by": "chain",
   "halted": false,
   "paused": false
@@ -30,39 +30,10 @@
  "tasks": {
   "T-101": {
    "id": "T-101",
-   "title": "research: state-anchor options",
    "status": "done",
-   "behavior": "succeed",
-   "work_ms": 4000,
-   "deps": [],
    "attempts": 1,
-   "lease": null,
-   "created": "2026-09-18T05:16:42.108Z",
-   "updated": "2026-09-18T05:17:15.377Z",
-   "history": [
-    {
-     "at": "2026-09-18T05:16:42.108Z",
-     "status": "ready",
-     "why": "created"
-    },
-    {
-     "at": "2026-09-18T05:16:42.109Z",
-     "status": "assigned",
-     "why": "assigned(attempt=1)"
-    },
-    {
-     "at": "2026-09-18T05:17:15.377Z",
-     "status": "done",
-     "why": "worker-done"
-    }
-   ],
-   "last_result": {
-    "status": "done",
-    "run_id": "35310179527",
-    "artifact": "shim(fast): completed task T-101 attempt 1",
-    "duration_ms": 4004
-   },
-   "terminal_seq": 1
+   "done_at": "2026-09-18T05:17:15.377Z",
+   "pruned": true
   },
   "T-102": {
    "id": "T-102",
@@ -303,39 +274,10 @@
   },
   "T-107": {
    "id": "T-107",
-   "title": "edge: duplicate report",
    "status": "done",
-   "behavior": "dup",
-   "work_ms": 3000,
-   "deps": [],
    "attempts": 1,
-   "lease": null,
-   "created": "2026-09-18T05:16:42.108Z",
-   "updated": "2026-09-18T05:17:15.375Z",
-   "history": [
-    {
-     "at": "2026-09-18T05:16:42.108Z",
-     "status": "ready",
-     "why": "created"
-    },
-    {
-     "at": "2026-09-18T05:16:42.109Z",
-     "status": "assigned",
-     "why": "assigned(attempt=1)"
-    },
-    {
-     "at": "2026-09-18T05:17:15.375Z",
-     "status": "done",
-     "why": "worker-done"
-    }
-   ],
-   "last_result": {
-    "status": "done",
-    "run_id": "35310179740",
-    "artifact": "shim(dup-report): task T-107 attempt 1 completed — the report is delivered TWICE (same event_id; the drain must dedup)",
-    "duration_ms": 3007
-   },
-   "terminal_seq": 1
+   "done_at": "2026-09-18T05:17:15.375Z",
+   "pruned": true
   },
   "T-108": {
    "id": "T-108",
@@ -428,6 +370,7 @@
   "tick-chain-1789709186789",
   "tick-chain-1789709221338",
   "tick-chain-1789709257062",
-  "tick-chain-1789709292531"
+  "tick-chain-1789709292531",
+  "tick-chain-1789709328007"
  ]
 }
