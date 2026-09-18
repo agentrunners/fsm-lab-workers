@@ -1,11 +1,11 @@
 {
  "schema": 1,
  "version": 61,
- "journal_seq": 123,
+ "journal_seq": 126,
  "chain": {
   "id": "c-1789708602108",
-  "seq": 47,
-  "last_tick": "2026-09-18T05:44:05.520Z",
+  "seq": 48,
+  "last_tick": "2026-09-18T05:44:42.168Z",
   "primed_by": "chain",
   "halted": false,
   "paused": false
@@ -100,54 +100,10 @@
   },
   "T-203": {
    "id": "T-203",
-   "title": "impl: parallel c",
    "status": "done",
-   "behavior": "flaky",
-   "work_ms": 4000,
-   "deps": [],
    "attempts": 2,
-   "lease": null,
-   "created": "2026-09-18T05:30:42.219Z",
-   "updated": "2026-09-18T05:32:27.802Z",
-   "history": [
-    {
-     "at": "2026-09-18T05:30:42.219Z",
-     "status": "ready",
-     "why": "created"
-    },
-    {
-     "at": "2026-09-18T05:31:17.282Z",
-     "status": "assigned",
-     "why": "assigned(attempt=1)"
-    },
-    {
-     "at": "2026-09-18T05:31:54.516Z",
-     "status": "failed",
-     "why": "worker-failed(attempts=1)"
-    },
-    {
-     "at": "2026-09-18T05:31:54.516Z",
-     "status": "ready",
-     "why": "retry-scan(attempts=1)"
-    },
-    {
-     "at": "2026-09-18T05:31:54.516Z",
-     "status": "assigned",
-     "why": "assigned(attempt=2)"
-    },
-    {
-     "at": "2026-09-18T05:32:27.802Z",
-     "status": "done",
-     "why": "worker-done"
-    }
-   ],
-   "last_result": {
-    "status": "done",
-    "run_id": "35311165302",
-    "artifact": "shim(flaky): completed task T-203 attempt 2",
-    "duration_ms": 4007
-   },
-   "terminal_seq": 27
+   "done_at": "2026-09-18T05:32:27.802Z",
+   "pruned": true
   },
   "T-204": {
    "id": "T-204",
@@ -207,39 +163,10 @@
   },
   "T-206": {
    "id": "T-206",
-   "title": "impl: parallel f",
    "status": "done",
-   "behavior": "succeed",
-   "work_ms": 4000,
-   "deps": [],
    "attempts": 1,
-   "lease": null,
-   "created": "2026-09-18T05:30:42.219Z",
-   "updated": "2026-09-18T05:32:27.808Z",
-   "history": [
-    {
-     "at": "2026-09-18T05:30:42.219Z",
-     "status": "ready",
-     "why": "created"
-    },
-    {
-     "at": "2026-09-18T05:31:54.538Z",
-     "status": "assigned",
-     "why": "assigned(attempt=1)"
-    },
-    {
-     "at": "2026-09-18T05:32:27.808Z",
-     "status": "done",
-     "why": "worker-done"
-    }
-   ],
-   "last_result": {
-    "status": "done",
-    "run_id": "35311165864",
-    "artifact": "shim(fast): completed task T-206 attempt 1",
-    "duration_ms": 4007
-   },
-   "terminal_seq": 27
+   "done_at": "2026-09-18T05:32:27.808Z",
+   "pruned": true
   },
   "T-207": {
    "id": "T-207",
@@ -421,6 +348,7 @@
   "tick-chain-1789710132381",
   "tick-chain-1789710170677",
   "tick-chain-1789710205712",
-  "tick-chain-1789710243853"
+  "tick-chain-1789710243853",
+  "tick-chain-1789710280684"
  ]
 }

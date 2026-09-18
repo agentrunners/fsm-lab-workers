@@ -120,3 +120,6 @@
 {"id":"e120","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-201","from_status":"done"}
 {"id":"e121","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-202","from_status":"done"}
 {"id":"e122","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-204","from_status":"done"}
+{"id":"e123","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"TICK","seq":48,"actor":"chain"}
+{"id":"e124","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"PRUNE","task":"T-203","from_status":"done"}
+{"id":"e125","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"PRUNE","task":"T-206","from_status":"done"}
