@@ -92,3 +92,4 @@
 {"id":"e92","ts":"2026-09-18T05:33:01.384Z","applied":true,"kind":"ASSIGN","task":"T-207","from":"ready","to":"assigned","lease":"l-fa4a4d90f1f6","expires":"2026-09-18T05:37:01.384Z","attempt":3,"behavior":"poison","task_ref":{"kind":"state-task","id":"T-207"}}
 {"id":"e93","ts":"2026-09-18T05:33:01.390Z","applied":true,"kind":"REPORT","task":"T-208","lease":"l-a7e3e01dd16f","to":"done","run_id":"35311204509","from":"assigned"}
 {"id":"e94","ts":"2026-09-18T05:33:01.390Z","applied":true,"kind":"TICK","seq":29,"actor":"chain"}
+{"id":"e95","ts":"2026-09-18T05:33:34.646Z","applied":true,"kind":"TICK","seq":30,"actor":"chain"}
