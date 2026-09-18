@@ -198,6 +198,9 @@ test('cc spawn boundary: the fake echoes the REAL argv + the complete F-M8 env (
   assert.deepEqual(echo.argv, [
     '-y', '@anthropic-ai/claude-code@2.1.273',
     '-p', 'do the thing',
+    // T46/X22: acceptEdits — headless write prompts deferred the declared
+    // artifact (run 35297656079); the workdir sandbox is the boundary
+    '--permission-mode', 'acceptEdits',
     '--max-turns', '9',
     '--output-format', 'json',
     '--disallowedTools', 'WebFetch,WebSearch',
