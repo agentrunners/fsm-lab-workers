@@ -357,5 +357,8 @@ PAT ladder — GITHUB_TOKEN 403'd, the LAB_PAT lane carried it; body = accept
 criteria + result digest + the transcript pointer) and stamped `pr: 8` in
 state. The artifact is real content the CC turn wrote (it read the repo
 context and produced a coherent status report).
-X22-final (issue #9, fired with all three fixes in): the one-pass
-completion-comment-with-link proof.
+X22-final (issue #9, chain c-1789698520934): **GREEN in ONE PASS** — the
+completion comment carries the result digest AND "**Pull requests**: task
+`X22-FINAL` → PR #10" on the same tick-set; PR #10 opened + stamped. The
+loop criterion (issue → door → cc epoch → artifacts → PR → completion
+comment with the link) is closed.
