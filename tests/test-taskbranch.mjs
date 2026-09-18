@@ -396,7 +396,10 @@ test('conductor.yml carries pull-requests: write (F-14) + var-driven OPS_ISSUE; 
   // comment; the PR ladder never eats the dispatch budget)
   const stateLine = src.indexOf('const state = out.state;');
   const dispatchLoop = src.indexOf('for (const a of actionList) {');
-  const prFlowLine = src.indexOf('await prFlow({');
+  // the committed-path prFlow call: the FIRST 'await prFlow({' AFTER the
+  // dispatch loop (the quiesced-path call — F4's fold — legitimately sits
+  // BEFORE it, inside the !out.committed return)
+  const prFlowLine = src.indexOf('await prFlow({', dispatchLoop);
   const journalScanLine = src.indexOf('for (const j of out.journal || []) {');
   const linksLine = src.indexOf('prFlowResult?.links');
   assert.ok(stateLine > 0 && dispatchLoop > stateLine, 'the dispatch loop follows the commit');
@@ -653,4 +656,37 @@ test('F7 live follow-up (the X22 finding): prCandidates SURVIVES store.commit �
     assert.equal(out.prCandidates?.length, 1, `prCandidates must ride the commit's return: ${JSON.stringify(Object.keys(out))}`);
     assert.equal(out.prCandidates[0].id, 'T-900');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('F4 live follow-up (the X22 verify tick): the QUIESCED path drains the PR flow — the noop return carries candidates and the store passes them', () => {
+  // the live probe (run 35298996619): the verify tick QUIESCED before the PR
+  // block — a halted epoch's PRs would never open. The noop return now
+  // carries prCandidates; the store's noop path passes them (pinned above
+  // for the committed path; this pins the noop side at the conductorTick level).
+  const gg = genesis({
+    config: { max_parallel: 2, lease_minutes: 4, max_attempts: 3, tick_min_interval_s: 25 },
+    project: { tasks: [{ id: 'T-900', title: 't', behavior: 'real', work_ms: 1, spec: { artifacts: ['tasks/T-900/report.md'], issue: 7 } }], milestones: 1 },
+    chainId: 'c-q', now: '2026-09-18T00:00:00.000Z', mode: 'cc', issue: 7,
+  });
+  const t = gg.tasks['T-900'];
+  t.status = 'done'; t.attempts = 1; t.lease = null;
+  t.last_result = { status: 'done', artifact: 'done', run_id: 'RQ' };
+  gg.project.phase = 'done'; gg.chain.halted = true; gg.stats.done = 1;
+  // a quiesced tick: no queue, no control, no wake journal → noop
+  const out = conductorTick({
+    cur: structuredClone(gg), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [], intakeBad: [],
+    ev: { kind: 'TICK', event_id: 'tq', ts: '2026-09-18T00:01:00.000Z' },
+    now: () => '2026-09-18T00:01:00.000Z',
+    nextMilestone: () => null, recover: null, makeGenesis: () => { throw new Error('no genesis'); },
+  });
+  assert.equal(out.noop, true, 'the tick is a noop (quiesced)');
+  assert.equal(out.prCandidates?.length, 1, 'the noop return still carries the PR candidates (F4)');
+  assert.equal(out.prCandidates[0].id, 'T-900');
+  // and the wiring: the quiesced path in turn.mjs runs prFlow BEFORE the return
+  const src = rfs(join(ROOT, 'conductor/turn.mjs'), 'utf8');
+  const quiesceIdx = src.indexOf('if (!out.committed) {');
+  const quiescePrFlowIdx = src.indexOf('PR-FLOW (quiesced path)');
+  const quiesceLogIdx = src.indexOf('QUIESCED: ');
+  assert.ok(quiesceIdx > 0 && quiescePrFlowIdx > quiesceIdx && quiesceLogIdx > quiescePrFlowIdx, 'the quiesced path drains the PR flow before returning');
 });

@@ -324,8 +324,28 @@ async function main() {
     // F2/A1: QUIESCED — a held chain with empty queues. NEVER self-dispatch
     // (the old noop path restarted stopped chains; a mixed-deploy version of
     // that is a livelock at runner cadence — structurally impossible now).
+    // T46/W-C2-R (F4, live-confirmed by the X22 verify tick 35298996619):
+    // the PR flow is the ONE piece of post-completion work that still runs
+    // on a quiesced tick — a halted epoch has no other ticks coming, and its
+    // declared-artifact tasks' PRs would otherwise NEVER open (lens-1 F4:
+    // deferred forever, silently). The stamps are legitimate commits; the
+    // NEXT tick quiesces truly (pr set → candidates empty).
+    if ((out.prCandidates || []).length) {
+      try {
+        const prr = await prFlow({
+          candidates: out.prCandidates, state: out.state, repo: REPO, api, store,
+          tokenFallback: PAT || null,
+          alert: (msg) => postIssueComment(msg),
+          log: console.log,
+        });
+        console.log(`PR-FLOW (quiesced path) candidates=${prr.candidates} opened=${prr.opened} reused=${prr.reused} stamped=${prr.stamped} failures=${prr.failures} deferred=${prr.deferred}`);
+      } catch (e) {
+        console.log(`PR-FLOW-FAILED (quiesced path) ${String(e?.message ?? e).slice(0, 200)} (law 5: visible, non-fatal — a manual tick retries)`);
+        await postIssueComment(`**[fsm-alert]** the PR flow FAILED on a quiesced tick — ${String(e?.message ?? e).slice(0, 160)}. A halted chain will not retry automatically; dispatch a manual fsm-tick.`);
+      }
+    }
     const held = out.state?.chain?.paused || out.state?.chain?.halted;
-    console.log(`QUIESCED: ${out.reason}${held ? ` (chain ${out.state.chain.paused ? 'paused' : 'halted'})` : ''} — no commit, no self-dispatch`);
+    console.log(`QUIESCED: ${out.reason}${held ? ` (chain ${out.state.chain.paused ? 'paused' : 'halted'})` : ''} — no commit, no self-dispatch${(out.prCandidates || []).length ? ' (the PR flow ran first)' : ''}`);
     return;
   }
   const state = out.state;
