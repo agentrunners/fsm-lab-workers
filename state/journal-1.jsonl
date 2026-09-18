@@ -93,3 +93,5 @@
 {"id":"e93","ts":"2026-09-18T05:33:01.390Z","applied":true,"kind":"REPORT","task":"T-208","lease":"l-a7e3e01dd16f","to":"done","run_id":"35311204509","from":"assigned"}
 {"id":"e94","ts":"2026-09-18T05:33:01.390Z","applied":true,"kind":"TICK","seq":29,"actor":"chain"}
 {"id":"e95","ts":"2026-09-18T05:33:34.646Z","applied":true,"kind":"TICK","seq":30,"actor":"chain"}
+{"id":"e96","ts":"2026-09-18T05:34:08.799Z","applied":true,"kind":"REPORT","task":"T-207","lease":"l-fa4a4d90f1f6","to":"quarantined","run_id":"35311241135","from":"assigned"}
+{"id":"e97","ts":"2026-09-18T05:34:08.802Z","applied":true,"kind":"TICK","seq":31,"actor":"chain"}
