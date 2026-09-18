@@ -36,4 +36,8 @@ jobs:
           LAB_PAT: ${{ secrets.LAB_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           STALE_AFTER_MIN: '4'
+          # T46/W-C2 (§5a, F-15): transcript retention knob — default 7 days;
+          # the scan HARD-CAPS at 90 (values >90 clamp, <1 or invalid reset
+          # to the default) regardless of what lands here.
+          TRANSCRIPT_GC_DAYS: '7'
         run: node watchdog/scan.mjs
