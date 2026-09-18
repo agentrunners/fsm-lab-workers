@@ -137,6 +137,10 @@ test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output
   assert.deepEqual(argv, [
     '-y', '@anthropic-ai/claude-code@2.1.273',
     '-p', 'do the thing',
+    // T46/X22 (live finding run 35297656079): headless write prompts deferred
+    // the declared artifact — acceptEdits is the designed shape (the workdir
+    // sandbox + the write-back door are the boundary)
+    '--permission-mode', 'acceptEdits',
     '--max-turns', '12',
     '--output-format', 'json',
     '--disallowedTools', 'WebFetch,WebSearch',

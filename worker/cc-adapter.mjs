@@ -138,10 +138,17 @@ export function ccCliVersion(env = process.env) {
 // the CLI argument vector AFTER the executable — the npx form. Fake mode
 // prepends the fake script path under the node executable; the fake then
 // echoes process.argv.slice(2) = THIS vector (the real spawn boundary).
+// T46/X22 (live finding, run 35297656079): --permission-mode acceptEdits —
+// headless -p mode DEFERS file-write prompts by default; the turn "completed
+// done" while the declared artifact was never written ("The write needs
+// your approval"). The workdir sandbox IS the boundary (a fresh temp dir,
+// the write-back door governs what rides the task branch) — auto-accepting
+// edits inside it is the designed shape.
 export function ccArgv(envelope, budget, env = process.env) {
   return [
     '-y', `@anthropic-ai/claude-code@${ccCliVersion(env)}`,
     '-p', envelope.prompt,
+    '--permission-mode', 'acceptEdits',
     '--max-turns', String(budget.max_turns),
     '--output-format', 'json',
     '--disallowedTools', CC_PERMISSION_DENIES.join(','),
