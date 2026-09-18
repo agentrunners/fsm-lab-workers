@@ -116,3 +116,7 @@
 {"id":"e116","ts":"2026-09-18T05:42:52.272Z","applied":true,"kind":"TICK","seq":45,"actor":"chain"}
 {"id":"e117","ts":"2026-09-18T05:43:27.095Z","applied":true,"kind":"TICK","seq":46,"actor":"chain"}
 {"id":"e118","ts":"2026-09-18T05:43:27.095Z","applied":true,"kind":"PRUNE","task":"T-105","from_status":"quarantined"}
+{"id":"e119","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"TICK","seq":47,"actor":"chain"}
+{"id":"e120","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-201","from_status":"done"}
+{"id":"e121","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-202","from_status":"done"}
+{"id":"e122","ts":"2026-09-18T05:44:05.520Z","applied":true,"kind":"PRUNE","task":"T-204","from_status":"done"}
