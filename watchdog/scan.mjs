@@ -202,14 +202,33 @@ function gcAttempt({ url, token, sinceIso, state, nowMs, gcDays, log, hooks, att
     // old ambiguous>0 trigger could NEVER fire, and prior-epoch residue (the
     // GC's bulk value) would be retained FOREVER whenever a fresh epoch
     // keeps re-bounding the window. A shallow log can never PROVE a file is
-    // old enough: deepen whenever the clone is shallow and transcripts
-    // exist; on deepen failure the shallow plan stands (fail-retention — the
-    // safe direction; a fabricated fresh touch only ever retains).
+    // old enough: deepen when terminal transcripts exist; on deepen failure
+    // the shallow plan stands (fail-retention — the safe direction; a
+    // fabricated fresh touch only ever retains).
+    //
+    // W-C2-R (F5/L2-1) — the COST guards (the watchdog scans every ~10 min):
+    //   (a) terminalCount, not transcriptCount: an ACTIVE epoch's live
+    //       transcripts can never be deleted — deepening for them was pure
+    //       per-scan cost with zero possible effect.
+    //   (b) the tip-age cadence: an actively-pushed branch (<1h tip age)
+    //       defers the deepen UNLESS the shallow plan already found victims
+    //       (fresh pushes keep re-bounding the window; a quiet scan collects
+    //       the residue with exact ages).
+    //   (c) the unshallow fetch is TIMEOUT-BOUNDED (90s): a branch grown
+    //       past the watchdog job's budget degrades to fail-retention
+    //       VISIBLY (the GC-DEEPEN-SKIPPED log) instead of killing the scan
+    //       (whose alerting duty is the thing that must never die).
     const shallowRepo = String(git(['rev-parse', '--is-shallow-repository']).stdout || '').trim() === 'true';
-    if (shallowRepo && plan.transcriptCount > 0) {
-      const up = git(['fetch', '-q', '--unshallow', 'origin']);
-      if (up.status !== 0) {
-        log(`GC-DEEPEN-SKIPPED (unshallow fetch failed; the shallow plan stands — fail-retention): ${scrub(up.stderr || up.error).trim().slice(0, 120)}`);
+    const tipAgeMs = (() => {
+      const tipDate = String(git(['log', '-1', '--format=%cI', 'HEAD']).stdout || '').trim();
+      const ms = Date.parse(tipDate);
+      return Number.isFinite(ms) ? (nowMs - ms) : NaN;
+    })();
+    const cadenceOk = plan.victims.length > 0 || !Number.isFinite(tipAgeMs) || tipAgeMs > 3_600_000;
+    if (shallowRepo && plan.terminalCount > 0 && cadenceOk) {
+      const up = spawnSync('git', ['fetch', '-q', '--unshallow', 'origin'], { cwd: wc, encoding: 'utf8', timeout: 90_000, maxBuffer: 64 * 1024 * 1024 });
+      if (up.status !== 0 || up.error) {
+        log(`GC-DEEPEN-SKIPPED (${up.error ? `timeout/error: ${String(up.error).slice(0, 80)}` : 'fetch failed'}; the shallow plan stands — fail-retention): ${scrub(up.stderr || '').trim().slice(0, 120)}`);
       } else {
         const lg2 = git(['log', '--name-only', '--format=@@@%H %cI', 'HEAD']);
         if (lg2.status === 0) {

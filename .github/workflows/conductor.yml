@@ -75,7 +75,10 @@ jobs:
           # genesis validates; a bad value fails the genesis LOUD.
           EPOCH_MODE: ${{ vars.EPOCH_MODE || 'mock' }}
           EVENT: ${{ toJSON(github.event) }}
-          OPS_ISSUE: '1'
+          # T46/W-C2-R (L2-5): var-driven like ops-console.yml (m-8's load-bearing
+          # variable) — a hardcoded '1' here would split the alert lane from the
+          # console the day the operator moves the ops anchor.
+          OPS_ISSUE: ${{ vars.OPS_ISSUE || '1' }}
         run: node conductor/turn.mjs
 
       - name: Persist run evidence

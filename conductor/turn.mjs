@@ -330,29 +330,6 @@ async function main() {
   }
   const state = out.state;
 
-  // T46/W-C2 (§4/F-4/m-3): the task-branch/PR flow — done cc-tasks with
-  // DECLARED artifacts get their PR opened + stamped HERE (post-commit,
-  // pre-comment: the intake completion comment below carries the link).
-  // The stamp rides a SECOND commit (the two-commit pattern); PR-open
-  // failure alerts (law 5) and NEVER fails the run. Mock epochs skip by
-  // construction (§4c — no declared artifacts). Bounded to PR_MAX_PER_TICK.
-  if (prFlowCandidates(state).length) {
-    try {
-      const prr = await prFlow({
-        state, repo: REPO, api, store,
-        tokenFallback: PAT || null,   // the LAB_PAT lane (PAT PR-creation needs no repo setting — live-proven PR#5)
-        alert: (msg) => postIssueComment(msg),
-        log: console.log,
-      });
-      if (prr.candidates) {
-        console.log(`PR-FLOW candidates=${prr.candidates} opened=${prr.opened} reused=${prr.reused} stamped=${prr.stamped} failures=${prr.failures}`);
-      }
-    } catch (e) {
-      // the flow itself dying must never kill the tick — the epoch still runs
-      console.log(`PR-FLOW-FAILED ${String(e?.message ?? e).slice(0, 200)} (non-fatal — the next tick retries via the reuse lane)`);
-    }
-  }
-
   // 4. execute actions (workers first — parallelism starts ASAP)
   let dispatchFailures = 0;
   let dispatchSkipped = 0;   // F-C: budget-exhausted skips (lease re-covers — loud, not fatal)
@@ -412,6 +389,39 @@ async function main() {
     }
   }
 
+  // T46/W-C2 (§4/F-4/m-3) — the task-branch/PR flow. W-C2-R (L2-2): AFTER
+  // the worker-dispatch loop (workers first — the PR ladder must never eat
+  // the F-C-reserved dispatch/self-tick budget) and BEFORE the journal-scan
+  // comments (the intake completion comment below carries the links, m-3).
+  // W-C2-R (F7): the candidates come from conductorTick's PRE-ROLLOVER
+  // view (out.prCandidates) — a same-tick intake rollover replaces
+  // out.state with the NEXT epoch and the completing epoch's PRs would
+  // otherwise vanish. Budget-guarded (L2-2): a thin remainder defers to the
+  // next tick + alerts (a halted epoch's deferral must be VISIBLE — F4).
+  let prFlowResult = null;
+  if ((out.prCandidates || []).length) {
+    if (BUDGET.remaining() < 90_000) {
+      console.log(`PR-FLOW-DEFERRED candidates=${out.prCandidates.length} budget=${Math.round(BUDGET.remaining() / 1000)}s (next tick retries; a halted chain needs a manual tick)`);
+      await postIssueComment(`**[fsm-alert]** PR flow DEFERRED (${out.prCandidates.length} candidate(s), turn budget exhausted) — a halted chain will not retry automatically; dispatch a manual fsm-tick or open the PRs from the \`tasks/<id>\` branches.`);
+    } else {
+      try {
+        prFlowResult = await prFlow({
+          candidates: out.prCandidates, state, repo: REPO, api, store,
+          tokenFallback: PAT || null,   // the LAB_PAT lane (PAT PR-creation needs no repo setting — live-proven PR#5)
+          alert: (msg) => postIssueComment(msg),
+          log: console.log,
+        });
+        console.log(`PR-FLOW candidates=${prFlowResult.candidates} opened=${prFlowResult.opened} reused=${prFlowResult.reused} stamped=${prFlowResult.stamped} failures=${prFlowResult.failures} deferred=${prFlowResult.deferred}`);
+      } catch (e) {
+        // W-C2-R (L2-6): the whole-flow death is law-5 VISIBLE (the log-only
+        // shape left a persistent structural failure invisible outside the
+        // Actions log browser) — the epoch still runs; the next tick retries.
+        console.log(`PR-FLOW-FAILED ${String(e?.message ?? e).slice(0, 200)} (non-fatal — the next tick retries via the reuse lane)`);
+        await postIssueComment(`**[fsm-alert]** the PR flow itself FAILED this tick — ${String(e?.message ?? e).slice(0, 160)}. The next tick retries via the reuse lane; if this repeats, read the conductor run log.`);
+      }
+    }
+  }
+
   // alertable journal records -> ops issue comments (bounded: quarantine is
   // terminal per task; PHASE/MILESTONE fire once each)
   // T46/W-C1: the scan also serves the intake thread (m-3) — the rollover's
@@ -444,21 +454,29 @@ async function main() {
       // R2 quality-gate (T45): a completion dominated by quarantine/cancel is
       // a DEGRADED halt — the alert must not read "PROJECT COMPLETE" when
       // the work died (the probe1 kill: 0% done, invariants clean, all green).
+      // W-C2-R (F7-adjacent): the stats/tasks come from the JOURNAL RECORD
+      // (the COMPLETING epoch's own view — a same-tick rollover replaced
+      // the live state with the next epoch's zeroed stats).
+      const cStats = j.stats || state.stats;
+      const cTaskCount = j.stats?.taskCount ?? Object.keys(state.tasks).length;
       if (j.degraded) {
-        await postIssueComment(`**[fsm-alert]** PROJECT HALTED DEGRADED — done ${state.stats.done}/${Object.keys(state.tasks).length} (quarantined=${state.stats.quarantined} cancelled=${state.stats.cancelled}); quality gate: done < 50%. Investigate the work lane before reset. stats ${JSON.stringify(state.stats)}`);
+        await postIssueComment(`**[fsm-alert]** PROJECT HALTED DEGRADED — done ${cStats.done}/${cTaskCount} (quarantined=${cStats.quarantined} cancelled=${cStats.cancelled}); quality gate: done < 50%. Investigate the work lane before reset. stats ${JSON.stringify(cStats)}`);
       } else {
-        await postIssueComment(`**[fsm]** PROJECT COMPLETE — stats ${JSON.stringify(state.stats)}`);
+        await postIssueComment(`**[fsm]** PROJECT COMPLETE — stats ${JSON.stringify(cStats)}`);
       }
       // m-3: an intake-born epoch's completion comment targets the intake
       // issue too (X22's criterion: the operator's thread gets the outcome).
-      // T46/W-C2: the comment carries the PR link when the task-branch flow
-      // stamped one (prFlow ran pre-comment — the link rides THIS comment).
-      const issueN = state.project?.issue;
+      // T46/W-C2: the comment carries the PR links from the PR flow's RETURN
+      // (W-C2-R F7/m4/L2-3: the rollover case's stamps cannot land in the
+      // live state — the links ride prFlowResult; ALL done candidates link,
+      // not just the first).
+      const issueN = j.issue ?? state.project?.issue;
       if (issueN) {
-        const taskIds = Object.keys(state.tasks);
-        const dones = Object.values(state.tasks).filter(t => t.status === 'done');
-        const prLink = dones.length && dones[0].pr ? `\n\n**Pull request**: #${dones[0].pr} — the task's artifacts await review/merge.` : '';
-        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch ${j.degraded ? 'HALTED DEGRADED' : 'COMPLETE'} for this task — done ${state.stats.done}/${taskIds.length}${dones.length && dones[0].last_result?.artifact ? `\n\nResult digest: ${String(dones[0].last_result.artifact).slice(0, 600)}` : ''}${prLink}\n\n(stats ${JSON.stringify(state.stats)})` });
+        const prLinks = (prFlowResult?.links || []).map(l => `- task \`${l.id}\` → PR #${l.prn}${l.closed ? ' (closed/merged — the write-back landed)' : ' — the artifacts await review/merge'}`).join('\n');
+        const linksBlock = prLinks ? `\n\n**Pull requests**:\n${prLinks}` : '';
+        const digest = (prFlowResult?.links || []).length && (out.prCandidates || [])[0]?.task?.last_result?.artifact
+          ? `\n\nResult digest: ${String(out.prCandidates[0].task.last_result.artifact).slice(0, 600)}` : '';
+        const r = await api(`/repos/${REPO}/issues/${issueN}/comments`, 'POST', { body: `**[fsm]** Epoch ${j.degraded ? 'HALTED DEGRADED' : 'COMPLETE'} for this task — done ${cStats.done}/${cTaskCount}${digest}${linksBlock}\n\n(stats ${JSON.stringify(cStats)})` });
         if (r.status !== 201) console.log(`INTAKE-COMMENT-FAILED issue=${issueN} HTTP=${r.status} (law 5: visible, non-fatal)`);
       }
     }

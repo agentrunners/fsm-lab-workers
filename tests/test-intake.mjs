@@ -21,7 +21,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseSpecBlock, validateSpec, specToTask, doorDecide, bodySha8, howToComment,
-  INTAKE_BEHAVIORS, PERMISSION_CLASSES,
+  INTAKE_BEHAVIORS, PERMISSION_CLASSES, ID_RE, validId,
 } from '../lib/intake.mjs';
 
 const BLOCK = (inner) => '```fsm-task\n' + inner + '\n```';
@@ -249,4 +249,32 @@ test('bodySha8: deterministic 8-hex; distinguishes bodies', () => {
   assert.equal(h, bodySha8('hello world'));
   assert.notEqual(h, bodySha8('hello worlds'));
   assert.equal(bodySha8(''), 'e3b0c442', 'the empty-string sha256 prefix');
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-C2-R fold pins (m2/m3 — lens 1's intake findings)
+// ---------------------------------------------------------------------------
+
+test('W-C2-R m2: the id charset is ONE path language — git-ref-valid AND door-compatible (no .lock / no leading dash / no .. runs)', () => {
+  // valid: alnum first char, then [A-Za-z0-9._-]
+  for (const ok of ['T-900', 'a', 'task_1.x', 'A9']) {
+    assert.equal(validId(ok), true, `${ok} should pass`);
+  }
+  // the old charset admitted these; each is a live failure downstream:
+  // 'T-900.lock' — invalid git ref (checkout -b dies → infra → quarantine)
+  for (const bad of ['T-900.lock', '-x', '.hidden', 'a..b', 'T-900.', '', 'x'.repeat(25)]) {
+    assert.equal(validId(bad), false, `${bad} must be rejected at the door`);
+  }
+});
+
+test('W-C2-R m3: artifacts count capped at 32 (the envelope\'s ENVELOPE_ARTIFACTS_MAX — the rejection belongs at intake, not the worker gate)', () => {
+  const arts = [];
+  for (let i = 0; i < 33; i++) arts.push(`tasks/i99/file${i}.md`);
+  const r = validateSpec({ id: 'i99', title: 't', accept: 'a', artifacts: arts }, { issue: 99 });
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some(e => /artifacts carries 33 paths \(cap 32/.test(e)), `the count rejection: ${r.errors.join(' | ')}`);
+  // 32 passes the count check (path binding still governs each)
+  const r2 = validateSpec({ id: 'i99', title: 't', accept: 'a', artifacts: arts.slice(0, 32) }, { issue: 99 });
+  assert.equal(r2.ok, true, `32 is fine: ${JSON.stringify(r2.errors || [])}`);
+  assert.ok(!(r2.errors || []).some(e => e.startsWith('artifacts carries')));
 });

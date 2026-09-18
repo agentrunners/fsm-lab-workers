@@ -468,10 +468,15 @@ function pushSessionsBranch({ env, files, log }) {
 // the read-back verification — PURE (extracted so the failure branches
 // are pinnable without hook gymnastics): tip = {path: bytes} parsed from
 // `git ls-tree -r --long FETCH_HEAD`, sizes = the local byte sizes.
-export function verifyReadBack({ committed, sizes, tip }) {
-  for (const rel of committed) {
+// W-C2-R (F8): iterates the ALLOWED set (not the copied subset) — a
+// declared-but-unwritten path is a MISSING file at the tip, never a
+// silently-dropped claim (the old shape pushed a partial tree green).
+export function verifyReadBack({ allowed, committed, sizes, tip }) {
+  const check = Array.isArray(allowed) && allowed.length ? allowed : committed;
+  for (const rel of check) {
     if (!(rel in tip)) return { ok: false, err: `artifact-push read-back: path ${rel} MISSING at the remote tip` };
-    if (tip[rel] !== sizes[rel]) return { ok: false, err: `artifact-push read-back: path ${rel} size drift at tip (${tip[rel]} vs ${sizes[rel]} local)` };
+    const local = sizes[rel];
+    if (local !== undefined && tip[rel] !== local) return { ok: false, err: `artifact-push read-back: path ${rel} size drift at tip (${tip[rel]} vs ${local} local)` };
   }
   return { ok: true };
 }
@@ -488,10 +493,14 @@ export function parseLsTree(stdout) {
 }
 
 export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
+  // W-C2-R (F6): the origin seam — CC_TASKBRANCH_ORIGIN (tests/ops override;
+  // the FSM_SESSIONS_ORIGIN pattern) wins; otherwise the github URL from
+  // GITHUB_REPOSITORY + the worker's own token lane.
+  const originOverride = env.CC_TASKBRANCH_ORIGIN;
   const repo = env.GITHUB_REPOSITORY;
   const token = env.GH_TOKEN || env.GITHUB_TOKEN;
-  if (!repo || !token) throw new Error('task-branch push needs GH_TOKEN + GITHUB_REPOSITORY');
-  const url = `https://x-access-token:${token}@github.com/${repo}.git`;
+  const url = originOverride || (repo && token ? `https://x-access-token:${token}@github.com/${repo}.git` : null);
+  if (!url) throw new Error('artifact-push: needs GH_TOKEN + GITHUB_REPOSITORY (or CC_TASKBRANCH_ORIGIN)');
   const taskId = branch.startsWith('tasks/') ? branch.slice('tasks/'.length) : branch;
   const scratch = mkdtempSync(join(tmpdir(), 'cc-taskbr-'));
   const wc = join(scratch, 'wc');
@@ -508,7 +517,10 @@ export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
       if (co.status !== 0) throw fail('git checkout -b', co);
       log(`CC-TASKBRANCH-GENESIS ${branch} from main (branch was absent — clone stderr: ${String(clone.stderr).trim().slice(0, 120)})`);
     }
-    // copy the door-allowed set from the workdir (m-4: the allowed pathspecs ONLY)
+    // copy the door-allowed set from the workdir (m-4: the allowed pathspecs
+    // ONLY). W-C2-R (F8): a declared-but-unwritten path ESCALATES — the read-
+    // back's job is to catch it, but failing HERE with a precise message is
+    // strictly better than pushing a partial tree (the old silent drop).
     const committed = [];
     const sizes = {};
     for (const rel of allowed) {
@@ -519,25 +531,40 @@ export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
         copyFileSync(src, dst);
         sizes[rel] = statSync(src).size;
         committed.push(rel);
-      } catch { /* declared-but-unwritten path — the read-back catches it; the door filtered violations already */ }
+      } catch {
+        throw new Error(`artifact-push: declared-but-unwritten path ${rel} (the turn did not produce a file it declared — infra class, net-zero retry)`);
+      }
     }
     if (!committed.length) throw new Error('artifact-push: no door-allowed file exists in the workdir (the turn wrote nothing it declared)');
     const add = git(['add', '--', ...committed]);
     if (add.status !== 0) throw fail('git add', add);
-    const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
-      'commit', '-m', `task/${taskId}: artifacts`]);
-    if (commit.status !== 0) throw fail('git commit', commit);
-    const push = git(['push', 'origin', `HEAD:refs/heads/${branch}`]);
-    if (push.status !== 0) throw fail('git push', push);
+    // W-C2-R (L2-4): a byte-identical re-attempt (the report was lost after a
+    // successful push — the crash-between-side-effect-and-report class) stages
+    // NOTHING: `git commit` would rc=1 "nothing to commit" and a DONE turn
+    // would escalate infra_failed → a FALSE QUARANTINE of fully-landed work.
+    // The diff probe decides: identical tree → skip commit+push, the read-back
+    // below still verifies the tip against the declared set.
+    const staged = git(['diff', '--cached', '--quiet']);
+    let identical = false;
+    if (staged.status === 0) {
+      identical = true;
+      log(`CC-TASKBRANCH-IDENTICAL (the branch tip already carries exactly the declared set — crash-recovery re-attempt; no new commit)`);
+    } else {
+      const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
+        'commit', '-m', `task/${taskId}: artifacts`]);
+      if (commit.status !== 0) throw fail('git commit', commit);
+      const push = git(['push', 'origin', `HEAD:refs/heads/${branch}`]);
+      if (push.status !== 0) throw fail('git push', push);
+    }
     // the REMOTE TIP read-back — never trust the green rc alone
     const fetch = git(['fetch', '--depth', '1', 'origin', branch]);
     if (fetch.status !== 0) throw fail('git fetch (read-back)', fetch);
     const ls = git(['ls-tree', '-r', '--long', 'FETCH_HEAD']);
     if (ls.status !== 0) throw fail('git ls-tree (read-back)', ls);
-    const vr = verifyReadBack({ committed, sizes, tip: parseLsTree(ls.stdout) });
+    const vr = verifyReadBack({ allowed, committed, sizes, tip: parseLsTree(ls.stdout) });
     if (!vr.ok) throw new Error(vr.err);
-    log(`CC-TASKBRANCH-PUSHED ${committed.length} file(s) -> ${branch} (remote tip read-back verified)`);
-    return { ok: true, branch, committed };
+    log(`CC-TASKBRANCH-PUSHED ${committed.length} file(s) -> ${branch} (remote tip read-back verified${identical ? ' — identical re-attempt' : ''})`);
+    return { ok: true, branch, committed, ...(identical ? { identical: true } : {}) };
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
