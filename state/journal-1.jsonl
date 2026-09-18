@@ -127,3 +127,5 @@
 {"id":"e127","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"TIMEOUT","task":"T-205","from":"assigned","to":"quarantined"}
 {"id":"e128","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"PRUNE","task":"T-208","from_status":"done"}
 {"id":"e129","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"MILESTONE","milestone":3,"tasks":[{"id":"T-301","title":"impl: integration","behavior":"succeed","work_ms":4000,"deps":[]},{"id":"T-302","title":"review: final","behavior":"succeed","work_ms":3000,"deps":["T-301"]}]}
+{"id":"e130","ts":"2026-09-18T05:45:47.471Z","applied":true,"kind":"TICK","seq":50,"actor":"chain"}
+{"id":"e131","ts":"2026-09-18T05:45:47.471Z","applied":true,"kind":"ASSIGN","task":"T-301","from":"ready","to":"assigned","lease":"l-9f90bbef21ce","expires":"2026-09-18T05:49:47.471Z","attempt":1,"behavior":"succeed","task_ref":{"kind":"state-task","id":"T-301"}}
