@@ -206,8 +206,10 @@ export function statusSummary({ state, depths = {}, nowMs = null }) {
 // runConsole({ event, env, api, store, now }) -> { outcome, exitCode }
 //
 //   event  the parsed github.event (issue_comment created payload)
-//   env    { REPO?, OPS_ISSUE?, TOKEN? }  (main() wires process.env)
+//   env    { REPO?, OPS_ISSUE? }  (main() wires process.env; the token
+//          NEVER crosses this seam — the api closure owns the credential)
 //   api    async (path, method, body) -> { status, data }  — the REST seam
+//          (comments, the permission gate, the nudge dispatch)
 //   store  the Store-like seam: { fetch, readState, readControlQueue,
 //          readIntakeQueue, readQueue, enqueueControl }
 //   now    () -> ISO string (the clock seam)

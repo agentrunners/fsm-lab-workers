@@ -66,6 +66,16 @@ EXISTING ids for node_id-less records).
 - D7 — note on console queue records: null (no note syntax in the comment
   surface; the actor field already answers "who"; keeps F-1's twin-guard
   semantics identical to the ops/turn.mjs lane).
+- D8 — mutation-checked pins (the 17-R2b discipline): the F-12 edit pinned
+  in BOTH directions (mint-unconditionally → the baseline pin fails;
+  mint-never → the round-trip pins fail); the record's node_id threading
+  and the scope gate each caught by their pins. Four mutations, four
+  catches, zero blind spots found.
+- D9 — reply/nudge order: enqueue → reply → nudge (the ack reaches the
+  operator before the 20s-nudge timeout can delay it; a failed REPLY
+  returns exit 2 without attempting the nudge — the queue line holds and
+  the backstop/pinger still drains it, and a failing comments API makes
+  the nudge's success unlikely anyway).
 
 ## Milestones
 
@@ -88,7 +98,10 @@ EXISTING ids for node_id-less records).
 - [x] tests/test-console.mjs written — 32/32 green; FULL suite 360/360
       (328 baseline + 32 new); sims 8/8 + 7/7 + 31/31 + 51/51;
       scripts/validate.sh VALIDATE-OK (YAML gate OK on ops-console.yml).
-- [ ] Branch pushed, report + worklog finalized.
+- [x] Mutation checks: 4 mutations (mint-always, mint-never, record-loses-
+      node_id, scope-gate-removed) — all 4 caught by the pins.
+- [x] Branch pushed (origin/t46/wc2-console), 4 commits.
+- [x] Report + worklog finalized.
 
 ## Open questions (for the reviewer / orchestrator)
 
