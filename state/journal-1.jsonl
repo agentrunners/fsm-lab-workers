@@ -54,3 +54,8 @@
 {"id":"e54","ts":"2026-09-18T05:28:49.130Z","applied":true,"kind":"TICK","seq":22,"actor":"chain"}
 {"id":"e55","ts":"2026-09-18T05:28:49.130Z","applied":true,"kind":"PRUNE","task":"T-101","from_status":"done"}
 {"id":"e56","ts":"2026-09-18T05:28:49.130Z","applied":true,"kind":"PRUNE","task":"T-107","from_status":"done"}
+{"id":"e57","ts":"2026-09-18T05:29:32.188Z","applied":true,"kind":"TICK","seq":23,"actor":"chain"}
+{"id":"e58","ts":"2026-09-18T05:29:32.188Z","applied":true,"kind":"TIMEOUT","task":"T-108","from":"assigned","to":"quarantined"}
+{"id":"e59","ts":"2026-09-18T05:29:32.188Z","applied":true,"kind":"PRUNE","task":"T-102","from_status":"done"}
+{"id":"e60","ts":"2026-09-18T05:29:32.188Z","applied":true,"kind":"PRUNE","task":"T-103","from_status":"done"}
+{"id":"e61","ts":"2026-09-18T05:29:32.188Z","applied":true,"kind":"PRUNE","task":"T-104","from_status":"done"}
