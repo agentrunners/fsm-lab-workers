@@ -123,3 +123,7 @@
 {"id":"e123","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"TICK","seq":48,"actor":"chain"}
 {"id":"e124","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"PRUNE","task":"T-203","from_status":"done"}
 {"id":"e125","ts":"2026-09-18T05:44:42.168Z","applied":true,"kind":"PRUNE","task":"T-206","from_status":"done"}
+{"id":"e126","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"TICK","seq":49,"actor":"chain"}
+{"id":"e127","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"TIMEOUT","task":"T-205","from":"assigned","to":"quarantined"}
+{"id":"e128","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"PRUNE","task":"T-208","from_status":"done"}
+{"id":"e129","ts":"2026-09-18T05:45:15.155Z","applied":true,"kind":"MILESTONE","milestone":3,"tasks":[{"id":"T-301","title":"impl: integration","behavior":"succeed","work_ms":4000,"deps":[]},{"id":"T-302","title":"review: final","behavior":"succeed","work_ms":3000,"deps":["T-301"]}]}
