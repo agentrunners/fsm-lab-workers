@@ -33,3 +33,4 @@
 {"id":"e33","ts":"2026-09-18T05:20:45.076Z","applied":true,"kind":"TIMEOUT","task":"T-108","from":"assigned","to":"ready"}
 {"id":"e34","ts":"2026-09-18T05:20:45.076Z","applied":true,"kind":"ASSIGN","task":"T-108","from":"ready","to":"assigned","lease":"l-ff5ab152f930","expires":"2026-09-18T05:24:45.076Z","attempt":2,"behavior":"slow","task_ref":{"kind":"state-task","id":"T-108"}}
 {"id":"e35","ts":"2026-09-18T05:21:19.478Z","applied":true,"kind":"TICK","seq":9,"actor":"chain"}
+{"id":"e36","ts":"2026-09-18T05:21:52.821Z","applied":true,"kind":"TICK","seq":10,"actor":"chain"}
