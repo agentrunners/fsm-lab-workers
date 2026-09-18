@@ -1,0 +1,64 @@
+# fsm-ops-console — the OPS CONSOLE (T46/W-C2 lane C, §6): the comment-
+# command surface on the ops issue. `pause` on issue #1 becomes a control
+# queue line (the git-CAS lane) + a conductor nudge — applied within
+# seconds; `status` gets a read-only one-screen reply. Trigger:
+# issue_comment[created] ONLY.
+#
+# SECURITY CONTRACT (F-13 + the F-2 per-workflow form):
+#   - GITHUB_TOKEN ONLY (`github.token`) — NO secrets.* anywhere in this
+#     workflow. The console's reply comments and its fsm-tick nudge are
+#     GITHUB_TOKEN-authored: issue_comment events created by GITHUB_TOKEN
+#     NEVER fire workflows (the platform law) — the console cannot wake
+#     ITSELF, anti-recursion BY CONSTRUCTION (F-13). The nudge's
+#     repository_dispatch still wakes the conductor (X1a: dispatch events
+#     are the law's stated exception — see ops/console.mjs).
+#   - In-run fail-closed gates (GitHub has no pre-job gate): ONLY the OPS
+#     issue (m-8: the LOAD-BEARING repo variable `vars.OPS_ISSUE`, default
+#     '1' — if the ops issue ever moves, the variable MUST be set or the
+#     console goes silent), then bot/parse pre-passes (zero API), then the
+#     author permission gate (≥ write; strangers exit 0 silently — a
+#     stranger's comment on a public repo must not burn a reply).
+#   - permissions: least privilege — issues:write (the console's replies) +
+#     contents:write. NOTE (the F-2a amendment class, documented deviation
+#     from the brief's `contents: read`): the command path enqueues via
+#     store.enqueueControl — a git CAS PUSH to fsm-state — and the nudge
+#     POSTs a repository_dispatch; both need contents:write. The intake
+#     door hit the identical wall (see intake.yml's F-2a note).
+name: fsm-ops-console
+
+run-name: "console · #${{ github.event.issue.number }} ${{ github.event.action }}"
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # OWN group — never contends with the hot conductor chain (the live
+  # discovery: external dispatches into a busy group get newest-wins-
+  # cancelled). Comments queue behind each other harmlessly.
+  group: fsm-ops-console
+  cancel-in-progress: false
+
+permissions:
+  issues: write    # the console's replies (ack / reject / the status screen)
+  contents: write  # the control-queue CAS push (F-2a class) + the nudge dispatch
+
+jobs:
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ops console
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ toJSON(github.event) }}
+          # F-13: the JOB token — the console's ONLY credential (never a
+          # PAT; test-pinned by the no-recursion source shape)
+          GH_TOKEN: ${{ github.token }}
+          # m-8 (LOAD-BEARING): the ops issue number as a repo VARIABLE —
+          # default '1'. The scoping gate maps this into the console; unset
+          # or wrong → the console is silent on every issue (fail-closed).
+          OPS_ISSUE: ${{ vars.OPS_ISSUE || '1' }}
+        run: node ops/console.mjs
