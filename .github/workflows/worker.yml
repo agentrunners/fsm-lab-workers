@@ -126,16 +126,19 @@ jobs:
           # report enqueues before the SIGTERM). Keep in sync with
           # timeout-minutes above.
           WORKER_TTL_MIN: '50'
-          # T46/W-B §1c: MODE=real model chain head (OPTIONAL repo variable —
-          # empty/absent = the free-lane defaults in worker/turn.mjs; the
-          # chain is [this, dots-studio/dots-3-note-preview:free,
-          # nvidia/nemotron-3-ultra-550b-a55b:free, cohere/north-mini-code:free]
-          # with ONE fallback hop on infra-class failure).
+          # T46/W-B §1c + W-D D1: MODE=real model chain head (OPTIONAL repo
+          # variable — empty/absent = the free-lane defaults in worker/
+          # turn.mjs; the chain is [this, nvidia/nemotron-3.5-lightning:free,
+          # deepseek/deepseek-v4-flash-0731:free, cohere/north-mini-code:free]
+          # with ONE fallback hop on infra-class failure. D1 retired the old
+          # dots-studio head (0% content at the production shape) and
+          # nemotron-3-ultra (p95 32s + the 30s burst-wall class).
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || '' }}
           # T46/W-D (D3 + B1): MODE=real key pool — comma-joined free-tier OR
           # keys (secret, registry order). Non-empty pool => the real lane's
-          # key is pool[fnv1a(task_id) % pool.length] with quota-class (429)
-          # rotation per hop (M5, worker/turn.mjs); OPENROUTER_API_KEY stays
+          # key is pool[fnv1a(task_id) % pool.length] with rotate-class (429
+          # quota + 401/402 dead-key) rotation per hop (M5 + the W-D review
+          # fold, worker/turn.mjs); OPENROUTER_API_KEY stays
           # the cc/paid lane's primary (the pool serves the FREE lane only).
           # Empty/absent = today's single-key behavior, bit-for-bit.
           OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}

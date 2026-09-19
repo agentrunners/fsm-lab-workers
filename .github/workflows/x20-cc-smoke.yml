@@ -12,8 +12,9 @@
 # (rate-limited, best-effort models) — the ceiling claim must say so.
 #
 # Secrets needed (fsm-lab repo): OPENROUTER_API_KEY (primary lane).
-# Optional vars: CC_MODEL (model slug; default dots-studio free), CC_VERSION
-# (CLI pin; default latest).
+# Optional vars: CC_MODEL (model slug; default deepseek/deepseek-v4.1-flash —
+# CC_MODEL_CHAIN_DEFAULTS' head, T46/W-D D2; the old dots-studio default is
+# retired), CC_VERSION (CLI pin; default latest).
 name: x20-cc-smoke
 
 on:

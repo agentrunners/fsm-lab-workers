@@ -127,3 +127,34 @@ rendering (shape pin), realWork per-hop (fixture).
 MINOR folds: capacity arithmetic reconciled (~7,550 free-lane/day = 71×50 + 3×1000, paid lanes excluded); D1 line-cite corrected (realWork payload at turn.mjs:143); D3's hash scope = task_ref.id string; the console window is 64 journal records (documented limit); the real lane REPORTS its key_index (drain carries it per M4).
 
 Lane map (updated): A ✅ BUILT (t46/wd-a @ 4a09f68, 413/413). B = D4 with M2/M3/M4 amendments (bridge JSONL + adapter aggregation + allowlist + drain + console). C = D3 with B1/M5/M6 amendments (workflow env line + hash+attempt rotation + denylist + pins). Integration also folds the pre-existing conformance-cc acceptEdits argv drift (25/26 on main — 1-line fix, 19-d's handoff).
+
+---
+
+## v3 FOLD (session 20, the 2-lens review round over t46/wd-int @ de9ebb2; reports: /home/z/lab-s20-wd-review2.md + /home/z/lab-s20-wd-review3.md — 0 BLOCKING / 4 MAJOR / 3 MINOR + 0 / 0 / 3)
+
+**M5 amendment — the IMPLEMENTED form (supersedes the v2 paragraph above):** within-turn
+rotation on the ROTATE class — `key_index = (fnv1a(task_id) + rotation_retries) %
+pool.length`, where `rotation_retries` counts THIS turn's prior hops that answered 429
+(quota: free-models-per-day) OR **401/402 (dead key: revoked/invalid/credits-dead)**.
+The v2 cross-turn `infra_attempt` threading was never implemented (infra_attempts does
+not ride the dispatch envelope — `assembleDispatchPayload` mints only the WORK attempt)
+and remains the named D3 follow-up at the fsm/conductor seam. With 401/402 rotating,
+a dead pool key no longer quarantine-kills every task hashed onto it (hop 2 recovers
+on a healthy key), and `isQuotaDetail` is narrowed to the quota shape (`lane-429` / the
+error-as-answer rate-limit marker) so dead-key/5xx/transport exhaustions can no longer
+arm the F-6 budget-pause (lens-1 F2: the false budget-pause on a non-quota cause —
+the W-C1 "stop-burn is flavor-agnostic" letter is superseded; the dead-key remedy is a
+pool-secret swap, not a quota wait).
+
+The fold also landed: bridge-lane.jsonl untracked + .gitignore + tmp-path lane logs in
+every test spawn (lens-1 F1 — gates leave the worktree provably clean); the two lane_stats
+glue pins the code comments already promised (lens-1 F4 — the runTurn/laneLogPath
+fixture pin + the startBridge env-wiring pin); `pool_size` rides beside `key_index`
+through the composer + the drain (lens-2 F1 — the journaled slot is self-describing);
+`readJournalTail(n, kind)` + the console LANE section sourced from the journal tail
+(lens-2 F2 + lens-1 F3's named half — the durable source that survives pruning and
+rebuild); the per-key `::add-mask::` step in worker.yml (lens-2 F3). Known residuals
+(named, not folded): the console's p50/p95 are percentiles of per-record p50s (a
+median-of-medians label — lens-1 F3's sub-point); hop_telemetry rows and the key_index
+histogram are not yet rendered in the LANE section; the deploy-order runbook line for
+the D2 or-074 swap (lens-1 F5) is an operator step.
