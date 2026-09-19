@@ -295,14 +295,17 @@ matrix.push(await matrixRow({
   const argvOk = eq(JSON.stringify(echo.argv), JSON.stringify([
     '-y', '@anthropic-ai/claude-code@2.1.273',   // M-4: the pinned default
     '-p', 'boundary probe',
+    // T46/X22 (live finding, run 35297656079): acceptEdits — the adapter's
+    // designed shape since the X22 fix; this pin predated it (the drift).
+    '--permission-mode', 'acceptEdits',
     '--max-turns', '11',
     '--output-format', 'json',
     '--disallowedTools', 'WebFetch,WebSearch',
   ]));
   const envOk = eq(echo.env.ANTHROPIC_BASE_URL, 'https://openrouter.ai/api/v1')
     && eq(echo.env.ANTHROPIC_AUTH_TOKEN, KEY1)
-    && eq(echo.env.ANTHROPIC_MODEL, 'dots-studio/dots-3-note-preview:free')
-    && eq(echo.env.ANTHROPIC_SMALL_FAST_MODEL, 'dots-studio/dots-3-note-preview:free')
+    && eq(echo.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash')
+    && eq(echo.env.ANTHROPIC_SMALL_FAST_MODEL, 'deepseek/deepseek-v4.1-flash')
     && eq(echo.env.DISABLE_TELEMETRY, '1')
     && eq(echo.env.OX_AGENT_DEADLINE_UTC, new Date(dl).toISOString())
     && eq(echo.env.OX_AGENT_TASK_ID, 'CF1');
@@ -332,7 +335,7 @@ matrix.push(await matrixRow({
   // the bridge-mode merged env (pure — fake mode cannot spawn the bridge by
   // design): the CLI aims at the bridge holding ONLY the dummy token
   const merged = ccChildEnv({ ...fakeEnv, PATH: '/usr/bin:/bin' },
-    { key: KEY1, keyIndex: 1, model: 'dots-studio/dots-3-note-preview:free' },
+    { key: KEY1, keyIndex: 1, model: 'deepseek/deepseek-v4.1-flash' },
     mkEnvelope(), { CC_BRIDGE_URL: 'http://127.0.0.1:45678' });
   const dead = ['OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN', 'GL_PAT']
     .every(k => !(k in merged));
@@ -365,8 +368,8 @@ matrix.push(await matrixRow({
   }), { keepRoots: true });
   const e2 = readEcho(roots, 1);
   const e4 = readEcho(roots, 3);
-  const lane2Rotated = eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY1) && eq(e2.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3-ultra-550b-a55b:free');
-  const keyRotated = eq(e4.env.ANTHROPIC_AUTH_TOKEN, KEY2) && eq(e4.env.ANTHROPIC_MODEL, 'dots-studio/dots-3-note-preview:free');
+  const lane2Rotated = eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY1) && eq(e2.env.ANTHROPIC_MODEL, 'z-ai/glm-5.3-flash');
+  const keyRotated = eq(e4.env.ANTHROPIC_AUTH_TOKEN, KEY2) && eq(e4.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
   const recovered = eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 4);
   check('rotation: lane 2 shows the rotated MODEL; lane 4 the rotated KEY; the turn recovers',
     lane2Rotated && keyRotated && recovered,

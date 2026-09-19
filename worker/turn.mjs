@@ -82,13 +82,17 @@ export function sleepCapMs(env = process.env) {
 // seam; one OpenRouter completion stands in for a CC turn), on the
 // env-driven model chain.
 //
-// The chain: [OPENROUTER_MODEL env (optional), dots-studio (the re-armed
-// free lane), nemotron, cohere] — the RETIRED minimax/minimax-m3:free slug
-// (live 404, 46-A4) is gone. On an INFRA-class lane failure (transport /
-// 401 / 402 / 429 / 5xx — lane/key state, operator action) the turn hops ONCE
-// to the next model, bounded by budget.lane_attempts (lane_attempts 1 = no
-// hop). WORK-class failures (empty completion, deterministic 4xx) do NOT
-// hop — the lane answered; rotating it cannot change the answer.
+// The chain (T46/W-D §D1): [OPENROUTER_MODEL env (optional), nemotron-3.5,
+// deepseek-v4-flash, cohere] — the s19 eval verdict. dots-studio demoted OUT
+// (0% content at the production max_tokens — reasoning eats the budget) and
+// nemotron-3-ultra demoted to never (p95 32s + 30s burst walls, the exact
+// upstream-rate-limit "long container wait" class). The RETIRED
+// minimax/minimax-m3:free slug (live 404, 46-A4) stays gone. On an INFRA-class
+// lane failure (transport / 401 / 402 / 429 / 5xx — lane/key state, operator
+// action) the turn hops ONCE to the next model, bounded by
+// budget.lane_attempts (lane_attempts 1 = no hop). WORK-class failures (empty
+// completion, deterministic 4xx) do NOT hop — the lane answered; rotating it
+// cannot change the answer.
 //
 // Returns the RAW lane result (pre-normalization — runTurn's single
 // classifyOutcome call is the one normalizer):
@@ -99,8 +103,8 @@ export function sleepCapMs(env = process.env) {
 // ---------------------------------------------------------------------------
 
 export const REAL_MODEL_CHAIN_DEFAULTS = [
-  'dots-studio/dots-3-note-preview:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'nvidia/nemotron-3.5-lightning:free',
+  'deepseek/deepseek-v4-flash-0731:free',
   'cohere/north-mini-code:free',
 ];
 
@@ -109,49 +113,139 @@ export function realModelChain(env = process.env) {
   return [...custom, ...REAL_MODEL_CHAIN_DEFAULTS];
 }
 
+// ---------------------------------------------------------------------------
+// T46/W-D (D3 + the v2 fold B1/M5/M6) — the OR KEY POOL: the real lane's
+// FREE-tier key rotation.
+//
+// env.OPENROUTER_KEY_POOL (ONE env line in worker.yml's "Work the task"
+// block — B1) = comma-joined free-tier keys (registry order; the secret
+// carries only the values). KEY PRECEDENCE (the design's rule, stated at
+// the pick site in realWork): pool keys serve THE REAL LANE — the free
+// chain above; the primary secret OPENROUTER_API_KEY stays the CC/PAID
+// lane's key (worker/cc-adapter.mjs's key pool reads it — untouched here).
+// Empty pool -> today's behavior, bit-for-bit.
+//
+// The pick is hash-stable per task (idempotent re-dispatches reuse the same
+// key; load spreads across accounts) and rotates on the QUOTA + DEAD-KEY
+// classes (M5 + the W-D review fold, lens-1 F2): a 429/401/402 hop advances
+// the pool slot by one for the next hop, bounded by the hop budget. The pool
+// secret itself joins the cc adapter's CC_ENV_DENYLIST (M6) — the CLI child
+// env never sees the 73 keys.
+// ---------------------------------------------------------------------------
+
+// comma-split, trim, drop empties. NO dedup (the registry's order is the
+// operator's; a duplicated value doubles that key's weight — visible in
+// pool_size, fixable at the secret).
+export function keyPool(env = process.env) {
+  const raw = typeof env.OPENROUTER_KEY_POOL === 'string' ? env.OPENROUTER_KEY_POOL : '';
+  return raw.split(',').map((k) => k.trim()).filter((k) => k !== '');
+}
+
+// FNV-1a, 32-bit, unsigned — the stable string hash for the deterministic
+// pick (the published test vectors are pinned in tests/test-key-pool.mjs;
+// Math.imul keeps the multiply in uint32 space, >>> 0 keeps the modulo
+// non-negative on every platform).
+export function fnv1a(str) {
+  const s = String(str);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 const isInfraStatus = (st) => st === 401 || st === 402 || st === 429 || (typeof st === 'number' && st >= 500);
 
 export async function realWork(envelope, { env = process.env, fetchImpl = fetch } = {}) {
   const chain = realModelChain(env);
   // ONE fallback hop, bounded by the lane budget and the chain's length
   const maxTries = Math.min(chain.length, Math.max(1, Math.min(2, envelope.budget.lane_attempts)));
-  const key = env.OPENROUTER_API_KEY;
+  // T46/W-D D3 — THE KEY PICK. Pool non-empty => the real lane's key is
+  //   pool[(fnv1a(task_ref.id) + rotation_retries) % pool.length]:
+  //   - hash-stable per task id (idempotent re-dispatches reuse the same
+  //     key; the free-lane daily budget spreads across accounts);
+  //   - M5 rotation: rotation_retries counts THIS turn's prior hops in the
+  //     ROTATE class — 429 (the quota family: free-models-per-day) AND
+  //     401/402 (the dead-key family: revoked/invalid/credits-dead — the KEY
+  //     is the problem, so re-aiming it burns the turn's remaining hops;
+  //     rotating lets the fallback hop recover on a healthy key). The W-D
+  //     review fold (lens-1 F2) widened M5 from the 429-only form: a dead
+  //     pool key deterministically quarantine-killed every task hashed onto
+  //     it. 5xx/transport (upstream health, not key health) do NOT rotate.
+  //     The FSM's cross-turn infra_attempts does NOT ride the dispatch
+  //     envelope (the ASSIGN action and assembleDispatchPayload mint only the
+  //     WORK attempt, which infra-retry voids net-zero — lib/fsm.mjs's
+  //     infra-retry transition), so the reachable retry context is the
+  //     turn's own hop ladder — the 19-c amendment's primary variant ("rotate
+  //     the key within the turn"), widened to the rotate class by the fold.
+  //   - PRECEDENCE: pool keys serve THIS free lane only; the primary secret
+  //     OPENROUTER_API_KEY stays the cc/paid lane's key (cc-adapter's pool).
+  //     Empty pool => env.OPENROUTER_API_KEY serves this lane too (today's
+  //     behavior, bit-for-bit).
+  const pool = keyPool(env);
+  const taskHash = fnv1a(String(envelope.task_ref?.id ?? ''));
+  let rotationRetries = 0;
+  let keyIndex = -1;   // the pool slot serving the current hop (set on pick)
+  const laneKey = () => {
+    if (pool.length === 0) return env.OPENROUTER_API_KEY;
+    keyIndex = (taskHash + rotationRetries) % pool.length;
+    return pool[keyIndex];
+  };
   const t0 = Date.now();
   const models = [];
+  // T46/W-D §D4-G5 (the real-lane half): per-hop {model, ms, status} — the
+  // per-hop latency the 19-b logging audit found missing. OPTIONAL field on
+  // the raw lane return (the report/drain fold is lane B's t46/wd-b).
+  const hopTelemetry = [];
   const finish = (raw) => ({
     ...raw,
     models: [...models],
     lane_attempts_used: models.length,
+    hop_telemetry: hopTelemetry.map(h => ({ ...h })),
     telemetry: { turns: 1, wall_ms: Date.now() - t0, lane_attempts_used: models.length },
     duration_ms: Date.now() - t0,
+    // D3 (v2 minor fold): the real lane REPORTS its pool slot — the 0-based
+    // array index of the key that served the turn's last hop (the burned
+    // slot on lane-exhaustion). Absent when the pool is empty (the legacy
+    // result shape stays bit-for-bit). Reaching the REPORT payload is lane
+    // B's M4 allowlist fold (composeReportOutcome), not this lane's.
+    ...(pool.length > 0 ? { key_index: keyIndex, pool_size: pool.length } : {}),
   });
 
   for (let i = 0; i < maxTries; i++) {
     const model = chain[i];
     models.push(model);
+    const hopT0 = Date.now();
     let r;
     try {
       r = await fetchImpl('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${laneKey()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
           messages: [
             { role: 'system', content: 'You are a task worker. Reply with a one-line result summary.' },
             { role: 'user', content: `Task ${envelope.task_ref.id}: ${envelope.prompt}` },
           ],
-          max_tokens: 64,
+          // T46/W-D §D1: 64 starved every reasoning-style model (content:null
+          // → work_failed 'empty-completion' churn that looked like model
+          // failure); 512 is the measured 100%-content shape on the new chain
+          // (free models cost nothing extra; ~$0.0001 on paid).
+          max_tokens: 512,
         }),
         signal: AbortSignal.timeout(150_000),  // bounded: the lease is the semantic backstop, not the hang
       });
     } catch (e) {
       // transport throw (AbortSignal timeout / DNS / socket) — infra class
+      hopTelemetry.push({ model, ms: Date.now() - hopT0, status: 'transport' });
       if (i === maxTries - 1) {
         return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last lane-transport)` });
       }
       continue;
     }
     const d = await r.json().catch(() => ({}));
+    hopTelemetry.push({ model, ms: Date.now() - hopT0, status: r.status });
     const content = d?.choices?.[0]?.message?.content || null;
     if (r.status === 200) {
       // done / empty-completion — both terminal for the turn (the lane
@@ -159,6 +253,12 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
       return finish(content ? { content: String(content) } : { content: null });
     }
     if (isInfraStatus(r.status)) {
+      // M5 (the W-D review fold, lens-1 F2): the ROTATE class advances the
+      // pool slot for the next hop — 429 (quota) AND 401/402 (dead key: the
+      // key itself is the problem; the fallback hop recovers on the NEXT
+      // key instead of burning on the same dead one). 5xx/transport stay
+      // key-stable (upstream health, not key health).
+      if (r.status === 429 || r.status === 401 || r.status === 402) rotationRetries += 1;
       if (i === maxTries - 1) {
         return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last lane-${r.status})` });
       }
@@ -224,12 +324,27 @@ async function ccWork(envelope, opts = {}) {
 // contract extras. The FSM receiver reads outcome.status / .artifact /
 // .error (journal text) / .duration_ms; telemetry + artifact_refs + models
 // ride along for the audit (extra keys are ignored by the receiver).
+//
+// T46/W-D lane B (§D4-M4, the v2 fold): lane telemetry JOINS the allowlist —
+//   lane_stats      the cc adapter's bridge-JSONL aggregate (M2)
+//   key_index       D3's pool pick (lane C's real-lane producer lands there;
+//   pool_size       the pick's modulo base — rides EXACTLY like key_index
+//                   (W-D review fold A4, lens-2 F1): the journal's key_index
+//                   is an index into the pool ARRAY; without pool_size the
+//                   historical slots are ambiguous across pool redeploys
+//                   (the registry's git history was the only recovery)
+//   hop_telemetry   lane A's real-lane per-hop [{model, ms, status}])
+// Without these entries the adapter's richest data dies HERE — the exact
+// silent-drop class W-C2's prCandidates taught (M4's whole point: this
+// composer is the first named drop point between the adapter and the drain).
+// Exported for the direct pins; the SEAM pin (a lane_stats-carrying turn →
+// the enqueued report payload) lives in the routing suite.
 // ---------------------------------------------------------------------------
 
 const SLICE = 200;
 const slice = (s) => String(s).slice(0, SLICE);
 
-function composeReportOutcome(classified, raw, durationMs) {
+export function composeReportOutcome(classified, raw, durationMs) {
   const outcome = { status: classified.status };
   if (classified.detail !== undefined && classified.detail !== null) outcome.error = slice(classified.detail);
   if (classified.status === 'done') {
@@ -243,6 +358,17 @@ function composeReportOutcome(classified, raw, durationMs) {
   if (raw?.telemetry && typeof raw.telemetry === 'object') outcome.telemetry = raw.telemetry;
   if (Array.isArray(raw?.models) && raw.models.length) outcome.models = raw.models;
   if (Number.isFinite(durationMs)) outcome.duration_ms = durationMs;
+  // T46/W-D lane B (M4): the lane telemetry pass-through — object/array
+  // guards only, NEVER sliced (lane_stats is the aggregate; slicing it here
+  // would silently corrupt the console's source)
+  if (raw?.lane_stats && typeof raw.lane_stats === 'object' && !Array.isArray(raw.lane_stats)) {
+    outcome.lane_stats = raw.lane_stats;
+  }
+  if (Number.isFinite(raw?.key_index)) outcome.key_index = raw.key_index;
+  // W-D review fold (A4, lens-2 F1): the pool's SIZE rides beside the pick —
+  // the pair is the self-describing slot (index + modulo base) in the journal.
+  if (Number.isFinite(raw?.pool_size)) outcome.pool_size = raw.pool_size;
+  if (Array.isArray(raw?.hop_telemetry) && raw.hop_telemetry.length) outcome.hop_telemetry = raw.hop_telemetry;
   return outcome;
 }
 
@@ -263,7 +389,7 @@ function appendStepSummary(path, text) {
 export async function runTurn({
   cp, runId = 'local', runAttempt = '1',
   env = process.env, fetchImpl = fetch, enqueue, sleepImpl = sleep, now = Date.now,
-  log = console.log, stepSummaryPath = null,
+  log = console.log, stepSummaryPath = null, laneLogPath = null,
 }) {
   const t0 = now();
   const eventId = reportEventId({ runId, attempt: runAttempt });
@@ -315,9 +441,13 @@ export async function runTurn({
       // allowRoot (envelopeFromDispatch unwraps ox → cp.artifacts → the
       // envelope). The adapter's write-back door + task-branch push consume
       // them; mock/real lanes never see them (the §4c skip).
+      // T46/W-D lane B: laneLogPath forwards (the seam pin injects a
+      // pre-written bridge-lane JSONL — the aggregation attach without a
+      // spawned bridge; production takes the adapter's turn-scoped default).
       raw = await ccWork(envelope, {
         env, runId, now, log,
         allowRoot: Array.isArray(envelope.artifacts) ? envelope.artifacts : [],
+        ...(typeof laneLogPath === 'string' && laneLogPath !== '' ? { laneLogPath } : {}),
       });
     } catch (e) {
       if (e instanceof AdapterNotShipped) {

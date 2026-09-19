@@ -1,0 +1,12 @@
+# T46/W-D review fold (A2, lens-1 F1): the repo's first .gitignore.
+#
+# bridge-lane.jsonl — the cc bridge's STANDALONE default lane log (worker/
+# cc-bridge.mjs falls back to <cwd>/bridge-lane.jsonl when BRIDGE_LANE_LOG is
+# unset). The file was committed once as pure gate residue and every gate run
+# appended to it (the dirty-worktree generator inside the repo's own validate
+# gate): untracked now, tests spawn the bridge with BRIDGE_LANE_LOG aimed at
+# a tmp path, and this entry keeps any interactive standalone debugging write
+# out of git status.
+bridge-lane.jsonl
+node_modules/
+*.log

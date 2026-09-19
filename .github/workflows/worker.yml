@@ -93,6 +93,25 @@ jobs:
             echo "INSTALL-SKIPPED mode=$MODE (non-cc dispatch — no CC CLI needed)"
           fi
 
+      - name: Mask the key-pool secrets (per split key)
+        # T46/W-D review fold (A5, lens-2 F3): GitHub auto-masks only the
+        # JOINED secret string — the ~68 individual pool keys would render in
+        # cleartext if any future log/error/tool output ever quoted ONE key.
+        # Registering a mask per key (defense-in-depth at the workflow layer;
+        # the denylist prevents env INHERITANCE, not log ECHO) makes any
+        # future single-key appearance render as ***. Fails harmless on an
+        # empty pool (var unset / secret absent). The values themselves are
+        # never echoed — only the ::add-mask:: registration.
+        env:
+          POOL_RAW: ${{ secrets.OPENROUTER_KEY_POOL || '' }}
+        run: |
+          if [ -n "$POOL_RAW" ]; then
+            printf '%s\n' "$POOL_RAW" | tr ',' '\n' | while IFS= read -r k; do
+              k="$(printf '%s' "$k" | xargs)"
+              if [ -n "$k" ]; then echo "::add-mask::${k}"; fi
+            done
+          fi
+
       - name: Work the task
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -107,12 +126,22 @@ jobs:
           # report enqueues before the SIGTERM). Keep in sync with
           # timeout-minutes above.
           WORKER_TTL_MIN: '50'
-          # T46/W-B §1c: MODE=real model chain head (OPTIONAL repo variable —
-          # empty/absent = the free-lane defaults in worker/turn.mjs; the
-          # chain is [this, dots-studio/dots-3-note-preview:free,
-          # nvidia/nemotron-3-ultra-550b-a55b:free, cohere/north-mini-code:free]
-          # with ONE fallback hop on infra-class failure).
+          # T46/W-B §1c + W-D D1: MODE=real model chain head (OPTIONAL repo
+          # variable — empty/absent = the free-lane defaults in worker/
+          # turn.mjs; the chain is [this, nvidia/nemotron-3.5-lightning:free,
+          # deepseek/deepseek-v4-flash-0731:free, cohere/north-mini-code:free]
+          # with ONE fallback hop on infra-class failure. D1 retired the old
+          # dots-studio head (0% content at the production shape) and
+          # nemotron-3-ultra (p95 32s + the 30s burst-wall class).
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || '' }}
+          # T46/W-D (D3 + B1): MODE=real key pool — comma-joined free-tier OR
+          # keys (secret, registry order). Non-empty pool => the real lane's
+          # key is pool[fnv1a(task_id) % pool.length] with rotate-class (429
+          # quota + 401/402 dead-key) rotation per hop (M5 + the W-D review
+          # fold, worker/turn.mjs); OPENROUTER_API_KEY stays
+          # the cc/paid lane's primary (the pool serves the FREE lane only).
+          # Empty/absent = today's single-key behavior, bit-for-bit.
+          OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}
           # T46/W4 §1d (D2): MODE=cc lanes — the KEY POOL (secret #7 primary,
           # #6 secondary; empty/absent lanes are simply not in the pool) and
           # the model chain head (OPTIONAL repo variable CC_MODEL; empty = the

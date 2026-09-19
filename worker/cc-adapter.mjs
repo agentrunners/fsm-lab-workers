@@ -31,8 +31,12 @@
 //   OX_AGENT_TASK_ID=<task id>                        (the artifact namespace)
 //
 // THE LANE PICKER (D2): key pool [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2] ×
-// model chain [CC_MODEL, dots-studio:free, nemotron:free, cohere:free],
-// flattened KEY-MAJOR (every model on key 1 before key 2's first), bounded by
+// model chain [CC_MODEL, deepseek-v4.1-flash, glm-5.3-flash,
+// nemotron-3.5-lightning:free] (T46/W-D §D2: the s19 cc-lane eval verdict —
+// deepseek primary, glm fallback for provider diversity, nemotron the free
+// tail; deepseek-v4-flash-0731:free is NEVER on this lane — it hallucinated
+// the eval task, silent content-poison), flattened KEY-MAJOR (every model on
+// key 1 before key 2's first), bounded by
 // budget.lane_attempts (default 3). INFRA-class lane failure (401/402/429/5xx
 // text-as-answer, transport-shaped stderr, budget-misconfigured truncation)
 // → next lane. WORK-class (the CLI ran and answered: empty completion,
@@ -86,6 +90,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { classifyOutcome, writeBackDoor } from '../lib/worker-contract.mjs';
+import { collectLaneStats } from './lane-telemetry.mjs';
 
 const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 
@@ -95,9 +100,9 @@ const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 
 export const CC_BRIDGE_BASE_URL = 'https://openrouter.ai/api/v1';
 export const CC_MODEL_CHAIN_DEFAULTS = [
-  'dots-studio/dots-3-note-preview:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'cohere/north-mini-code:free',
+  'deepseek/deepseek-v4.1-flash',
+  'z-ai/glm-5.3-flash',
+  'nvidia/nemotron-3.5-lightning:free',
 ];
 // SA-5: the web tools are DENIED at the CLI boundary (mcp-web replaces them)
 export const CC_PERMISSION_DENIES = ['WebFetch', 'WebSearch'];
@@ -189,6 +194,16 @@ export function ccLaneEnv(lane, envelope, extra = {}) {
 export const CC_ENV_DENYLIST = [
   'OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN',
   'ANTHROPIC_AUTH_TOKEN', 'GL_PAT',
+  // T46/W-D lane B (M4/M6 class): the bridge's telemetry path rides the
+  // ADAPTER-side spawn env only — it must never leak into the CLI child env
+  // (the same seam lane C extends for OPENROUTER_KEY_POOL). Defense-in-depth:
+  // the adapter passes it via startBridge's explicit env, but a stray export
+  // in a runner's top-level env would otherwise inherit through the copy.
+  'BRIDGE_LANE_LOG',
+  // T46/W-D M6: the real-lane FREE key pool (worker/turn.mjs's D3 pick) —
+  // the CLI child env must never see the 73 pool keys (the live-proven
+  // /proc/<pid>/environ leak class; this lane's only pool-relevant edit)
+  'OPENROUTER_KEY_POOL',
 ];
 
 // the merged child env: the caller's env (PATH et al.) MINUS the denylist,
@@ -244,7 +259,14 @@ export function ccApiErrorStatus(exitJson) {
 // ---------------------------------------------------------------------------
 const CC_BRIDGE_PATH = fileURLToPath(new URL('./cc-bridge.mjs', import.meta.url));
 
-async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
+// T46/W-D lane B (§D4-M2): startBridge passes the TURN-scoped lane-log path
+// (BRIDGE_LANE_LOG) — every lane's bridge appends to the SAME file, so the
+// turn-level aggregate sees every upstream call across rotations. Exported
+// for the glue pin (the bridge env wiring — without it the bridge writes its
+// standalone default while the adapter aggregates a path nothing wrote: a
+// dead feature with every pure pin green, the exact gap class this repo
+// guards against).
+export async function startBridge(lane, log, { timeoutMs = 5_000, laneLogPath = null, upstreamBase = null } = {}) {
   const scratch = mkdtempSync(join(tmpdir(), 'cc-bridge-'));
   const portFile = join(scratch, 'port');
   const child = spawn(process.execPath, [CC_BRIDGE_PATH, portFile], {
@@ -252,7 +274,8 @@ async function startBridge(lane, log, { timeoutMs = 5_000 } = {}) {
       PATH: process.env.PATH || '/usr/bin:/bin',
       OPENROUTER_API_KEY: lane.key,
       CC_LANE_MODEL: lane.model,
-      OPENROUTER_BASE: process.env.OPENROUTER_BASE || '',
+      OPENROUTER_BASE: upstreamBase ?? (process.env.OPENROUTER_BASE || ''),
+      ...(laneLogPath ? { BRIDGE_LANE_LOG: laneLogPath } : {}),
       // M-3 (integration wiring): the bridge enforces this exact bearer on
       // the credential-spending route; the CLI carries the SAME dummy as its
       // ANTHROPIC_AUTH_TOKEN (ccLaneEnv line above) — the CLI's requests
@@ -582,6 +605,8 @@ export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
 // a done's PR depends on the artifacts landing, so the turn escalates to
 // infra_failed 'artifact-push' = net-zero retry; failed turns keep their
 // work-class result — the escalation would mask the diagnosis).
+// T46/W-D lane B: lane_stats rides the escalation too — the retry's console
+// view must see WHY the first attempt burned (the 429 class et al).
 export function artifactPushEscalation(taskId, attempt, err, result) {
   return {
     status: 'infra_failed',
@@ -590,6 +615,7 @@ export function artifactPushEscalation(taskId, attempt, err, result) {
     summary: `cc: task ${taskId} attempt ${attempt} — the artifact branch push failed (${String(err?.message ?? err).slice(0, 120)})`,
     telemetry: result.telemetry, models: result.models,
     lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
+    ...(result.lane_stats ? { lane_stats: result.lane_stats } : {}),
   };
 }
 
@@ -687,6 +713,14 @@ export async function ccTurn(envelope, opts = {}) {
   const workdir = mkdtempSync(join(tmpdir(), fake ? 'cc-fake-' : 'cc-turn-'));
   const echoRootProvided = fake && echoDir;
   const echoRoot = fake ? (echoDir || mkdtempSync(join(tmpdir(), 'cc-echo-'))) : null;
+  // T46/W-D lane B (§D4-M2): the turn-scoped lane-log scratch — its OWN temp
+  // dir, NOT the workdir (scanWorkdir would otherwise claim the telemetry
+  // file as a CLI write-back artifact — the door/poison interplay). Every
+  // lane's bridge appends to the SAME file; finalize aggregates it into
+  // `lane_stats` and DELETES it (consumed); the finally below reaps the dir
+  // (the backstop). opts.laneLogPath overrides for the seam pins.
+  const laneLogDir = mkdtempSync(join(tmpdir(), fake ? 'cc-lanelog-fake-' : 'cc-lanelog-'));
+  const laneLogPath = typeof opts.laneLogPath === 'string' && opts.laneLogPath !== '' ? opts.laneLogPath : join(laneLogDir, 'bridge-lane.jsonl');
   try {
     if (!lanes.length) {
       // routable infra marker — the key pool is empty (never a work attempt)
@@ -709,7 +743,7 @@ export async function ccTurn(envelope, opts = {}) {
       let bridge = null;
       if (!fake) {
         try {
-          bridge = await startBridge(lane, log);
+          bridge = await startBridge(lane, log, { laneLogPath });
           extraEnv.CC_BRIDGE_URL = bridge.url;
         } catch (e) {
           laneLog.push({
@@ -875,6 +909,14 @@ export async function ccTurn(envelope, opts = {}) {
 
     // ---- the shared terminal tail: scan → door → transcript → return ----
     async function finalize(partial, used, extra = {}) {
+      // T46/W-D lane B (§D4-M2): the bridge-lane JSONL → `lane_stats`. Read
+      // HERE (every terminal path funnels through finalize — rotation
+      // `continue`s burned their bridges but their lines are already in the
+      // turn-level file). collectLaneStats aggregates + DELETES the file; a
+      // turn whose lanes never reached the model (fake mode, bridge spawn
+      // failures) attaches NOTHING — lane_stats is an optional field the
+      // whole drain treats as absent-means-absent.
+      const laneStats = collectLaneStats(laneLogPath);
       // the write-back claim surface: the workdir scan — ONLY for lanes that
       // ran to rc 0 and answered (the raw-extraction path sets scan:true);
       // every failure shape carries [] like the shim's failure rows
@@ -882,6 +924,7 @@ export async function ccTurn(envelope, opts = {}) {
       let result = {
         ...partial,
         artifact_refs: refs,
+        ...(laneStats ? { lane_stats: laneStats } : {}),
         telemetry: {
           turns: extra.turns ?? 0,
           wall_ms: now() - t0,
@@ -950,6 +993,7 @@ export async function ccTurn(envelope, opts = {}) {
             summary: `cc: task ${taskId} attempt ${attempt} — the transcript never landed (${String(e?.message ?? e).slice(0, 120)})`,
             telemetry: result.telemetry, models: result.models,
             lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
+            ...(result.lane_stats ? { lane_stats: result.lane_stats } : {}),
           };
         }
         log(`CC-TRANSCRIPT-MISSED (best-effort for a ${internalCls.status} turn): ${String(e?.message ?? e).slice(0, 160)}`);
@@ -991,6 +1035,10 @@ export async function ccTurn(envelope, opts = {}) {
     }
   } finally {
     rmSync(workdir, { recursive: true, force: true });
+    // T46/W-D lane B: the lane-log scratch dir — collectLaneStats already
+    // deleted the FILE (consumed); this reaps the DIR (the backstop for the
+    // paths that never reached finalize)
+    rmSync(laneLogDir, { recursive: true, force: true });
     // an internally-created echo root is unreadable by the caller — reap it;
     // a PROVIDED one stays (conformance reads the boundary records after)
     if (echoRoot && !echoRootProvided) rmSync(echoRoot, { recursive: true, force: true });

@@ -28,6 +28,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { startBridge as adapterStartBridge } from '../worker/cc-adapter.mjs';
 
 const BRIDGE_PATH = fileURLToPath(new URL('../worker/cc-bridge.mjs', import.meta.url));
 const LANE_KEY = 'sk-or-bridge-test-key';
@@ -77,7 +78,10 @@ function startMockUpstream() {
 }
 
 // spawn the real bridge with a lane key/model aimed at the mock upstream;
-// resolves once the port file appears (the adapter's startBridge contract)
+// resolves once the port file appears (the adapter's startBridge contract).
+// T46/W-D review fold (A2, lens-1 F1): BRIDGE_LANE_LOG points at the spawn's
+// OWN scratch path — the bridge's cwd fallback (./bridge-lane.jsonl) is the
+// committed-residue class this fold killed; gates must never dirty the tree.
 function startBridge({ auth, upstreamBase }) {
   const scratch = mkdtempSync(join(tmpdir(), 'bridge-b-test-'));
   const portFile = join(scratch, 'port');
@@ -86,6 +90,7 @@ function startBridge({ auth, upstreamBase }) {
     OPENROUTER_API_KEY: LANE_KEY,
     CC_LANE_MODEL: LANE_MODEL,
     OPENROUTER_BASE: upstreamBase,
+    BRIDGE_LANE_LOG: join(scratch, 'bridge-lane.jsonl'),
   };
   if (auth !== undefined) env.BRIDGE_AUTH = auth;
   const child = spawn(process.execPath, [BRIDGE_PATH, portFile], { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -421,4 +426,47 @@ test('verified-sound passthrough: statuses verbatim, query string preserved, SSE
     assert.ok(firstClient !== -1 && secondMock !== -1 && firstClient < secondMock,
       `the client streamed chunk 1 before the mock wrote chunk 2 (events: ${upstream.events.join(' -> ')})`);
   });
+});
+
+// ---------------------------------------------------------------------------
+// T46/W-D review fold (A3, lens-1 F4) — the startBridge GLUE pin: the bridge
+// env wiring at the SPAWN SEAM. The ADAPTER's exported startBridge must pass
+// BRIDGE_LANE_LOG when laneLogPath is set — without it the bridge writes its
+// cwd default while the adapter aggregates a path nothing wrote (a dead
+// feature with every pure pin green, the exact gap class this repo guards
+// against; the export existed but no test drove it). One forwarded call must
+// land its per-call line in the TURN-SCOPED path.
+// ---------------------------------------------------------------------------
+
+test('glue (W-D fold A3, lens-1 F4): the ADAPTER\'s startBridge wires BRIDGE_LANE_LOG — a forwarded call lands in the turn-scoped JSONL', async () => {
+  const upstream = await startMockUpstream();
+  const scratch = mkdtempSync(join(tmpdir(), 'bridge-glue-'));
+  const laneLog = join(scratch, 'bridge-lane.jsonl');
+  const bridge = await adapterStartBridge(
+    { key: LANE_KEY, keyIndex: 3, model: LANE_MODEL },
+    () => {},
+    { laneLogPath: laneLog, upstreamBase: upstream.base },
+  );
+  try {
+    // one forwarded call (the adapter always sets BRIDGE_AUTH to the local
+    // dummy — the request must carry exactly that bearer)
+    const r = await post(`${bridge.url}/v1/messages`, msgBody(LANE_MODEL), { authorization: 'Bearer bridge-local-no-key' });
+    assert.equal(r.status, 200, 'the forwarded call succeeds through the mock upstream');
+    // the per-call line lands in the TURN-SCOPED path (BRIDGE_LANE_LOG made
+    // it there — NOT the cwd default)
+    let lines = [];
+    for (let i = 0; i < 40 && lines.length === 0; i++) {
+      try { lines = readFileSync(laneLog, 'utf8').split('\n').map((s) => s.trim()).filter(Boolean); } catch { /* not yet */ }
+      if (lines.length === 0) await new Promise((res) => setTimeout(res, 25));
+    }
+    assert.equal(lines.length, 1, `exactly one per-call line (got ${lines.length})`);
+    const l = JSON.parse(lines[0]);
+    assert.equal(l.model, LANE_MODEL, 'the pinned lane model rides the line');
+    assert.equal(l.status, 200, 'the forwarded status rides the line');
+    assert.ok(Number.isFinite(l.ms), 'the per-call latency rides the line');
+  } finally {
+    bridge.stop();
+    await upstream.close();
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
