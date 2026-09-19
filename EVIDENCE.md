@@ -362,3 +362,53 @@ completion comment carries the result digest AND "**Pull requests**: task
 `X22-FINAL` → PR #10" on the same tick-set; PR #10 opened + stamped. The
 loop criterion (issue → door → cc epoch → artifacts → PR → completion
 comment with the link) is closed.
+
+## X23 — the budget-pause live proof (2026-09-19, session 19)
+
+**The PARK half is LIVE-PROVEN in the multi-task shape; the resume arc ran with
+one honest wrinkle (a straggler re-pause).** The wall was engineered honestly:
+kasulty's fresh 1000/day free-model quota burned to the day-wall
+(`free-models-per-day-high-balance`, X-RateLimit-Remaining: 0) at 00:07Z, then
+`EPOCH_MODE=cc` + console `reset` birthed the 8-task epoch (reset comments
+5737684542/5737690584 on ops issue #1).
+
+- **Arc 1 (single-task, issue #11, chain pre-midnight):** the infra-retry ladder
+  held perfectly — 3 dispatches, 2 infra retries, both quota reports captured in
+  `budget_window` (`lane-exhausted(3/6 lanes, last lane-429)`), task QUARANTINED,
+  epoch closed degraded-halt, zero uncontrolled burn (worker logs: 11 CC-CLI
+  retries per attempt, ~9min grind each, clean `infra_failed` classification —
+  the X21 burn-class is dead). **Finding: a single-task epoch halts BEFORE the
+  pause can fire** (the trigger's `!halted && phase!=='done'` gate — by design,
+  nothing left to protect). The park proof needs the multi-task shape.
+- **Arc 2 (the complete proof):** the 8-task cc epoch dispatched 4-parallel into
+  the wall at 00:11Z; THREE DISTINCT tasks' quota infra-reports landed inside
+  the 15-min window (00:19:32) → the count trigger fired → **alert issue #12
+  opened FIRST** ("[fsm-alert] lane budget exhausted — epoch parked") → the
+  pause CONTROL landed (`budget_pauses: 1`, chain `paused: true`, project
+  `executing` — alive) with **4 backlog tasks PROTECTED** (the burn stops at
+  exactly the protection point the design promised).
+- **The operator remedy + resume:** `OPENROUTER_API_KEY` rotated to the
+  ansgauretychis-B lane (fresh 1000/day — the credit reality: kasulty
+  $10/$10.38 overdrawn, ansgauretychis-B $9.997/$10 spent, both free-lane-only
+  keys) + the remedy recorded on the alert issue (comment 5737850985) + console
+  `resume` (comment 5737851388, 00:29:59Z) → the re-dispatched workers ran
+  REAL turns on the fresh lane — **T-101 done in 202s** (run logs: pure 200s on
+  dots-studio after a session of pure 429s — the lane swap verbatim in the
+  bridge lines).
+- **The wrinkle (recorded honestly):** a SECOND pause fired
+  (`budget_pauses: 2`) from straggler infra-reports landing just after the
+  resume (the first batch's 9-minute grinds were still in flight when the
+  window cleared — their reports re-populated the window post-resume). The
+  at-least-once drain kept consuming reports while parked (T-101's done + 2
+  work_failed + 1 poison landed) — the chain held correctly through both
+  pauses. Resume #2 at 01:19:20Z (comment 5738198340) drains the backlog 4.
+- Final tally (to be amended at halt): 1 done / 2 work_failed / 1 poison / 1
+  quarantined (arc 1) / 4 backlog draining; `budget_pauses: 2`; zero burn
+  beyond the bounded retry ladders.
+
+**Machinery verdict: the lane-budget pause is live-proven end-to-end in its
+designed shape (alert-first → pause → protection → operator remedy → resume →
+real work completes).** The straggler re-pause is a benign race (the window
+persists across a resume that races in-flight grinds) — candidate polish for
+the W-D review round: clear the window only after the in-flight cohort's
+reports drain, or accept the double-resume as operator routine.
