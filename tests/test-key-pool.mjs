@@ -123,7 +123,9 @@ test('pool: precedence — pool + OPENROUTER_API_KEY both present -> the REAL la
 
 test('pool: result shape — key_index/pool_size ride ONLY when the pool is set (the seam for lane B\'s M4 fold)', async () => {
   const done = await drive(env2('pool-pin-T2'), { env: poolEnv(), responses: [jsonRes(200, okBody('k'))] });
-  assert.deepEqual(Object.keys(done.raw).sort(), ['content', 'duration_ms', 'key_index', 'lane_attempts_used', 'models', 'pool_size', 'telemetry'], 'the done shape gains exactly key_index + pool_size');
+  // W-D integration: hop_telemetry is lane A's unconditional realWork field —
+  // the union key-set is lane C's pool pins + lane A's telemetry pin.
+  assert.deepEqual(Object.keys(done.raw).sort(), ['content', 'duration_ms', 'hop_telemetry', 'key_index', 'lane_attempts_used', 'models', 'pool_size', 'telemetry'], 'the done shape gains exactly key_index + pool_size (over the hop_telemetry baseline)');
   const burned = await drive(env2('pool-pin-T2'), { env: poolEnv(), responses: [jsonRes(429, {}), jsonRes(429, {})] });
   assert.equal(burned.raw.status, 'infra_failed');
   assert.equal(burned.raw.key_index, (fnv1a('pool-pin-T2') + 1) % 3, 'lane-exhaustion reports the LAST (burned) slot');
@@ -178,7 +180,10 @@ test('pool: empty pool -> today\'s behavior BIT-FOR-BIT (the regression pin)', a
       responses: [jsonRes(200, okBody('legacy lane'))],
     });
     assert.equal(headers[0], 'Bearer legacy-primary', `pool=${JSON.stringify(absent)} -> the primary secret serves the lane`);
-    assert.deepEqual(Object.keys(raw).sort(), ['content', 'duration_ms', 'lane_attempts_used', 'models', 'telemetry'], 'NO key_index/pool_size keys — the legacy result shape, exactly');
+    // W-D integration: the integrated baseline carries lane A's hop_telemetry
+    // (unconditional); the pin's intent — NO pool keys without a pool — is
+    // unchanged.
+    assert.deepEqual(Object.keys(raw).sort(), ['content', 'duration_ms', 'hop_telemetry', 'lane_attempts_used', 'models', 'telemetry'], 'NO key_index/pool_size keys — the legacy result shape + lane A\'s hop_telemetry');
   }
 });
 

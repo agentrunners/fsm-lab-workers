@@ -295,6 +295,9 @@ matrix.push(await matrixRow({
   const argvOk = eq(JSON.stringify(echo.argv), JSON.stringify([
     '-y', '@anthropic-ai/claude-code@2.1.273',   // M-4: the pinned default
     '-p', 'boundary probe',
+    // T46/X22 (live finding, run 35297656079): acceptEdits — the adapter's
+    // designed shape since the X22 fix; this pin predated it (the drift).
+    '--permission-mode', 'acceptEdits',
     '--max-turns', '11',
     '--output-format', 'json',
     '--disallowedTools', 'WebFetch,WebSearch',
