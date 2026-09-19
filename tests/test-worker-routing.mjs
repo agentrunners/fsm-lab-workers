@@ -197,10 +197,10 @@ test('routing: MODE=cc (fake lane) — the adapter completes through the full tu
   assert.equal(r.reported, true);
   const rep = h.enqueued[0];
   assert.equal(rep.outcome.status, 'done', 'the fake CLI answers → content → done');
-  assert.match(rep.outcome.artifact, /fake-cc ok: completed the task on dots-studio/);
+  assert.match(rep.outcome.artifact, /fake-cc ok: completed the task on deepseek\/deepseek-v4\.1-flash/);
   assert.equal(rep.outcome.telemetry.lane_attempts_used, 1);
   assert.equal(rep.outcome.telemetry.lanes?.[0]?.key_index, 1);
-  assert.deepEqual(rep.outcome.models, ['dots-studio/dots-3-note-preview:free']);
+  assert.deepEqual(rep.outcome.models, ['deepseek/deepseek-v4.1-flash']);
   assert.equal(h.sleeps.length, 0, 'the cc lane enforces its OWN wall — no worker-side sleep');
   assert.ok(!h.fetches.length, 'zero network through the whole turn');
 });
@@ -235,18 +235,20 @@ const jsonRes = (status, body) => new Response(JSON.stringify(body), { status, h
 const okBody = (text) => ({ choices: [{ message: { content: text } }] });
 const models = (fetches) => fetches.map(([, init]) => JSON.parse(init.body).model);
 
-test('routing: real chain — the RETIRED minimax slug is gone; the free defaults lead', () => {
-  assert.deepEqual(realModelChain({}), ['dots-studio/dots-3-note-preview:free', 'nvidia/nemotron-3-ultra-550b-a55b:free', 'cohere/north-mini-code:free']);
+test('routing: real chain — D1: nemotron-3.5 leads, dots-studio/nemotron-3-ultra demoted OUT; the free defaults lead', () => {
+  assert.deepEqual(realModelChain({}), ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free', 'cohere/north-mini-code:free']);
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: '' }), realModelChain({}), 'empty env model = absent');
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: ' x/y ' })[0], 'x/y', 'env model heads the chain (trimmed)');
-  assert.ok(!JSON.stringify(realModelChain({})).includes('minimax'));
+  assert.ok(!JSON.stringify(realModelChain({})).includes('minimax'), 'the retired slug stays dead');
+  assert.ok(!JSON.stringify(realModelChain({})).includes('dots-studio'), 'D1: dots-studio demoted OUT — 0% content at the production shape');
+  assert.ok(!JSON.stringify(realModelChain({})).includes('nemotron-3-ultra'), 'D1: nemotron-3-ultra demoted to never — p95 32s + 30s burst walls');
 });
 
 test('routing: real fallback — primary 429 → ONE hop → the fallback model completes', async () => {
   const h = makeHarness({
     cp: legacyCp({ mode: 'real', behavior: null }),
     env: { OPENROUTER_API_KEY: 'k' },
-    fetchImpl: async (url, init) => JSON.parse(init.body).model.includes('dots-studio')
+    fetchImpl: async (url, init) => JSON.parse(init.body).model.includes('nemotron')
       ? jsonRes(429, { error: { message: 'rate limited' } })
       : jsonRes(200, okBody('the fallback answer')),
   });
@@ -254,8 +256,8 @@ test('routing: real fallback — primary 429 → ONE hop → the fallback model 
   assert.equal(r.exitCode, 0);
   assert.equal(h.enqueued[0].outcome.status, 'done');
   assert.equal(h.enqueued[0].outcome.artifact, 'the fallback answer');
-  assert.deepEqual(models(h.fetches), ['dots-studio/dots-3-note-preview:free', 'nvidia/nemotron-3-ultra-550b-a55b:free'], 'exactly one hop');
-  assert.deepEqual(h.enqueued[0].outcome.models, ['dots-studio/dots-3-note-preview:free', 'nvidia/nemotron-3-ultra-550b-a55b:free']);
+  assert.deepEqual(models(h.fetches), ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free'], 'exactly one hop');
+  assert.deepEqual(h.enqueued[0].outcome.models, ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free']);
   assert.equal(h.enqueued[0].outcome.telemetry.lane_attempts_used, 2);
 });
 
@@ -268,7 +270,7 @@ test('routing: real fallback — OPENROUTER_MODEL heads the chain and is hopped 
       : jsonRes(200, okBody('after the custom lane')),
   });
   await h.turn();
-  assert.deepEqual(models(h.fetches), ['custom/model-x', 'dots-studio/dots-3-note-preview:free']);
+  assert.deepEqual(models(h.fetches), ['custom/model-x', 'nvidia/nemotron-3.5-lightning:free']);
   assert.equal(h.enqueued[0].outcome.status, 'done');
 });
 
@@ -301,7 +303,7 @@ test('routing: real transport throw on the primary → infra hop → done', asyn
     cp: legacyCp({ mode: 'real' }),
     env: { OPENROUTER_API_KEY: 'k' },
     fetchImpl: async (url, init) => {
-      if (JSON.parse(init.body).model.includes('dots-studio')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
+      if (JSON.parse(init.body).model.includes('nemotron')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
       return jsonRes(200, okBody('post-transport'));
     },
   });
@@ -342,7 +344,60 @@ test('routing: realWork is directly drivable (the lane chain, no full turn)', as
     fetchImpl: async (u, init) => { fetches.push(JSON.parse(init.body).model); return jsonRes(200, okBody('direct')); },
   });
   assert.equal(raw.content, 'direct');
-  assert.deepEqual(fetches, ['dots-studio/dots-3-note-preview:free']);
+  assert.deepEqual(fetches, ['nvidia/nemotron-3.5-lightning:free']);
+});
+
+test('routing: real max_tokens — D1: the completion budget is 512 (the seam: the request body the fetch receives)', async () => {
+  // 64 starved every reasoning-style model (content:null → work_failed
+  // 'empty-completion' churn that LOOKED like model failure but was a budget
+  // artifact); 512 is the measured 100%-content shape on the new chain.
+  const h = makeHarness({
+    cp: legacyCp({ mode: 'real', behavior: null }),
+    env: { OPENROUTER_API_KEY: 'k' },
+    fetchImpl: async () => jsonRes(200, okBody('done at the 512 budget')),
+  });
+  await h.turn();
+  assert.equal(h.fetches.length, 1);
+  const body = JSON.parse(h.fetches[0][1].body);
+  assert.equal(body.max_tokens, 512, 'the request body carries the 512 completion budget');
+  assert.equal(body.model, 'nvidia/nemotron-3.5-lightning:free');
+});
+
+test('routing: real hop_telemetry — per-hop {model, ms, status} on the two-hop fixture (429 → 200; D4-G5 real-lane half)', async () => {
+  const env = { task_ref: { kind: 'state-task', id: 'T1' }, prompt: 'p', deadline_ms: NOW + 600_000, session: 's', budget: { max_turns: 40, wall_ms: 480_000, lane_attempts: 3 }, mode: 'real', attempt: 1 };
+  const raw = await realWork(env, {
+    env: { OPENROUTER_API_KEY: 'k' },
+    fetchImpl: async (u, init) => JSON.parse(init.body).model.includes('nemotron')
+      ? jsonRes(429, { error: { message: 'rate limited' } })
+      : jsonRes(200, okBody('telemetry after the hop')),
+  });
+  assert.equal(raw.content, 'telemetry after the hop');
+  assert.deepEqual(raw.models, ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free']);
+  assert.ok(Array.isArray(raw.hop_telemetry), 'the optional per-hop field rides the raw lane return');
+  assert.equal(raw.hop_telemetry.length, 2, 'one entry per attempted hop');
+  const [hop1, hop2] = raw.hop_telemetry;
+  assert.deepEqual(Object.keys(hop1).sort(), ['model', 'ms', 'status'], 'the minimal G5 shape');
+  assert.equal(hop1.model, 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(hop1.status, 429, 'the first hop carries the lane answer that triggered the hop');
+  assert.ok(Number.isFinite(hop1.ms) && hop1.ms >= 0, 'the hop wall is a finite ms');
+  assert.equal(hop2.model, 'deepseek/deepseek-v4-flash-0731:free');
+  assert.equal(hop2.status, 200);
+  assert.ok(Number.isFinite(hop2.ms) && hop2.ms >= 0);
+});
+
+test('routing: real hop_telemetry — the transport hop records status \'transport\'', async () => {
+  const env = { task_ref: { kind: 'state-task', id: 'T1' }, prompt: 'p', deadline_ms: NOW + 600_000, session: 's', budget: { max_turns: 40, wall_ms: 480_000, lane_attempts: 3 }, mode: 'real', attempt: 1 };
+  const raw = await realWork(env, {
+    env: { OPENROUTER_API_KEY: 'k' },
+    fetchImpl: async (u, init) => {
+      if (JSON.parse(init.body).model.includes('nemotron')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
+      return jsonRes(200, okBody('after transport'));
+    },
+  });
+  assert.equal(raw.content, 'after transport');
+  assert.equal(raw.hop_telemetry.length, 2);
+  assert.equal(raw.hop_telemetry[0].status, 'transport', 'a thrown fetch records the transport class, not a number');
+  assert.equal(raw.hop_telemetry[1].status, 200);
 });
 
 // ---------------------------------------------------------------------------
@@ -521,7 +576,7 @@ test('routing: W2 payload with mode=cc — the envelope budget bounds the lane c
   assert.equal(rep.outcome.status, 'infra_failed', 'every lane answered 429-text-as-answer → infra hop, hop, exhausted');
   assert.equal(rep.outcome.telemetry.lane_attempts_used, 3, 'W2 mints lane_attempts:3 — exactly three fake spawns');
   assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
-  assert.equal(rep.outcome.telemetry.lanes?.[2]?.model, 'cohere/north-mini-code:free', 'key-major flatten: three models on key 1');
+  assert.equal(rep.outcome.telemetry.lanes?.[2]?.model, 'nvidia/nemotron-3.5-lightning:free', 'key-major flatten: three models on key 1');
 });
 
 test('routing: W2 payload with mode=real — the envelope budget bounds the lane chain (lane_attempts rides the dispatch)', async () => {

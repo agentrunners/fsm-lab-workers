@@ -31,8 +31,12 @@
 //   OX_AGENT_TASK_ID=<task id>                        (the artifact namespace)
 //
 // THE LANE PICKER (D2): key pool [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2] ×
-// model chain [CC_MODEL, dots-studio:free, nemotron:free, cohere:free],
-// flattened KEY-MAJOR (every model on key 1 before key 2's first), bounded by
+// model chain [CC_MODEL, deepseek-v4.1-flash, glm-5.3-flash,
+// nemotron-3.5-lightning:free] (T46/W-D §D2: the s19 cc-lane eval verdict —
+// deepseek primary, glm fallback for provider diversity, nemotron the free
+// tail; deepseek-v4-flash-0731:free is NEVER on this lane — it hallucinated
+// the eval task, silent content-poison), flattened KEY-MAJOR (every model on
+// key 1 before key 2's first), bounded by
 // budget.lane_attempts (default 3). INFRA-class lane failure (401/402/429/5xx
 // text-as-answer, transport-shaped stderr, budget-misconfigured truncation)
 // → next lane. WORK-class (the CLI ran and answered: empty completion,
@@ -95,9 +99,9 @@ const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 
 export const CC_BRIDGE_BASE_URL = 'https://openrouter.ai/api/v1';
 export const CC_MODEL_CHAIN_DEFAULTS = [
-  'dots-studio/dots-3-note-preview:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'cohere/north-mini-code:free',
+  'deepseek/deepseek-v4.1-flash',
+  'z-ai/glm-5.3-flash',
+  'nvidia/nemotron-3.5-lightning:free',
 ];
 // SA-5: the web tools are DENIED at the CLI boundary (mcp-web replaces them)
 export const CC_PERMISSION_DENIES = ['WebFetch', 'WebSearch'];
