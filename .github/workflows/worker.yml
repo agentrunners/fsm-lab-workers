@@ -66,7 +66,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50   # T46/X21: the wall can be lease-2min (45-lease epochs); was 20 (the 15-lease era)
     steps:
+      # T46/ar (20-e): TARGET_REPO redirects the seat — the second bucket's
+      # workers (agentrunners/fsm-lab-workers) check out the MAIN repo so the
+      # task-branch push, the transcript push and the report-queue CAS-append
+      # all land THERE (every git push follows the CHECKOUT: the report push
+      # rides the checkout's origin; the cc-lane pushes ride the
+      # GITHUB_REPOSITORY + GH_TOKEN env below — both re-targeted together).
+      # Unset = own repo on the ephemeral job token — today's behavior,
+      # byte-identical.
       - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.TARGET_REPO || github.repository }}
+          # The PAT lane only when redirected (cross-repo checkout + the
+          # pushes the job token cannot make); the job token otherwise.
+          token: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-node@v4
         with:
@@ -115,7 +128,15 @@ jobs:
       - name: Work the task
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          # T46/ar (20-e): the cc-lane push targets (fsm-sessions transcripts
+          # + the tasks/<id> write-back) follow the CHECKOUT target, not the
+          # run's repo: GITHUB_REPOSITORY re-targets to TARGET_REPO and
+          # GH_TOKEN rides the PAT lane (the ephemeral job token cannot push
+          # cross-repo). Unset TARGET_REPO = github.repository + the job token
+          # — today's behavior. The report-queue push needs no mapping: it
+          # rides the checkout's own origin (lib/store.mjs).
+          GITHUB_REPOSITORY: ${{ vars.TARGET_REPO || github.repository }}
+          GH_TOKEN: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           # T45/F-E: GITHUB_RUN_ID is STABLE across re-runs — only the attempt
           # increments. The report id is attempt-scoped (rep-<run>-a<attempt>)
@@ -152,8 +173,9 @@ jobs:
           CC_MODEL: ${{ vars.CC_MODEL || '' }}
           CC_VERSION: ${{ vars.CC_VERSION || '' }}
           # T46/W4: the CC adapter's transcript push (fsm-sessions branch) —
-          # the job token (X20 run-1 finding: without it the turn reports
-          # infra 'transcript-push-failed')
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # the token lane (X20 run-1 finding: without it the turn reports
+          # infra 'transcript-push-failed'). T46/ar (20-e): the value moved UP
+          # beside GITHUB_REPOSITORY (the cc-lane push pair — both follow the
+          # CHECKOUT target; see the ar comment there).
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs

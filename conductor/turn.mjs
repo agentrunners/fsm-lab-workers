@@ -35,6 +35,7 @@ import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
+  dispatchLadder, workerOverflowDecision, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
@@ -42,6 +43,14 @@ import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
 const RUN_ID = process.env.GITHUB_RUN_ID || 'local';
 const PAT = process.env.LAB_PAT;
+// T46/ar (20-e): the SECOND-BUCKET overflow lane. WORKER_REPO_2 (repo
+// variable, e.g. agentrunners/fsm-lab-workers; unset/empty = NO lane —
+// today's dispatch path bit-for-bit) + WORKER_OVERFLOW_AT (repo variable;
+// unset/bad = the core's default 6). The lane engages per-dispatch in the
+// action loop below (workerOverflowDecision); the PAT is REQUIRED — a
+// cross-repo dispatch cannot ride the ephemeral job token (X1a).
+const WORKER_REPO_2 = process.env.WORKER_REPO_2 || null;
+const WORKER_OVERFLOW_AT = parseInt(process.env.WORKER_OVERFLOW_AT || '', 10) || WORKER_OVERFLOW_AT_DEFAULT;
 // X1a finding applied: same-repo dispatches ride the EPHEMERAL job token
 // (repository_dispatch is a documented exception to the anti-recursion rule
 // — probe-proven run 34025596219). The PAT stays as the fallback lane.
@@ -90,37 +99,15 @@ async function api(path, method = 'GET', body = null, token = TOKEN) {
   return { status: r.status, data, headers };
 }
 
-// F6: Retry-After-aware, budget-capped, jittered. A 403+Retry-After (the
-// secondary-rate-limit shape) must wait the SERVER floor, not burn all tries
-// in 6s (the old fixed ladder = chain death on a transient). 403 WITHOUT
-// Retry-After is a permission problem — fail fast, no retry.
-// F-C (T45): the budget is CALLER-SUPPLIED ({budgetMs}) — the per-call fresh
-// 240s is now the DEFAULT only; every worker ladder passes
-// max(0, remaining() - SELF_TICK_RESERVE) so the first Retry-After ladder can
-// never eat the heartbeat window (R3 D1-M2); the self-tick passes the full
-// remaining() (the turn's LAST call). Every internal wait clamps to the
-// ladder's budgetLeft; budget <= 0 aborts the ladder.
-async function dispatchRetry(eventType, clientPayload, { tries = 5, budgetMs = 240_000 } = {}) {
-  const t0 = Date.now();
-  let last = null;
-  for (let i = 0; i < tries; i++) {
-    const r = await api(`/repos/${REPO}/dispatches`, 'POST', {
-      event_type: eventType, client_payload: clientPayload,
-    });
-    if (r.status === 204) return { ok: true };
-    last = r;
-    const budgetLeft = budgetMs - (Date.now() - t0);
-    const ra = parseInt(r.headers?.['retry-after'] || '', 10);
-    if ((r.status === 403 || r.status === 429) && Number.isFinite(ra) && ra > 0) {
-      if (budgetLeft <= 0) break;
-      await sleep(Math.min(ra * 1000 * (1 + Math.random() * 0.2), budgetLeft));
-      continue;
-    }
-    if (r.status === 403) return { ok: false, status: 403, fatal: true };
-    if (budgetLeft <= 0) break;
-    await sleep(Math.min(Math.round(2000 * (i + 1) * (0.8 + Math.random() * 0.4)), budgetLeft));
-  }
-  return { ok: false, status: last?.status, body: last?.data };
+// F6: Retry-After-aware, budget-capped, jittered — the LOGIC lives in the
+// core's dispatchLadder (T46/ar: extracted so the routing is behaviorally
+// pinnable; identical statuses/jitter/budget clamps). 403+Retry-After (the
+// secondary-rate-limit shape) waits the SERVER floor; 403 WITHOUT
+// Retry-After is a permission problem — fail fast, no retry. The default
+// target is THIS repo on the ephemeral job token (X1a); {repo, token}
+// re-target the overflow lane's second-bucket dispatch on the PAT.
+async function dispatchRetry(eventType, clientPayload, { tries = 5, budgetMs = 240_000, repo = REPO, token } = {}) {
+  return dispatchLadder({ eventType, clientPayload, api, repo, token, tries, budgetMs, sleep });
 }
 
 async function postIssueComment(body) {
@@ -364,6 +351,11 @@ async function main() {
   } catch { /* absent brief — the envelope omits it cleanly */ }
   const epochMode = state.project?.mode || 'mock';
   let dispatchIndex = 0;
+  // T46/ar (20-e): the overflow lane's occupancy base — the leases that were
+  // outstanding BEFORE this tick's dispatches (the committed state's active
+  // count minus this turn's DISPATCH_WORKER assigns); the loop's
+  // dispatchIndex adds each already-dispatched one as the loop runs.
+  const priorInFlight = priorInFlightCount(state, actionList);
   for (const a of actionList) {
     if (a.type === 'DISPATCH_WORKER') {
       dispatchIndex++;
@@ -392,7 +384,25 @@ async function main() {
         briefMd,
         { nowMs: Date.now(), mode: epochMode },
       );
-      const d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
+      let d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
+      // T46/ar (20-e): the overflow lane — when the main-repo ladder
+      // saturates (403-with-Retry-After exhaustion) or the main bucket holds
+      // >= WORKER_OVERFLOW_AT in-flight leases, THIS dispatch re-targets
+      // WORKER_REPO_2 on the PAT lane. The ENVELOPE is unchanged: the second
+      // bucket's workers read client_payload identically — their worker.yml
+      // TARGET_REPO checks out the MAIN repo and the report CAS-append
+      // follows the CHECKOUT (worker/turn.mjs's Store rides the checkout's
+      // origin), so the report lands on the MAIN fsm-state. Unset
+      // WORKER_REPO_2 -> workerOverflowDecision returns false for any input
+      // (byte-identical today path).
+      const ov = workerOverflowDecision({
+        d, inFlightNow: priorInFlight + dispatchIndex - 1,
+        repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,
+      });
+      if (ov.overflow) {
+        console.log(`DISPATCH-OVERFLOW task=${a.task} ${ov.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; envelope unchanged — the bucket-2 worker checks out TARGET_REPO and reports to the MAIN fsm-state)`);
+        d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });
+      }
       if (!d.ok) {
         // X21 lesson: 4 dispatchFailures with ZERO logged detail (the 422
         // 10-property limit took a whole debugging round to find) — the

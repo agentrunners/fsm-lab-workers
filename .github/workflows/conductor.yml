@@ -79,6 +79,18 @@ jobs:
           # variable) — a hardcoded '1' here would split the alert lane from the
           # console the day the operator moves the ops anchor.
           OPS_ISSUE: ${{ vars.OPS_ISSUE || '1' }}
+          # T46/ar (20-e): the SECOND-BUCKET overflow lane. WORKER_REPO_2 (repo
+          # variable, e.g. agentrunners/fsm-lab-workers): when the main bucket
+          # saturates (the dispatch ladder's 403-with-Retry-After exhaustion, or
+          # in-flight leases >= WORKER_OVERFLOW_AT) the current dispatch
+          # re-targets that repo via the LAB_PAT lane (cross-repo dispatch —
+          # the ephemeral job token is same-repo only). Unset/empty = NO lane,
+          # today's dispatch path bit-for-bit.
+          WORKER_REPO_2: ${{ vars.WORKER_REPO_2 || '' }}
+          # The in-flight occupancy that sends dispatches to the second bucket
+          # (unset = the code default 6, WORKER_OVERFLOW_AT_DEFAULT in
+          # lib/conductor-core.mjs — the main bucket stays the primary).
+          WORKER_OVERFLOW_AT: ${{ vars.WORKER_OVERFLOW_AT || '' }}
         run: node conductor/turn.mjs
 
       - name: Persist run evidence
