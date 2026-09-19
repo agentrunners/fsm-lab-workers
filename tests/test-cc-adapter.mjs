@@ -634,7 +634,11 @@ test('X20 run-4 lesson: the bridge spawns, listens on 127.0.0.1, synthesizes the
   const scratch = mkdtempSync(join(tmpdir(), 'bridge-test-'));
   const portFile = join(scratch, 'port');
   const child = spawn(process.execPath, ['worker/cc-bridge.mjs', portFile], {
-    env: { PATH: process.env.PATH || '/usr/bin:/bin', OPENROUTER_API_KEY: 'sk-or-v1-test-key', CC_LANE_MODEL: 'test/model:free' },
+    // W-D review fold (A2): BRIDGE_LANE_LOG on EVERY test spawn of the
+    // bridge — the cwd fallback would write ./bridge-lane.jsonl into the
+    // repo (this test drives no upstream call so writes nothing today, but
+    // the spawn must be residue-proof by construction, not by accident)
+    env: { PATH: process.env.PATH || '/usr/bin:/bin', OPENROUTER_API_KEY: 'sk-or-v1-test-key', CC_LANE_MODEL: 'test/model:free', BRIDGE_LANE_LOG: join(scratch, 'bridge-lane.jsonl') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let out = '';

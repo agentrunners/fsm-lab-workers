@@ -77,7 +77,10 @@ function startMockUpstream() {
 }
 
 // spawn the real bridge with a lane key/model aimed at the mock upstream;
-// resolves once the port file appears (the adapter's startBridge contract)
+// resolves once the port file appears (the adapter's startBridge contract).
+// T46/W-D review fold (A2, lens-1 F1): BRIDGE_LANE_LOG points at the spawn's
+// OWN scratch path — the bridge's cwd fallback (./bridge-lane.jsonl) is the
+// committed-residue class this fold killed; gates must never dirty the tree.
 function startBridge({ auth, upstreamBase }) {
   const scratch = mkdtempSync(join(tmpdir(), 'bridge-b-test-'));
   const portFile = join(scratch, 'port');
@@ -86,6 +89,7 @@ function startBridge({ auth, upstreamBase }) {
     OPENROUTER_API_KEY: LANE_KEY,
     CC_LANE_MODEL: LANE_MODEL,
     OPENROUTER_BASE: upstreamBase,
+    BRIDGE_LANE_LOG: join(scratch, 'bridge-lane.jsonl'),
   };
   if (auth !== undefined) env.BRIDGE_AUTH = auth;
   const child = spawn(process.execPath, [BRIDGE_PATH, portFile], { env, stdio: ['ignore', 'pipe', 'pipe'] });
