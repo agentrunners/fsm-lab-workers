@@ -36,6 +36,7 @@ import {
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
   dispatchLadder, workerOverflowDecision, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
+  chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
@@ -571,7 +572,14 @@ async function main() {
   // sleep keeps the job occupied (free on public repos) and throttles ticks.
   // F-C: pacing under budget — min(interval-elapsed, remaining-RESERVE, 240s);
   // <= 0 skips pacing (a faster tick is harmless; the throttle is a nicety).
-  const stop = actionList.some(a => a.type === 'STOP_CHAIN' || a.type === 'HOLD_CHAIN') || pausedNow;
+  // T46/W-C3 (X24): the decision routes through chainContinuationDecision —
+  // the held-state arm is what keeps a pinger MARKER commit on a held chain
+  // from self-dispatching (the marker tick carries no STOP/HOLD action: the
+  // chain was already held; without the held arm it would restart the
+  // self-tick loop at runner cadence — F2's livelock class through the
+  // marker door).
+  const cont = chainContinuationDecision({ actions: actionList, state, pausedNow });
+  const stop = cont.stop;
   let chain = { ok: true };
   let selfTickSkipped = false;
   if (!stop) {
