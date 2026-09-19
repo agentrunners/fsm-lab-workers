@@ -328,6 +328,11 @@ async function ccWork(envelope, opts = {}) {
 // T46/W-D lane B (§D4-M4, the v2 fold): lane telemetry JOINS the allowlist —
 //   lane_stats      the cc adapter's bridge-JSONL aggregate (M2)
 //   key_index       D3's pool pick (lane C's real-lane producer lands there;
+//   pool_size       the pick's modulo base — rides EXACTLY like key_index
+//                   (W-D review fold A4, lens-2 F1): the journal's key_index
+//                   is an index into the pool ARRAY; without pool_size the
+//                   historical slots are ambiguous across pool redeploys
+//                   (the registry's git history was the only recovery)
 //   hop_telemetry   lane A's real-lane per-hop [{model, ms, status}])
 // Without these entries the adapter's richest data dies HERE — the exact
 // silent-drop class W-C2's prCandidates taught (M4's whole point: this
@@ -360,6 +365,9 @@ export function composeReportOutcome(classified, raw, durationMs) {
     outcome.lane_stats = raw.lane_stats;
   }
   if (Number.isFinite(raw?.key_index)) outcome.key_index = raw.key_index;
+  // W-D review fold (A4, lens-2 F1): the pool's SIZE rides beside the pick —
+  // the pair is the self-describing slot (index + modulo base) in the journal.
+  if (Number.isFinite(raw?.pool_size)) outcome.pool_size = raw.pool_size;
   if (Array.isArray(raw?.hop_telemetry) && raw.hop_telemetry.length) outcome.hop_telemetry = raw.hop_telemetry;
   return outcome;
 }

@@ -391,6 +391,44 @@ test('T44/F5: NUMERIC generation ordering — journal-10 is read AFTER journal-9
   } finally { lab.cleanup(); }
 });
 
+// T46/W-D review fold (A4, lens-2 F2) — the readJournalTail KIND filter: the
+// console's journal-sourced LANE section needs the last N REPORT records,
+// not the last N records of any kind. Mixed-kind journal, hand-built via the
+// F1 pattern (a raw file pushed through buildCommit) so the kinds interleave.
+test('W-D fold (A4): readJournalTail(n, kind) — REPORT-only tail scans past other kinds; n bounds the MATCHED count; the default is unchanged', () => {
+  const lab = mkLab(); try {
+    const st = new Store({ cwd: lab.clone });
+    st.init(boot('2026-09-06T10:00:00Z'));
+    st.fetch();
+    const dir = mkdtempSync(join(tmpdir(), 'fsm-jkind-'));
+    try {
+      const recs = [
+        { id: 'e101', ts: '2026-09-06T10:00:01Z', applied: true, kind: 'TICK', task: null },
+        { id: 'e102', ts: '2026-09-06T10:00:02Z', applied: true, kind: 'REPORT', task: 'A1', to: 'done', lane_stats: { calls: 1, ok: 1 } },
+        { id: 'e103', ts: '2026-09-06T10:00:03Z', applied: true, kind: 'CONTROL', command: 'pause' },
+        { id: 'e104', ts: '2026-09-06T10:00:04Z', applied: true, kind: 'REPORT', task: 'A2', to: 'done' },
+        { id: 'e105', ts: '2026-09-06T10:00:05Z', applied: true, kind: 'TIMEOUT', task: 'A3', from: 'assigned', to: 'ready' },
+      ];
+      writeFileSync(join(dir, 'journal.jsonl'), recs.map(r => JSON.stringify(r)).join('\n') + '\n');
+      const commit = st.buildCommit([[join(dir, 'journal.jsonl'), 'state/journal-1.jsonl']], [], st.headSha(), 'seed mixed-kind journal');
+      st.git(['push', 'origin', `${commit}:refs/heads/fsm-state`]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+    st.fetch();
+    // default: today's behavior — every kind rides, tail order
+    const all = st.readJournalTail(10);
+    assert.deepEqual(all.map(r => r.id), ['e101', 'e102', 'e103', 'e104', 'e105'], 'no kind filter: all five records in sequence order');
+    // REPORT-only: the scan SKIPS the interleaved kinds, tail order kept
+    const reports = st.readJournalTail(10, 'REPORT');
+    assert.deepEqual(reports.map(r => r.id), ['e102', 'e104'], 'only the REPORT records, oldest-first tail order');
+    assert.ok(reports.every(r => r.kind === 'REPORT'), 'no foreign kind leaks');
+    assert.deepEqual(reports[0].lane_stats, { calls: 1, ok: 1 }, 'the lane_stats payload rides the record (the console\'s source)');
+    // n bounds the MATCHED count (not the scanned lines): last 1 REPORT
+    assert.deepEqual(st.readJournalTail(1, 'REPORT').map(r => r.id), ['e104'], 'n=1 -> the newest REPORT record only');
+    // a kind that does not exist: empty (not an error, not the unfiltered tail)
+    assert.deepEqual(st.readJournalTail(10, 'PHASE'), [], 'a absent kind yields the empty tail');
+  } finally { lab.cleanup(); }
+});
+
 test('T44/F1: unparseable queue lines surface via readQueueEx (auditable before the drop)', () => {
   const lab = mkLab(); try {
     const st = new Store({ cwd: lab.clone });

@@ -168,10 +168,12 @@ export function queuedReply(cmd, queueId) {
 // the PURE half — the status screen (read-only, one screen)
 // ---------------------------------------------------------------------------
 
-// statusSummary({ state, depths, nowMs }) — phase, milestone, done/
-// quarantined counts, chain id + age of last_tick, queue depths (report/
+// statusSummary({ state, depths, nowMs, journalReports }) — phase, milestone,
+// done/quarantined counts, chain id + age of last_tick, queue depths (report/
 // control/intake), paused/halted, active task ids. NEVER writes anything.
-export function statusSummary({ state, depths = {}, nowMs = null }) {
+// journalReports (optional, the W-D review fold A4): the journal-tail REPORT
+// records — the LANE section's PRIMARY source (see laneSection).
+export function statusSummary({ state, depths = {}, nowMs = null, journalReports = null }) {
   if (!state) {
     return '**[fsm-console]** status: state.json is UNREADABLE on the state branch (absent or corrupt — the conductor\'s git-history recovery owns it; the watchdog alerts if the chain is also stale).';
   }
@@ -190,11 +192,13 @@ export function statusSummary({ state, depths = {}, nowMs = null }) {
   const active = tasks.filter(t => t && ACTIVE_STATUSES.has(t.status)).map(t => t.id);
   const total = tasks.length;
   const d = (n) => (Number.isFinite(n) ? n : 0);
-  // T46/W-D lane B (§D4 console): the LANE section — aggregated off the tasks'
-  // last_result.lane_stats (the drain's durable carry, M3; the same data the
-  // journal REPORT records hold — the state projection is the cheaper read).
-  // Absent on every legacy/pre-W-D record → the single "no telemetry" line.
-  const laneLines = laneSection(tasks);
+  // T46/W-D lane B (§D4 console) + the review fold (A4): the LANE section.
+  // PRIMARY source = journalReports (the caller's readJournalTail(64,
+  // 'REPORT') — the durable record; survives pruning + rebuild); FALLBACK =
+  // the tasks' last_result.lane_stats (the drain's durable carry, M3; the
+  // state projection is the cheaper read but the ~20-tick window). Absent
+  // on every legacy/pre-W-D record → the single "no telemetry" line.
+  const laneLines = laneSection(tasks, journalReports);
   return [
     `**[fsm-console]** status — chain \`${chain.id ?? '?'}\` (last tick ${age})`,
     `- phase: ${proj.phase ?? '?'} · milestone ${proj.milestone ?? '?'}/${proj.milestones_total ?? '?'} · mode ${proj.mode ?? '?'}`,
@@ -205,17 +209,26 @@ export function statusSummary({ state, depths = {}, nowMs = null }) {
   ].join('\n');
 }
 
-// T46/W-D lane B: aggregate the per-task lane_stats/hop_telemetry into the
-// one-screen lane lines. Pure + exported for the pins.
-export function laneSection(tasks) {
-  const withStats = (tasks || []).filter(t => t?.last_result && t.last_result.lane_stats && typeof t.last_result.lane_stats === 'object');
-  if (!withStats.length) return ['- lanes: no telemetry yet (pre-W-D records or no turns since the fold)'];
+// T46/W-D lane B (§D4 console): the LANE section — the W-D review fold
+// (A4, lens-2 F2 + lens-1 F3) makes the JOURNAL the PRIMARY source:
+// statusSummary's caller passes the last LANE_JOURNAL_WINDOW REPORT records
+// (store.readJournalTail(64, 'REPORT')) — the durable record that survives
+// task pruning AND a journal rebuild. The state-side last_result view (the
+// pre-terminal window, ~prune_tasks_after_ticks) stays as the FALLBACK when
+// the journal yields nothing usable; records lacking lane_stats (old-format
+// / pre-fold) are skipped gracefully — absent everywhere → the single
+// "no telemetry" line. Pure + exported for the pins.
+export const LANE_JOURNAL_WINDOW = 64;
+
+const laneStatsGuard = (s) => s && typeof s === 'object' && !Array.isArray(s);
+
+// the shared accumulator: one lane_stats-shaped object per entry
+function accumulateLaneStats(statsList) {
   let calls = 0, ok = 0, err429 = 0, err5xx = 0, tokens = 0, cost = 0;
   const lat = [];
   const models = {};
   const classes = {};
-  for (const t of withStats) {
-    const s = t.last_result.lane_stats;
+  for (const s of statsList) {
     calls += Number(s.calls) || 0;
     ok += Number(s.ok) || 0;
     err429 += Number(s.err429) || 0;
@@ -226,15 +239,41 @@ export function laneSection(tasks) {
     for (const [m, mm] of Object.entries(s.models || {})) models[m] = (models[m] || 0) + (Number(mm.calls) || 0);
     for (const [k, v] of Object.entries(s.rate_classes || {})) classes[k] = (classes[k] || 0) + (Number(v) || 0);
   }
-  lat.sort((a, b) => a - b);
-  const p = (q) => lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * q))] : null;
-  const top = Object.entries(models).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, n]) => `${m.split('/').pop()}:${n}`).join(' ');
-  const cls = Object.entries(classes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${k}:${v}`).join(' ');
+  return { calls, ok, err429, err5xx, tokens, cost, lat, models, classes };
+}
+
+function renderLaneLines(acc, sourceLabel) {
+  acc.lat.sort((a, b) => a - b);
+  const p = (q) => acc.lat.length ? acc.lat[Math.min(acc.lat.length - 1, Math.floor(acc.lat.length * q))] : null;
+  const top = Object.entries(acc.models).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, n]) => `${m.split('/').pop()}:${n}`).join(' ');
+  const cls = Object.entries(acc.classes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${k}:${v}`).join(' ');
   const lines = [
-    `- lanes: ${calls} calls (${ok} ok · ${err429}×429 · ${err5xx}×5xx) · p50 ${p(0.5) ?? '?'}ms · p95 ${p(0.95) ?? '?'}ms · tokens ${tokens} · cost $${cost.toFixed(4)} · ${withStats.length} tasks`,
+    `- lanes: ${acc.calls} calls (${acc.ok} ok · ${acc.err429}×429 · ${acc.err5xx}×5xx) · p50 ${p(0.5) ?? '?'}ms · p95 ${p(0.95) ?? '?'}ms · tokens ${acc.tokens} · cost $${acc.cost.toFixed(4)} · ${sourceLabel}`,
   ];
   if (top) lines.push(`- lane models: ${top}${cls ? ` · limits: ${cls}` : ''}`);
   return lines;
+}
+
+export function laneSection(tasks, journalReports = null) {
+  // PRIMARY: the journal tail's REPORT records (the caller read them via
+  // store.readJournalTail(LANE_JOURNAL_WINDOW, 'REPORT')). Old-format
+  // records without lane_stats are skipped, never crash the screen.
+  if (Array.isArray(journalReports) && journalReports.length) {
+    const statsList = journalReports
+      .filter(r => r && r.kind === 'REPORT' && laneStatsGuard(r.lane_stats))
+      .map(r => r.lane_stats);
+    if (statsList.length) {
+      return renderLaneLines(accumulateLaneStats(statsList), `${statsList.length} turns (journal tail)`);
+    }
+  }
+  // FALLBACK: the state-side view (last_result — the fast pre-terminal
+  // window; decays after pruning, resets after a rebuild)
+  const withStats = (tasks || []).filter(t => t?.last_result && laneStatsGuard(t.last_result.lane_stats));
+  if (!withStats.length) return ['- lanes: no telemetry yet (pre-W-D records or no turns since the fold)'];
+  return renderLaneLines(
+    accumulateLaneStats(withStats.map(t => t.last_result.lane_stats)),
+    `${withStats.length} tasks (state window)`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +363,16 @@ export async function runConsole({ event, env = {}, api, store, now = () => new 
       control: store.readControlQueue().length,
       intake: store.readIntakeQueue().length,
     };
-    const body = statusSummary({ state, depths, nowMs: Date.parse(now()) });
+    // T46/W-D review fold (A4): the LANE section's PRIMARY source — the
+    // journal tail's REPORT records (the durable record the design named;
+    // the state view is the ~prune-window fallback). A store seam without
+    // readJournalTail (older fakes) or a failed read degrades gracefully
+    // to the fallback — the status screen never goes red over telemetry.
+    let journalReports = null;
+    if (typeof store.readJournalTail === 'function') {
+      try { journalReports = store.readJournalTail(LANE_JOURNAL_WINDOW, 'REPORT'); } catch { journalReports = null; }
+    }
+    const body = statusSummary({ state, depths, nowMs: Date.parse(now()), journalReports });
     const okc = await postComment(api, repo, issue.number, body);
     console.log(`CONSOLE-STATUS by @${author} — ${okc ? 'one-screen reply posted' : 'REPLY FAILED'}`);
     return { outcome: 'status', exitCode: okc ? 0 : 2 };

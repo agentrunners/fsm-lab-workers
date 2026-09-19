@@ -101,7 +101,9 @@ function mkApi({ permission = 'write', permissionStatus = 200, commentStatus = 2
 }
 
 // the store seam: a recording fake — `writes` must stay EMPTY on the status lane
-function mkStore({ state = null, control = [], intake = [], report = [], enqueueResult = { ok: true } } = {}) {
+// (W-D review fold A4: readJournalTail joined the read set — the journal tail
+// is the LANE section's primary source)
+function mkStore({ state = null, control = [], intake = [], report = [], journalTail = [], enqueueResult = { ok: true } } = {}) {
   const reads = [];
   const writes = [];
   const store = {
@@ -110,6 +112,10 @@ function mkStore({ state = null, control = [], intake = [], report = [], enqueue
     readControlQueue() { reads.push('readControlQueue'); return control; },
     readIntakeQueue() { reads.push('readIntakeQueue'); return intake; },
     readQueue() { reads.push('readQueue'); return report; },
+    readJournalTail(n = 64, kind = null) {
+      reads.push(`readJournalTail(${n},${kind})`);
+      return kind === 'REPORT' ? journalTail : journalTail;
+    },
     enqueueControl(rec) { writes.push({ method: 'enqueueControl', rec }); return enqueueResult; },
   };
   return { store, reads, writes };
@@ -419,6 +425,42 @@ test('status: the screen carries phase, milestone, counts, chain id + last-tick 
   assert.match(body, /active \[/);
   assert.match(body, /- holds: paused=false · halted=false/);
   assert.match(body, /- queues: report 0 · control 0 · intake 2/);
+});
+
+// T46/W-D review fold (A4, lens-2 F2 + lens-1 F3) — the status lane's PRIMARY
+// lane source is the JOURNAL tail: runConsole reads
+// store.readJournalTail(LANE_JOURNAL_WINDOW, 'REPORT') (a READ — the status
+// lane stays write-free) and the reply's LANE section aggregates the REPORT
+// records' lane_stats. Old-format records (no lane_stats) degrade gracefully.
+test('status (the fold, A4): the LANE section sources from readJournalTail(64, REPORT) — read-only kept, old-format records degrade', async () => {
+  const { api, calls } = mkApi();
+  const { store, reads, writes } = mkStore({
+    state: STATUS_STATE,
+    journalTail: [
+      { kind: 'REPORT', task: 'A1', lane_stats: { calls: 2, ok: 1, err429: 1, err5xx: 0, tokens: 40, cost: 0.01, p50_ms: 250, p95_ms: 300, models: { 'z-ai/glm-5.3-flash': { calls: 2 } }, rate_classes: { openrouter_free_tier_daily: 1 } } },
+      { kind: 'REPORT', task: 'A2' },   // old-format: no lane_stats — skipped
+    ],
+  });
+  const r = await runConsole({ event: commentEvent({ body: 'status' }), env: ENV, api, store, now: NOW });
+  assert.equal(r.outcome, 'status');
+  assert.equal(r.exitCode, 0);
+  assert.equal(writes.length, 0, 'the journal tail read is a READ — the status lane stays write-free');
+  assert.ok(reads.includes('readJournalTail(64,REPORT)'), 'the kind-filtered tail read fired (the primary lane source)');
+  const body = calls.find(x => x.method === 'POST' && x.path.endsWith('/comments')).body.body;
+  assert.match(body, /- lanes: 2 calls \(1 ok · 1×429 · 0×5xx\)/);
+  assert.match(body, /1 turns \(journal tail\)/);
+  assert.match(body, /glm-5\.3-flash:2/);
+  assert.match(body, /- phase: executing/);   // the rest of the screen survives
+  // the graceful-missing pin: an ALL-old-format journal (pre-fold records)
+  // renders the fallback view — never a crash, never a red run
+  const { api: api2, calls: calls2 } = mkApi();
+  const { store: store2 } = mkStore({ state: STATUS_STATE, journalTail: [{ kind: 'REPORT', task: 'A9' }, { kind: 'TICK' }] });
+  const r2 = await runConsole({ event: commentEvent({ body: 'status' }), env: ENV, api: api2, store: store2, now: NOW });
+  assert.equal(r2.outcome, 'status');
+  assert.equal(r2.exitCode, 0);
+  const body2 = calls2.find(x => x.method === 'POST' && x.path.endsWith('/comments')).body.body;
+  assert.match(body2, /no telemetry yet/, 'old-format journal records render the graceful absent line');
+  assert.match(body2, /- phase: executing/);
 });
 
 test('status: unreadable state → an honest one-screen reply (never a silent red)', async () => {
