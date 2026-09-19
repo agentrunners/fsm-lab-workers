@@ -412,3 +412,5 @@ real work completes).** The straggler re-pause is a benign race (the window
 persists across a resume that races in-flight grinds) — candidate polish for
 the W-D review round: clear the window only after the in-flight cohort's
 reports drain, or accept the double-resume as operator routine.
+
+**Session-close amendment (01:44Z):** the epoch is STILL DRAINING at session close — M2 unlocked (4 ready + 4 assigned) after M1's terminals: the chain is alive and progressing post-resume (the resume→work-completes half beyond T-101: milestone advancement is the structural proof). The dots-studio lane quarantines honestly on the harder tasks (`error_max_turns` — weak-model symptoms, exactly what the W-D model swap fixes). Next session records the final halt tally. EPOCH_MODE restored to 'mock' at 01:45Z (mid-flight safe — mode is baked at genesis).
