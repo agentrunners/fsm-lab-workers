@@ -59,13 +59,24 @@
 //   Writes the chosen port to <port-file> when listening, then serves.
 
 import { createServer } from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, appendFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { laneLogLine, parseLaneTelemetry } from './lane-telemetry.mjs';
 
 const PORT_FILE = process.argv[2];
 const UPSTREAM_BASE = (process.env.OPENROUTER_BASE || 'https://openrouter.ai').replace(/\/+$/, '');
 const LANE_KEY = process.env.OPENROUTER_API_KEY || process.env.OPENROUTER_API_KEY_2 || '';
 const LANE_MODEL = process.env.CC_LANE_MODEL || '';
 const BRIDGE_AUTH = process.env.BRIDGE_AUTH || '';   // M-3: enforced only when present
+
+// T46/W-D lane B (§D4-M2, the v2 fold): the per-call telemetry log — ONE
+// append-only JSON line per upstream call (worker/lane-telemetry.mjs shapes
+// it). The path comes from the ADAPTER (the turn-scoped scratch dir); a
+// standalone spawn defaults to <cwd>/bridge-lane.jsonl. The file is the
+// contract: the adapter SIGKILLs this process (no graceful shutdown — see
+// the lifecycle note at the bottom), so NO in-memory stat survives — only
+// the fs append does.
+const LANE_LOG = process.env.BRIDGE_LANE_LOG || join(process.cwd(), 'bridge-lane.jsonl');
 
 // m-8: request-body cap — an over-cap body is a LOUD 413; it is never
 // buffered whole and never forwarded.
@@ -75,6 +86,11 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 // not just idle time — a mid-stream abort surfaces as BRIDGE-FAILED and the
 // client's stream simply ends.
 const UPSTREAM_TIMEOUT_MS = 300_000;
+// T46/W-D lane B: the tee-scan cap — the response body is duplicated into a
+// scan buffer for the usage/error extraction (4MB is ~2 orders past any real
+// completion body; over-cap keeps FORWARDING verbatim but drops the scan —
+// the proxy is never bounded by the telemetry).
+const MAX_SCAN_BYTES = 4 * 1024 * 1024;
 
 if (!PORT_FILE) {
   console.error('cc-bridge: usage: node cc-bridge.mjs <port-file>');
@@ -214,31 +230,60 @@ const server = createServer(async (req, res) => {
         'anthropic-version': '2023-06-01',
       };
       if (req.headers['anthropic-beta']) fwd['anthropic-beta'] = req.headers['anthropic-beta'];
-      const up = await fetch(`${UPSTREAM_BASE}/api/v1/messages${u.search}`, {
-        method: 'POST',
-        headers: fwd,
-        body,
-        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-      });
-      // m-8: forward a SAFE subset of upstream response headers back —
-      // request ids, retry-after, rate-limit telemetry. NEVER the framing
-      // headers (content-length/transfer-encoding — undici re-frames the
-      // passthrough) nor content-encoding (undici decompresses; forwarding
-      // it would corrupt the body).
-      const respHeaders = { 'Content-Type': up.headers.get('content-type') || 'application/json' };
-      for (const h of ['request-id', 'anthropic-request-id', 'retry-after']) {
-        const v = up.headers.get(h);
-        if (v) respHeaders[h] = v;
+      // T46/W-D lane B (§D4-M2): the upstream exchange is TEE-SCANNED — every
+      // chunk is written through to the client the MOMENT it arrives (the
+      // streaming pin holds: no whole-body buffering before res.write) while
+      // a bounded duplicate accumulates for the usage/error extraction at
+      // stream end. The ONE telemetry line lands in a finally — it records
+      // success, transport failure, AND abort alike (the adapter may read the
+      // file after SIGKILLing this process mid-anything; append-only is the
+      // survival property).
+      const t0 = Date.now();
+      let up = null;
+      let scanChunks = [];
+      let scanBytes = 0;
+      let scanOn = true;
+      let exchangeErr = null;
+      try {
+        up = await fetch(`${UPSTREAM_BASE}/api/v1/messages${u.search}`, {
+          method: 'POST',
+          headers: fwd,
+          body,
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+        });
+        // m-8: forward a SAFE subset of upstream response headers back —
+        // request ids, retry-after, rate-limit telemetry. NEVER the framing
+        // headers (content-length/transfer-encoding — undici re-frames the
+        // passthrough) nor content-encoding (undici decompresses; forwarding
+        // it would corrupt the body).
+        const respHeaders = { 'Content-Type': up.headers.get('content-type') || 'application/json' };
+        for (const h of ['request-id', 'anthropic-request-id', 'retry-after']) {
+          const v = up.headers.get(h);
+          if (v) respHeaders[h] = v;
+        }
+        for (const [k, v] of up.headers) {
+          if (/^(x-ratelimit-|anthropic-ratelimit-)/.test(k)) respHeaders[k] = v;
+        }
+        res.writeHead(up.status, respHeaders);
+        if (up.body) {
+          // stream the upstream body through (SSE included) — teeing into the
+          // scan buffer as it goes
+          for await (const chunk of up.body) {
+            res.write(chunk);
+            if (scanOn) {
+              scanBytes += chunk.length;
+              if (scanBytes > MAX_SCAN_BYTES) scanOn = false;   // drop the scan, keep forwarding
+              else scanChunks.push(chunk);
+            }
+          }
+        }
+        res.end();
+      } catch (e) {
+        exchangeErr = e;
+        throw e;   // the outer handler answers the loud 502 (unchanged shape)
+      } finally {
+        writeLaneLine(t0, up, scanOn ? scanChunks : [], exchangeErr);
       }
-      for (const [k, v] of up.headers) {
-        if (/^(x-ratelimit-|anthropic-ratelimit-)/.test(k)) respHeaders[k] = v;
-      }
-      res.writeHead(up.status, respHeaders);
-      if (up.body) {
-        // stream the upstream body through (SSE included)
-        for await (const chunk of up.body) res.write(chunk);
-      }
-      res.end();
       console.log(`BRIDGE messages${u.search} -> ${up.status} (${body.length}B in)`);
       return;
     }
@@ -256,6 +301,34 @@ const server = createServer(async (req, res) => {
     }
   }
 });
+
+// T46/W-D lane B (§D4-M2): the per-call JSONL append — BEST-EFFORT by
+// design: a telemetry write failure logs LOUD and NEVER touches the proxy
+// path (the credential lane answers the client regardless). Transport
+// failures record status:null + the error name as err_code; the body scan
+// yields tokens/cost/class when the surface emits them (documented null
+// otherwise — the m7 accept-null state, not a silent zero).
+function writeLaneLine(t0, up, scanChunks, exchangeErr) {
+  try {
+    const bodyText = scanChunks.length ? Buffer.concat(scanChunks).toString('utf8') : '';
+    const headers = up ? Object.fromEntries(up.headers.entries()) : {};
+    const tele = parseLaneTelemetry({ status: up ? up.status : null, headers, bodyText });
+    const line = laneLogLine({
+      ts: t0,
+      model: LANE_MODEL,
+      status: up ? up.status : null,
+      ms: Date.now() - t0,
+      tokens_in: tele.tokens_in,
+      tokens_out: tele.tokens_out,
+      cost: tele.cost,
+      rate_class: tele.rate_class,
+      err_code: exchangeErr ? String(exchangeErr?.name ?? exchangeErr ?? 'transport') : tele.err_code,
+    });
+    appendFileSync(LANE_LOG, JSON.stringify(line) + '\n');
+  } catch (e) {
+    console.error(`BRIDGE-LANELOG-ERR ${String(e?.message ?? e).slice(0, 120)} (telemetry is best-effort — the proxy is unaffected)`);
+  }
+}
 
 server.listen(0, '127.0.0.1', () => {
   const { port } = server.address();

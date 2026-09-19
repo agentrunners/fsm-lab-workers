@@ -439,7 +439,10 @@ test('statusSummary: pure — the paused/halted + active-ids projections from ar
   assert.match(out, /paused=true · halted=false/);
   assert.match(out, /queues: report 3 · control 1 · intake 0/);
   assert.match(out, new RegExp(`active \\[${assigned.join(', ').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`));
-  assert.equal(out.split('\n').length, 5, 'one screen, five lines');
+  // T46/W-D lane B: the screen carries the LANE section — six lines now
+  // (five + the lane telemetry line; legacy records render the no-telemetry line)
+  assert.equal(out.split('\n').length, 6, 'one screen, six lines (the W-D lane section)');
+  assert.match(out, /- lanes: /);
 });
 
 // ---------------------------------------------------------------------------
