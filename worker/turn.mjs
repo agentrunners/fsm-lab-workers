@@ -82,13 +82,17 @@ export function sleepCapMs(env = process.env) {
 // seam; one OpenRouter completion stands in for a CC turn), on the
 // env-driven model chain.
 //
-// The chain: [OPENROUTER_MODEL env (optional), dots-studio (the re-armed
-// free lane), nemotron, cohere] — the RETIRED minimax/minimax-m3:free slug
-// (live 404, 46-A4) is gone. On an INFRA-class lane failure (transport /
-// 401 / 402 / 429 / 5xx — lane/key state, operator action) the turn hops ONCE
-// to the next model, bounded by budget.lane_attempts (lane_attempts 1 = no
-// hop). WORK-class failures (empty completion, deterministic 4xx) do NOT
-// hop — the lane answered; rotating it cannot change the answer.
+// The chain (T46/W-D §D1): [OPENROUTER_MODEL env (optional), nemotron-3.5,
+// deepseek-v4-flash, cohere] — the s19 eval verdict. dots-studio demoted OUT
+// (0% content at the production max_tokens — reasoning eats the budget) and
+// nemotron-3-ultra demoted to never (p95 32s + 30s burst walls, the exact
+// upstream-rate-limit "long container wait" class). The RETIRED
+// minimax/minimax-m3:free slug (live 404, 46-A4) stays gone. On an INFRA-class
+// lane failure (transport / 401 / 402 / 429 / 5xx — lane/key state, operator
+// action) the turn hops ONCE to the next model, bounded by
+// budget.lane_attempts (lane_attempts 1 = no hop). WORK-class failures (empty
+// completion, deterministic 4xx) do NOT hop — the lane answered; rotating it
+// cannot change the answer.
 //
 // Returns the RAW lane result (pre-normalization — runTurn's single
 // classifyOutcome call is the one normalizer):
@@ -99,8 +103,8 @@ export function sleepCapMs(env = process.env) {
 // ---------------------------------------------------------------------------
 
 export const REAL_MODEL_CHAIN_DEFAULTS = [
-  'dots-studio/dots-3-note-preview:free',
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
+  'nvidia/nemotron-3.5-lightning:free',
+  'deepseek/deepseek-v4-flash-0731:free',
   'cohere/north-mini-code:free',
 ];
 
@@ -118,10 +122,15 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
   const key = env.OPENROUTER_API_KEY;
   const t0 = Date.now();
   const models = [];
+  // T46/W-D §D4-G5 (the real-lane half): per-hop {model, ms, status} — the
+  // per-hop latency the 19-b logging audit found missing. OPTIONAL field on
+  // the raw lane return (the report/drain fold is lane B's t46/wd-b).
+  const hopTelemetry = [];
   const finish = (raw) => ({
     ...raw,
     models: [...models],
     lane_attempts_used: models.length,
+    hop_telemetry: hopTelemetry.map(h => ({ ...h })),
     telemetry: { turns: 1, wall_ms: Date.now() - t0, lane_attempts_used: models.length },
     duration_ms: Date.now() - t0,
   });
@@ -129,6 +138,7 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
   for (let i = 0; i < maxTries; i++) {
     const model = chain[i];
     models.push(model);
+    const hopT0 = Date.now();
     let r;
     try {
       r = await fetchImpl('https://openrouter.ai/api/v1/chat/completions', {
@@ -140,18 +150,24 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
             { role: 'system', content: 'You are a task worker. Reply with a one-line result summary.' },
             { role: 'user', content: `Task ${envelope.task_ref.id}: ${envelope.prompt}` },
           ],
-          max_tokens: 64,
+          // T46/W-D §D1: 64 starved every reasoning-style model (content:null
+          // → work_failed 'empty-completion' churn that looked like model
+          // failure); 512 is the measured 100%-content shape on the new chain
+          // (free models cost nothing extra; ~$0.0001 on paid).
+          max_tokens: 512,
         }),
         signal: AbortSignal.timeout(150_000),  // bounded: the lease is the semantic backstop, not the hang
       });
     } catch (e) {
       // transport throw (AbortSignal timeout / DNS / socket) — infra class
+      hopTelemetry.push({ model, ms: Date.now() - hopT0, status: 'transport' });
       if (i === maxTries - 1) {
         return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last lane-transport)` });
       }
       continue;
     }
     const d = await r.json().catch(() => ({}));
+    hopTelemetry.push({ model, ms: Date.now() - hopT0, status: r.status });
     const content = d?.choices?.[0]?.message?.content || null;
     if (r.status === 200) {
       // done / empty-completion — both terminal for the turn (the lane

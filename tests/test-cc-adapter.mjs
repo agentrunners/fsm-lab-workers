@@ -103,13 +103,13 @@ test('cc lanes: the key pool × model chain product, KEY-MAJOR flatten (D2)', ()
   const lanes = ccLanes(env);
   assert.deepEqual(lanes.map(l => [l.keyIndex, l.model]), [
     [1, 'vendor/custom-model'],
-    [1, 'dots-studio/dots-3-note-preview:free'],
-    [1, 'nvidia/nemotron-3-ultra-550b-a55b:free'],
-    [1, 'cohere/north-mini-code:free'],
+    [1, 'deepseek/deepseek-v4.1-flash'],
+    [1, 'z-ai/glm-5.3-flash'],
+    [1, 'nvidia/nemotron-3.5-lightning:free'],
     [2, 'vendor/custom-model'],
-    [2, 'dots-studio/dots-3-note-preview:free'],
-    [2, 'nvidia/nemotron-3-ultra-550b-a55b:free'],
-    [2, 'cohere/north-mini-code:free'],
+    [2, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'z-ai/glm-5.3-flash'],
+    [2, 'nvidia/nemotron-3.5-lightning:free'],
   ], 'every model on key 1 before key 2\'s first');
   assert.ok(lanes.every(l => l.key === (l.keyIndex === 1 ? KEY1 : KEY2)));
 });
@@ -123,11 +123,15 @@ test('cc lanes: a single key collapses the pool; an empty pool yields NO lanes',
   assert.equal(ccKeyPool({ OPENROUTER_API_KEY_2: 'x' }).length, 1, 'key 2 alone is a valid pool');
 });
 
-test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are the live-probed free lanes', () => {
+test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are the s19 eval verdict (D2)', () => {
+  assert.deepEqual(CC_MODEL_CHAIN_DEFAULTS, ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'nvidia/nemotron-3.5-lightning:free'],
+    'D2: deepseek-v4.1-flash primary (20.6s turn, 4/4 calls, flawless content), glm-5.3-flash fallback (provider diversity), nemotron free tail');
   assert.deepEqual(ccModelChain({}), CC_MODEL_CHAIN_DEFAULTS);
   assert.equal(ccModelChain({ CC_MODEL: ' x/y ' })[0], 'x/y');
   assert.deepEqual(ccModelChain({ CC_MODEL: '' }), CC_MODEL_CHAIN_DEFAULTS, 'empty = absent');
   assert.ok(!JSON.stringify(ccModelChain({})).includes('minimax'), 'the retired slug stays dead');
+  assert.ok(!JSON.stringify(CC_MODEL_CHAIN_DEFAULTS).includes('deepseek-v4-flash-0731'),
+    'D2 NEVER: the hallucinating free slug on the cc lane (silent content-poison, measured live)');
 });
 
 test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output, the SA-5 denies', () => {
@@ -287,10 +291,10 @@ test('M-1 (bridge boundary, pure): the merged bridge-mode env — bridge base + 
 test('cc classify: the normal done — content extracted, single lane, no hop', async () => {
   const { result, roots } = await turn(fakeEnv());
   assert.equal(classifyOutcome(result).status, 'done');
-  assert.match(result.content, /fake-cc ok: completed the task on dots-studio/);
+  assert.match(result.content, /fake-cc ok: completed the task on deepseek\/deepseek-v4\.1-flash/);
   assert.equal(result.reasoning, null);
   assert.equal(result.lane_attempts_used, 1);
-  assert.deepEqual(result.models, ['dots-studio/dots-3-note-preview:free']);
+  assert.deepEqual(result.models, ['deepseek/deepseek-v4.1-flash']);
   assert.deepEqual(result.artifact_refs, [], 'nothing written = nothing claimed');
   assert.equal(result.telemetry.lanes[0].class, 'done');
   assert.equal(result.telemetry.lanes[0].rc, 0);
@@ -444,19 +448,19 @@ test('cc rotation: key-1 lanes 429 → hops through the chain to a KEY-2 lane �
   assert.equal(classifyOutcome(result).status, 'done', 'the rotation recovered the turn in-process');
   assert.equal(result.lane_attempts_used, 4, '3 key-1 lanes burned, the 4th (key 2, first model) completed');
   assert.deepEqual(result.models, [
-    'dots-studio/dots-3-note-preview:free',
-    'nvidia/nemotron-3-ultra-550b-a55b:free',
-    'cohere/north-mini-code:free',
-    'dots-studio/dots-3-note-preview:free',
+    'deepseek/deepseek-v4.1-flash',
+    'z-ai/glm-5.3-flash',
+    'nvidia/nemotron-3.5-lightning:free',
+    'deepseek/deepseek-v4.1-flash',
   ], 'key-major: the full chain on key 1, then key 2');
   // the SECOND spawn's boundary already shows the rotated MODEL (same key)
   const e1 = readEcho(roots, 1);
   assert.equal(e1.env.ANTHROPIC_AUTH_TOKEN, KEY1);
-  assert.equal(e1.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3-ultra-550b-a55b:free', 'lane 2 = the next model on key 1');
+  assert.equal(e1.env.ANTHROPIC_MODEL, 'z-ai/glm-5.3-flash', 'lane 2 = the next model on key 1');
   // the KEY rotation is visible from spawn 4 on
   const e4 = readEcho(roots, 3);
   assert.equal(e4.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the key pool rotated');
-  assert.equal(e4.env.ANTHROPIC_MODEL, 'dots-studio/dots-3-note-preview:free');
+  assert.equal(e4.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.class]), [
     [1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done'],
   ]);
@@ -526,7 +530,7 @@ test('cc transcripts: the full turn lands in the LOCAL dir (fake mode) BEFORE cc
   const meta = JSON.parse(readFileSync(join(roots.transcriptsDir, 'sessions/T1/test-run-a2.meta.json'), 'utf8'));
   assert.ok(txt.includes('--- PROMPT ---') && txt.includes('transcribe me'));
   assert.ok(txt.includes('--- RESULT ---') && txt.includes('done'));
-  assert.ok(txt.includes('lane 1: key#1 dots-studio'));
+  assert.ok(txt.includes('lane 1: key#1 deepseek/deepseek-v4.1-flash'));
   assert.equal(meta.task, 'T1');
   assert.equal(meta.run_id, 'test-run');
   assert.equal(meta.attempt, 2);
