@@ -93,6 +93,25 @@ jobs:
             echo "INSTALL-SKIPPED mode=$MODE (non-cc dispatch — no CC CLI needed)"
           fi
 
+      - name: Mask the key-pool secrets (per split key)
+        # T46/W-D review fold (A5, lens-2 F3): GitHub auto-masks only the
+        # JOINED secret string — the ~68 individual pool keys would render in
+        # cleartext if any future log/error/tool output ever quoted ONE key.
+        # Registering a mask per key (defense-in-depth at the workflow layer;
+        # the denylist prevents env INHERITANCE, not log ECHO) makes any
+        # future single-key appearance render as ***. Fails harmless on an
+        # empty pool (var unset / secret absent). The values themselves are
+        # never echoed — only the ::add-mask:: registration.
+        env:
+          POOL_RAW: ${{ secrets.OPENROUTER_KEY_POOL || '' }}
+        run: |
+          if [ -n "$POOL_RAW" ]; then
+            printf '%s\n' "$POOL_RAW" | tr ',' '\n' | while IFS= read -r k; do
+              k="$(printf '%s' "$k" | xargs)"
+              if [ -n "$k" ]; then echo "::add-mask::${k}"; fi
+            done
+          fi
+
       - name: Work the task
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}

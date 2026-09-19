@@ -287,6 +287,17 @@ test('pool: B1 workflow pin — worker.yml\'s "Work the task" env carries the ON
       const at = text.indexOf(line);
       const run = text.indexOf('run: node worker/turn.mjs');
       assert.ok(step !== -1 && at > step && at < run, 'the line rides INSIDE the Work-the-task step env block (before the run)');
+      // W-D review fold (A5, lens-2 F3): the per-key mask step — one
+      // ::add-mask:: registration per comma-split pool key, BEFORE the turn
+      // step (the masks must be live before any worker output could echo a
+      // single key). The step reads the secret via its OWN env slot
+      // (POOL_RAW) so the exact B1 line stays the ONLY exact-line hit.
+      const maskStep = text.indexOf('name: Mask the key-pool secrets');
+      assert.ok(maskStep !== -1, 'the mask step exists');
+      assert.ok(maskStep < step, 'the mask step PRECEDES Work the task');
+      assert.ok(/::add-mask::/.test(text), 'the mask registration command is present');
+      assert.ok(text.includes('tr \',\' \'\\n\''), 'the comma-split loop (per-key masks)');
+      assert.equal(text.split(line).length - 1, 1, 'the exact B1 pool env line appears exactly ONCE (the mask step reads POOL_RAW, not the B1 line)');
     } else {
       assert.ok(!text.includes('OPENROUTER_KEY_POOL'), `${f}: the secrets-free contract is untouched (no pool reference)`);
     }
