@@ -624,9 +624,10 @@ test('X20-run-1 lesson: an ISO-string now() clock fails LOUD (the NaN-wall insta
 });
 
 test('X20 run-4 lesson: the bridge spawns, listens on 127.0.0.1, synthesizes the models route, and stops cleanly', async () => {
-  // startBridge lives in the adapter (not exported) — drive the bridge
-  // contract directly instead: spawn cc-bridge.mjs (no network needed
-  // until a request arrives) and check the port-file contract
+  // startBridge IS exported (the W-D fold's A3 glue pin drives it in
+  // tests/test-cc-bridge.mjs — the bridge env wiring at the spawn seam);
+  // THIS pin stays on the raw bridge contract: spawn cc-bridge.mjs (no
+  // network needed until a request arrives) and check the port-file contract
   const { spawn } = await import('node:child_process');
   const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');

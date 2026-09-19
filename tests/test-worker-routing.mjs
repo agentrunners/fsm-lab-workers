@@ -18,7 +18,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runTurn, realWork, realModelChain, sleepCapMs } from '../worker/turn.mjs';
@@ -225,6 +225,42 @@ test('routing: W2 payload with mode=cc — the epoch-mode lane reaches the adapt
   assert.match(h.enqueued[0].outcome.artifact, /fake-cc ok/);
   // the W2-minted prompt (title + quoted brief) is what the CLI received
   assert.ok(h.enqueued[0].outcome.telemetry.lanes?.length >= 1);
+});
+
+// T46/W-D review fold (A3, lens-1 F4) — the lane_stats GLUE pin: the attach
+// chain runTurn(laneLogPath) -> ccTurn opts -> collectLaneStats at finalize
+// -> composeReportOutcome's allowlist -> the ENQUEUED outcome was unpinned
+// (the "seam pin injects a pre-written bridge-lane JSONL" the code comment
+// promised did not exist — a dropped option or a finalize refactor anywhere
+// in the middle passed every pure pin and silently killed the D4 fold).
+// FIXTURE-DRIVEN by design: a pre-written bridge-lane JSONL at the seam path,
+// no spawned bridge (the bridge env wiring is the companion pin in
+// tests/test-cc-bridge.mjs).
+test('routing: MODE=cc laneLogPath glue — a pre-written bridge-lane JSONL becomes outcome.lane_stats (the aggregation attach)', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'wd-fold-glue-'));
+  try {
+    const laneLog = join(scratch, 'bridge-lane.jsonl');
+    writeFileSync(laneLog, [
+      JSON.stringify({ ts: '2026-09-16T12:00:00Z', model: 'test/lane-model:free', status: 200, ms: 100, tokens_in: 7, tokens_out: 3, cost: 0.0002, rate_class: '', err_code: null }),
+      JSON.stringify({ ts: '2026-09-16T12:00:01Z', model: 'test/lane-model:free', status: 429, ms: 50, tokens_in: 0, tokens_out: 0, cost: 0, rate_class: 'openrouter_free_tier_daily', err_code: 429 }),
+    ].join('\n') + '\n');
+    const h = makeHarness({ cp: legacyCp({ mode: 'cc', behavior: 'fast' }), env: ccEnv() });
+    const r = await h.turn({ laneLogPath: laneLog });
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.reported, true);
+    assert.equal(h.enqueued[0].outcome.status, 'done', 'the fake CLI answers (the lane stats ride a DONE report — the allowlist path)');
+    const ls = h.enqueued[0].outcome.lane_stats;
+    assert.ok(ls && typeof ls === 'object' && !Array.isArray(ls), 'the aggregated lane_stats rides the enqueued outcome');
+    assert.equal(ls.calls, 2, 'both fixture lines counted');
+    assert.equal(ls.ok, 1);
+    assert.equal(ls.err429, 1);
+    assert.equal(ls.p50_ms, 100, 'p50 over the sorted per-call ms [50,100] -> index 1 = 100');
+    assert.equal(ls.tokens, 10, 'usage summed (7+3)');
+    assert.equal(ls.rate_classes.openrouter_free_tier_daily, 1, 'the 429 limit-source class histogrammed');
+    assert.equal(existsSync(laneLog), false, 'the fixture was CONSUMED (collectLaneStats: read -> aggregate -> delete)');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
