@@ -224,12 +224,22 @@ async function ccWork(envelope, opts = {}) {
 // contract extras. The FSM receiver reads outcome.status / .artifact /
 // .error (journal text) / .duration_ms; telemetry + artifact_refs + models
 // ride along for the audit (extra keys are ignored by the receiver).
+//
+// T46/W-D lane B (§D4-M4, the v2 fold): lane telemetry JOINS the allowlist —
+//   lane_stats      the cc adapter's bridge-JSONL aggregate (M2)
+//   key_index       D3's pool pick (lane C's real-lane producer lands there;
+//   hop_telemetry   lane A's real-lane per-hop [{model, ms, status}])
+// Without these entries the adapter's richest data dies HERE — the exact
+// silent-drop class W-C2's prCandidates taught (M4's whole point: this
+// composer is the first named drop point between the adapter and the drain).
+// Exported for the direct pins; the SEAM pin (a lane_stats-carrying turn →
+// the enqueued report payload) lives in the routing suite.
 // ---------------------------------------------------------------------------
 
 const SLICE = 200;
 const slice = (s) => String(s).slice(0, SLICE);
 
-function composeReportOutcome(classified, raw, durationMs) {
+export function composeReportOutcome(classified, raw, durationMs) {
   const outcome = { status: classified.status };
   if (classified.detail !== undefined && classified.detail !== null) outcome.error = slice(classified.detail);
   if (classified.status === 'done') {
@@ -243,6 +253,14 @@ function composeReportOutcome(classified, raw, durationMs) {
   if (raw?.telemetry && typeof raw.telemetry === 'object') outcome.telemetry = raw.telemetry;
   if (Array.isArray(raw?.models) && raw.models.length) outcome.models = raw.models;
   if (Number.isFinite(durationMs)) outcome.duration_ms = durationMs;
+  // T46/W-D lane B (M4): the lane telemetry pass-through — object/array
+  // guards only, NEVER sliced (lane_stats is the aggregate; slicing it here
+  // would silently corrupt the console's source)
+  if (raw?.lane_stats && typeof raw.lane_stats === 'object' && !Array.isArray(raw.lane_stats)) {
+    outcome.lane_stats = raw.lane_stats;
+  }
+  if (Number.isFinite(raw?.key_index)) outcome.key_index = raw.key_index;
+  if (Array.isArray(raw?.hop_telemetry) && raw.hop_telemetry.length) outcome.hop_telemetry = raw.hop_telemetry;
   return outcome;
 }
 
@@ -263,7 +281,7 @@ function appendStepSummary(path, text) {
 export async function runTurn({
   cp, runId = 'local', runAttempt = '1',
   env = process.env, fetchImpl = fetch, enqueue, sleepImpl = sleep, now = Date.now,
-  log = console.log, stepSummaryPath = null,
+  log = console.log, stepSummaryPath = null, laneLogPath = null,
 }) {
   const t0 = now();
   const eventId = reportEventId({ runId, attempt: runAttempt });
@@ -315,9 +333,13 @@ export async function runTurn({
       // allowRoot (envelopeFromDispatch unwraps ox → cp.artifacts → the
       // envelope). The adapter's write-back door + task-branch push consume
       // them; mock/real lanes never see them (the §4c skip).
+      // T46/W-D lane B: laneLogPath forwards (the seam pin injects a
+      // pre-written bridge-lane JSONL — the aggregation attach without a
+      // spawned bridge; production takes the adapter's turn-scoped default).
       raw = await ccWork(envelope, {
         env, runId, now, log,
         allowRoot: Array.isArray(envelope.artifacts) ? envelope.artifacts : [],
+        ...(typeof laneLogPath === 'string' && laneLogPath !== '' ? { laneLogPath } : {}),
       });
     } catch (e) {
       if (e instanceof AdapterNotShipped) {

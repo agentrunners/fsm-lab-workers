@@ -190,13 +190,51 @@ export function statusSummary({ state, depths = {}, nowMs = null }) {
   const active = tasks.filter(t => t && ACTIVE_STATUSES.has(t.status)).map(t => t.id);
   const total = tasks.length;
   const d = (n) => (Number.isFinite(n) ? n : 0);
+  // T46/W-D lane B (§D4 console): the LANE section — aggregated off the tasks'
+  // last_result.lane_stats (the drain's durable carry, M3; the same data the
+  // journal REPORT records hold — the state projection is the cheaper read).
+  // Absent on every legacy/pre-W-D record → the single "no telemetry" line.
+  const laneLines = laneSection(tasks);
   return [
     `**[fsm-console]** status — chain \`${chain.id ?? '?'}\` (last tick ${age})`,
     `- phase: ${proj.phase ?? '?'} · milestone ${proj.milestone ?? '?'}/${proj.milestones_total ?? '?'} · mode ${proj.mode ?? '?'}`,
     `- tasks: ${d(stats.done)}/${total} done · ${d(stats.quarantined)} quarantined · ${d(stats.failed)} failed · ${d(stats.cancelled)} cancelled · active [${active.join(', ')}]`,
     `- holds: paused=${chain.paused === true} · halted=${chain.halted === true}`,
     `- queues: report ${d(depths.report)} · control ${d(depths.control)} · intake ${d(depths.intake)}`,
+    ...laneLines,
   ].join('\n');
+}
+
+// T46/W-D lane B: aggregate the per-task lane_stats/hop_telemetry into the
+// one-screen lane lines. Pure + exported for the pins.
+export function laneSection(tasks) {
+  const withStats = (tasks || []).filter(t => t?.last_result && t.last_result.lane_stats && typeof t.last_result.lane_stats === 'object');
+  if (!withStats.length) return ['- lanes: no telemetry yet (pre-W-D records or no turns since the fold)'];
+  let calls = 0, ok = 0, err429 = 0, err5xx = 0, tokens = 0, cost = 0;
+  const lat = [];
+  const models = {};
+  const classes = {};
+  for (const t of withStats) {
+    const s = t.last_result.lane_stats;
+    calls += Number(s.calls) || 0;
+    ok += Number(s.ok) || 0;
+    err429 += Number(s.err429) || 0;
+    err5xx += Number(s.err5xx) || 0;
+    tokens += Number(s.tokens) || 0;
+    cost += Number(s.cost) || 0;
+    if (Number.isFinite(Number(s.p50_ms))) lat.push(Number(s.p50_ms));
+    for (const [m, mm] of Object.entries(s.models || {})) models[m] = (models[m] || 0) + (Number(mm.calls) || 0);
+    for (const [k, v] of Object.entries(s.rate_classes || {})) classes[k] = (classes[k] || 0) + (Number(v) || 0);
+  }
+  lat.sort((a, b) => a - b);
+  const p = (q) => lat.length ? lat[Math.min(lat.length - 1, Math.floor(lat.length * q))] : null;
+  const top = Object.entries(models).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, n]) => `${m.split('/').pop()}:${n}`).join(' ');
+  const cls = Object.entries(classes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${k}:${v}`).join(' ');
+  const lines = [
+    `- lanes: ${calls} calls (${ok} ok · ${err429}×429 · ${err5xx}×5xx) · p50 ${p(0.5) ?? '?'}ms · p95 ${p(0.95) ?? '?'}ms · tokens ${tokens} · cost $${cost.toFixed(4)} · ${withStats.length} tasks`,
+  ];
+  if (top) lines.push(`- lane models: ${top}${cls ? ` · limits: ${cls}` : ''}`);
+  return lines;
 }
 
 // ---------------------------------------------------------------------------
