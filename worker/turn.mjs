@@ -109,13 +109,81 @@ export function realModelChain(env = process.env) {
   return [...custom, ...REAL_MODEL_CHAIN_DEFAULTS];
 }
 
+// ---------------------------------------------------------------------------
+// T46/W-D (D3 + the v2 fold B1/M5/M6) — the OR KEY POOL: the real lane's
+// FREE-tier key rotation.
+//
+// env.OPENROUTER_KEY_POOL (ONE env line in worker.yml's "Work the task"
+// block — B1) = comma-joined free-tier keys (registry order; the secret
+// carries only the values). KEY PRECEDENCE (the design's rule, stated at
+// the pick site in realWork): pool keys serve THE REAL LANE — the free
+// chain above; the primary secret OPENROUTER_API_KEY stays the CC/PAID
+// lane's key (worker/cc-adapter.mjs's key pool reads it — untouched here).
+// Empty pool -> today's behavior, bit-for-bit.
+//
+// The pick is hash-stable per task (idempotent re-dispatches reuse the same
+// key; load spreads across accounts) and rotates on the QUOTA class (M5):
+// a 429 hop advances the pool slot by one for the next hop, bounded by the
+// hop budget. The pool secret itself joins the cc adapter's CC_ENV_DENYLIST
+// (M6) — the CLI child env never sees the 73 keys.
+// ---------------------------------------------------------------------------
+
+// comma-split, trim, drop empties. NO dedup (the registry's order is the
+// operator's; a duplicated value doubles that key's weight — visible in
+// pool_size, fixable at the secret).
+export function keyPool(env = process.env) {
+  const raw = typeof env.OPENROUTER_KEY_POOL === 'string' ? env.OPENROUTER_KEY_POOL : '';
+  return raw.split(',').map((k) => k.trim()).filter((k) => k !== '');
+}
+
+// FNV-1a, 32-bit, unsigned — the stable string hash for the deterministic
+// pick (the published test vectors are pinned in tests/test-key-pool.mjs;
+// Math.imul keeps the multiply in uint32 space, >>> 0 keeps the modulo
+// non-negative on every platform).
+export function fnv1a(str) {
+  const s = String(str);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 const isInfraStatus = (st) => st === 401 || st === 402 || st === 429 || (typeof st === 'number' && st >= 500);
 
 export async function realWork(envelope, { env = process.env, fetchImpl = fetch } = {}) {
   const chain = realModelChain(env);
   // ONE fallback hop, bounded by the lane budget and the chain's length
   const maxTries = Math.min(chain.length, Math.max(1, Math.min(2, envelope.budget.lane_attempts)));
-  const key = env.OPENROUTER_API_KEY;
+  // T46/W-D D3 — THE KEY PICK. Pool non-empty => the real lane's key is
+  // pool[(fnv1a(task_ref.id) + quota_class_retries) % pool.length]:
+  //   - hash-stable per task id (idempotent re-dispatches reuse the same
+  //     key; the free-lane daily budget spreads across accounts);
+  //   - M5 rotation: quota_class_retries counts THIS turn's prior infra hops
+  //     whose detail matched the QUOTA class (HTTP 429 — the
+  //     free-models-per-day family): a burned key's next hop lands on the
+  //     NEXT pool key (bounded rotation). The FSM's cross-turn
+  //     infra_attempts does NOT ride the dispatch envelope (the ASSIGN
+  //     action and assembleDispatchPayload mint only the WORK attempt,
+  //     which infra-retry voids net-zero — lib/fsm.mjs's infra-retry
+  //     transition), so the reachable retry context is the turn's own hop
+  //     ladder — this is the 19-c amendment's primary variant ("rotate the
+  //     key within the turn on the 429 class"). Non-quota infra (401/402/
+  //     5xx/transport) does NOT rotate.
+  //   - PRECEDENCE: pool keys serve THIS free lane only; the primary secret
+  //     OPENROUTER_API_KEY stays the cc/paid lane's key (cc-adapter's pool).
+  //     Empty pool => env.OPENROUTER_API_KEY serves this lane too (today's
+  //     behavior, bit-for-bit).
+  const pool = keyPool(env);
+  const taskHash = fnv1a(String(envelope.task_ref?.id ?? ''));
+  let quotaClassRetries = 0;
+  let keyIndex = -1;   // the pool slot serving the current hop (set on pick)
+  const laneKey = () => {
+    if (pool.length === 0) return env.OPENROUTER_API_KEY;
+    keyIndex = (taskHash + quotaClassRetries) % pool.length;
+    return pool[keyIndex];
+  };
   const t0 = Date.now();
   const models = [];
   const finish = (raw) => ({
@@ -124,6 +192,12 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
     lane_attempts_used: models.length,
     telemetry: { turns: 1, wall_ms: Date.now() - t0, lane_attempts_used: models.length },
     duration_ms: Date.now() - t0,
+    // D3 (v2 minor fold): the real lane REPORTS its pool slot — the 0-based
+    // array index of the key that served the turn's last hop (the burned
+    // slot on lane-exhaustion). Absent when the pool is empty (the legacy
+    // result shape stays bit-for-bit). Reaching the REPORT payload is lane
+    // B's M4 allowlist fold (composeReportOutcome), not this lane's.
+    ...(pool.length > 0 ? { key_index: keyIndex, pool_size: pool.length } : {}),
   });
 
   for (let i = 0; i < maxTries; i++) {
@@ -133,7 +207,7 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
     try {
       r = await fetchImpl('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${laneKey()}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model,
           messages: [
@@ -159,6 +233,10 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
       return finish(content ? { content: String(content) } : { content: null });
     }
     if (isInfraStatus(r.status)) {
+      // M5: the QUOTA class (429) rotates the pool key for the next hop —
+      // the pick's rotation input. 401/402/5xx stay key-stable (the design's
+      // quota-class scope; 401-rotation is a named integrator question).
+      if (r.status === 429) quotaClassRetries += 1;
       if (i === maxTries - 1) {
         return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last lane-${r.status})` });
       }

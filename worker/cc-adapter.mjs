@@ -189,6 +189,10 @@ export function ccLaneEnv(lane, envelope, extra = {}) {
 export const CC_ENV_DENYLIST = [
   'OPENROUTER_API_KEY', 'OPENROUTER_API_KEY_2', 'GH_TOKEN', 'GITHUB_TOKEN',
   'ANTHROPIC_AUTH_TOKEN', 'GL_PAT',
+  // T46/W-D M6: the real-lane FREE key pool (worker/turn.mjs's D3 pick) —
+  // the CLI child env must never see the 73 pool keys (the live-proven
+  // /proc/<pid>/environ leak class; this lane's only pool-relevant edit)
+  'OPENROUTER_KEY_POOL',
 ];
 
 // the merged child env: the caller's env (PATH et al.) MINUS the denylist,
