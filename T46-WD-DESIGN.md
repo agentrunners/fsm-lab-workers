@@ -111,3 +111,19 @@ rendering (shape pin), realWork per-hop (fixture).
 5. 2-lens adversarial review over the three branches (the discipline), fold,
    merge in a quiescent window, live re-probe (one mock epoch + one cc epoch),
    EVIDENCE.md entry.
+
+---
+
+## v2 FOLD (session 19, the 19-c review — 1 BLOCKING + 6 MAJOR folded; report: cc-gha-exploration-side /home/z/lab-s19-wd-review.md)
+
+- **B1 (pool env path):** D3 REQUIRES a `worker.yml` env line — `OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}` in the "Work the task" env block (lane C owns it; the secrets-free contract of the OTHER workflows is untouched — worker.yml already carries secrets).
+- **M1 (unreachable degraded fallback):** honest scope-cut — the paid-key head + free fallback chain is reached only when `budget.lane_attempts` covers it; the conductor envelope pins lane_attempts (3). D2-code keeps the chain order; the DEGRADED-mode note becomes: free fallbacks engage only if the envelope's lane budget allows ≥2 hops (config-dependent), documented, not claimed.
+- **M2 (bridge stat lifecycle):** REPLACED — no shutdown handshake, no in-memory stat. The bridge appends one JSONL line per upstream call to `<workdir>/bridge-lane.jsonl` (append-only fs write per request — survives the adapter's SIGKILL of the bridge). The adapter reads the file post-turn and aggregates into `lane_stats` on the worker record. The per-call lines are ALSO the raw 429/latency/cost signal store (G2/G3/G4 satisfied at the source).
+- **M3 (journal durability):** the drain pass-through journals `lane_stats` (optional field) on the REPORT queue line AND the journal record — `fsm.mjs applyEvent` + the store's queue-line projection both carry it (old records without it keep applying).
+- **M4 (composeReportOutcome allowlist):** `lane_stats` + `key_index` join the allowlist in `conductor/turn.mjs` composeReportOutcome — the first named drop point; without it nothing reaches the queue line.
+- **M5 (quota-class key rotation):** on an infra retry whose detail is quota-class, the pool index ADVANCES: `key_index = (hash(task_id) + infra_attempt) % pool.length` — a burned key's retry lands on the NEXT key (bounded rotation; idempotency preserved per attempt, rotation across attempts). This kills the daily-terminal-quarantine failure mode the review flagged.
+- **M6 (child-env leak):** `OPENROUTER_KEY_POOL` joins the adapter's `CC_ENV_DENYLIST` (the CLI child env must never see the 73 keys — the existing leak-prevention seam).
+
+MINOR folds: capacity arithmetic reconciled (~7,550 free-lane/day = 71×50 + 3×1000, paid lanes excluded); D1 line-cite corrected (realWork payload at turn.mjs:143); D3's hash scope = task_ref.id string; the console window is 64 journal records (documented limit); the real lane REPORTS its key_index (drain carries it per M4).
+
+Lane map (updated): A ✅ BUILT (t46/wd-a @ 4a09f68, 413/413). B = D4 with M2/M3/M4 amendments (bridge JSONL + adapter aggregation + allowlist + drain + console). C = D3 with B1/M5/M6 amendments (workflow env line + hash+attempt rotation + denylist + pins). Integration also folds the pre-existing conformance-cc acceptEdits argv drift (25/26 on main — 1-line fix, 19-d's handoff).
