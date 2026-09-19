@@ -113,6 +113,13 @@ jobs:
           # nvidia/nemotron-3-ultra-550b-a55b:free, cohere/north-mini-code:free]
           # with ONE fallback hop on infra-class failure).
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || '' }}
+          # T46/W-D (D3 + B1): MODE=real key pool — comma-joined free-tier OR
+          # keys (secret, registry order). Non-empty pool => the real lane's
+          # key is pool[fnv1a(task_id) % pool.length] with quota-class (429)
+          # rotation per hop (M5, worker/turn.mjs); OPENROUTER_API_KEY stays
+          # the cc/paid lane's primary (the pool serves the FREE lane only).
+          # Empty/absent = today's single-key behavior, bit-for-bit.
+          OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}
           # T46/W4 §1d (D2): MODE=cc lanes — the KEY POOL (secret #7 primary,
           # #6 secondary; empty/absent lanes are simply not in the pool) and
           # the model chain head (OPTIONAL repo variable CC_MODEL; empty = the

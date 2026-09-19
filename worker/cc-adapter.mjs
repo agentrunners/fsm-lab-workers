@@ -200,6 +200,10 @@ export const CC_ENV_DENYLIST = [
   // the adapter passes it via startBridge's explicit env, but a stray export
   // in a runner's top-level env would otherwise inherit through the copy.
   'BRIDGE_LANE_LOG',
+  // T46/W-D M6: the real-lane FREE key pool (worker/turn.mjs's D3 pick) —
+  // the CLI child env must never see the 73 pool keys (the live-proven
+  // /proc/<pid>/environ leak class; this lane's only pool-relevant edit)
+  'OPENROUTER_KEY_POOL',
 ];
 
 // the merged child env: the caller's env (PATH et al.) MINUS the denylist,
