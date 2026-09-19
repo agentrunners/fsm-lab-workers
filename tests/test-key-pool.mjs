@@ -1,13 +1,14 @@
 // test-key-pool.mjs — the T46/W-D LANE C suite (D3 + the v2 fold B1/M5/M6):
 // the OR key pool for the REAL lane.
 //
-// Pins, per the lane-C brief:
-//   - the pick: pool[(fnv1a(task_ref.id) + quota_class_retries) % pool.length]
+// Pins, per the lane-C brief + the W-D review fold (lens-1 F2):
+//   - the pick: pool[(fnv1a(task_ref.id) + rotation_retries) % pool.length]
 //     — FNV-1a against the PUBLISHED 32-bit test vectors (the hash is
 //     stable, not just self-consistent), determinism per task id, spread
 //     across slots
-//   - M5 quota rotation: a 429 (the quota class — free-models-per-day) hop
-//     advances the pool slot by ONE; non-quota infra (503/transport) stays
+//   - M5 rotation (widened by the fold): a 429 (quota) OR 401/402
+//     (dead-key) hop advances the pool slot by ONE — the fallback hop
+//     recovers on a healthy key; non-rotate infra (503/transport) stays
 //     key-stable
 //   - the empty pool → the legacy single-key behavior, BIT-FOR-BIT (the
 //     result key set is pinned — no key_index/pool_size ride)
@@ -147,7 +148,7 @@ test('pool: M5 quota rotation — a 429 hop advances the pool slot by ONE (the b
   assert.equal(raw.key_index, 2, 'the serving slot is reported');
 });
 
-test('pool: M5 scope — NON-quota infra (503 / transport) keeps the key stable; only 429 rotates', async () => {
+test('pool: M5 scope — NON-rotate infra (503 / transport) keeps the key stable; the rotate class is 429/401/402', async () => {
   const s503 = await drive(env2('pool-pin-T1'), {
     env: poolEnv(),
     responses: [jsonRes(503, {}), jsonRes(200, okBody('after a 5xx'))],
@@ -167,6 +168,35 @@ test('pool: M5 wrap — the rotation wraps at the pool boundary', async () => {
     responses: [jsonRes(429, {}), jsonRes(200, okBody('wrapped'))],
   });
   assert.deepEqual(headers, [`Bearer ${POOL[2]}`, `Bearer ${POOL[0]}`], '(2+1) % 3 = 0 — bounded rotation wraps');
+});
+
+// T46/W-D review fold (lens-1 F2) — the DEAD-KEY rotation: a 401/402 means
+// the KEY is dead (revoked/invalid/credits-dead). The model is fine; burning
+// the turn's fallback hop on the SAME dead key quarantine-kills every task
+// hashed onto it (the finding's deterministic failure mode). Rotating lets
+// hop 2 recover on a healthy key.
+test('pool: dead-key rotation (the fold, lens-1 F2) — a 401/402 hop advances the pool slot by ONE (the fallback hop recovers on the next key)', async () => {
+  const dead401 = await drive(env2('pool-pin-T1'), {
+    env: poolEnv(),
+    responses: [jsonRes(401, {}), jsonRes(200, okBody('recovered on the next key'))],
+  });
+  assert.deepEqual(dead401.headers, [`Bearer ${POOL[1]}`, `Bearer ${POOL[2]}`], 'a 401 advances the slot by exactly one (the dead-key class rotates)');
+  assert.equal(dead401.raw.content, 'recovered on the next key');
+  assert.equal(dead401.raw.key_index, 2, 'the serving (recovering) slot is reported');
+  const dead402 = await drive(env2('pool-pin-T1'), {
+    env: poolEnv(),
+    responses: [jsonRes(402, {}), jsonRes(200, okBody('after the credits-death rotation'))],
+  });
+  assert.deepEqual(dead402.headers, [`Bearer ${POOL[1]}`, `Bearer ${POOL[2]}`], 'a 402 (credits-dead) rotates identically');
+  // BOTH hops dead → lane-exhaustion names the 401 class and reports the
+  // LAST (rotated-onto) slot — the operator's swap-the-secret signal
+  const burned = await drive(env2('pool-pin-T1'), {
+    env: poolEnv(),
+    responses: [jsonRes(401, {}), jsonRes(401, {})],
+  });
+  assert.equal(burned.raw.status, 'infra_failed');
+  assert.match(burned.raw.detail, /lane-exhausted\(2\/3 lanes, last lane-401\)/);
+  assert.equal(burned.raw.key_index, (fnv1a('pool-pin-T1') + 1) % 3, 'the rotated-onto slot is the reported one');
 });
 
 // ---------------------------------------------------------------------------

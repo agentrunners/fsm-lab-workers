@@ -126,10 +126,11 @@ export function realModelChain(env = process.env) {
 // Empty pool -> today's behavior, bit-for-bit.
 //
 // The pick is hash-stable per task (idempotent re-dispatches reuse the same
-// key; load spreads across accounts) and rotates on the QUOTA class (M5):
-// a 429 hop advances the pool slot by one for the next hop, bounded by the
-// hop budget. The pool secret itself joins the cc adapter's CC_ENV_DENYLIST
-// (M6) — the CLI child env never sees the 73 keys.
+// key; load spreads across accounts) and rotates on the QUOTA + DEAD-KEY
+// classes (M5 + the W-D review fold, lens-1 F2): a 429/401/402 hop advances
+// the pool slot by one for the next hop, bounded by the hop budget. The pool
+// secret itself joins the cc adapter's CC_ENV_DENYLIST (M6) — the CLI child
+// env never sees the 73 keys.
 // ---------------------------------------------------------------------------
 
 // comma-split, trim, drop empties. NO dedup (the registry's order is the
@@ -161,31 +162,34 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
   // ONE fallback hop, bounded by the lane budget and the chain's length
   const maxTries = Math.min(chain.length, Math.max(1, Math.min(2, envelope.budget.lane_attempts)));
   // T46/W-D D3 — THE KEY PICK. Pool non-empty => the real lane's key is
-  // pool[(fnv1a(task_ref.id) + quota_class_retries) % pool.length]:
+  //   pool[(fnv1a(task_ref.id) + rotation_retries) % pool.length]:
   //   - hash-stable per task id (idempotent re-dispatches reuse the same
   //     key; the free-lane daily budget spreads across accounts);
-  //   - M5 rotation: quota_class_retries counts THIS turn's prior infra hops
-  //     whose detail matched the QUOTA class (HTTP 429 — the
-  //     free-models-per-day family): a burned key's next hop lands on the
-  //     NEXT pool key (bounded rotation). The FSM's cross-turn
-  //     infra_attempts does NOT ride the dispatch envelope (the ASSIGN
-  //     action and assembleDispatchPayload mint only the WORK attempt,
-  //     which infra-retry voids net-zero — lib/fsm.mjs's infra-retry
-  //     transition), so the reachable retry context is the turn's own hop
-  //     ladder — this is the 19-c amendment's primary variant ("rotate the
-  //     key within the turn on the 429 class"). Non-quota infra (401/402/
-  //     5xx/transport) does NOT rotate.
+  //   - M5 rotation: rotation_retries counts THIS turn's prior hops in the
+  //     ROTATE class — 429 (the quota family: free-models-per-day) AND
+  //     401/402 (the dead-key family: revoked/invalid/credits-dead — the KEY
+  //     is the problem, so re-aiming it burns the turn's remaining hops;
+  //     rotating lets the fallback hop recover on a healthy key). The W-D
+  //     review fold (lens-1 F2) widened M5 from the 429-only form: a dead
+  //     pool key deterministically quarantine-killed every task hashed onto
+  //     it. 5xx/transport (upstream health, not key health) do NOT rotate.
+  //     The FSM's cross-turn infra_attempts does NOT ride the dispatch
+  //     envelope (the ASSIGN action and assembleDispatchPayload mint only the
+  //     WORK attempt, which infra-retry voids net-zero — lib/fsm.mjs's
+  //     infra-retry transition), so the reachable retry context is the
+  //     turn's own hop ladder — the 19-c amendment's primary variant ("rotate
+  //     the key within the turn"), widened to the rotate class by the fold.
   //   - PRECEDENCE: pool keys serve THIS free lane only; the primary secret
   //     OPENROUTER_API_KEY stays the cc/paid lane's key (cc-adapter's pool).
   //     Empty pool => env.OPENROUTER_API_KEY serves this lane too (today's
   //     behavior, bit-for-bit).
   const pool = keyPool(env);
   const taskHash = fnv1a(String(envelope.task_ref?.id ?? ''));
-  let quotaClassRetries = 0;
+  let rotationRetries = 0;
   let keyIndex = -1;   // the pool slot serving the current hop (set on pick)
   const laneKey = () => {
     if (pool.length === 0) return env.OPENROUTER_API_KEY;
-    keyIndex = (taskHash + quotaClassRetries) % pool.length;
+    keyIndex = (taskHash + rotationRetries) % pool.length;
     return pool[keyIndex];
   };
   const t0 = Date.now();
@@ -249,10 +253,12 @@ export async function realWork(envelope, { env = process.env, fetchImpl = fetch 
       return finish(content ? { content: String(content) } : { content: null });
     }
     if (isInfraStatus(r.status)) {
-      // M5: the QUOTA class (429) rotates the pool key for the next hop —
-      // the pick's rotation input. 401/402/5xx stay key-stable (the design's
-      // quota-class scope; 401-rotation is a named integrator question).
-      if (r.status === 429) quotaClassRetries += 1;
+      // M5 (the W-D review fold, lens-1 F2): the ROTATE class advances the
+      // pool slot for the next hop — 429 (quota) AND 401/402 (dead key: the
+      // key itself is the problem; the fallback hop recovers on the NEXT
+      // key instead of burning on the same dead one). 5xx/transport stay
+      // key-stable (upstream health, not key health).
+      if (r.status === 429 || r.status === 401 || r.status === 402) rotationRetries += 1;
       if (i === maxTries - 1) {
         return finish({ status: 'infra_failed', detail: `lane-exhausted(${models.length}/${chain.length} lanes, last lane-${r.status})` });
       }

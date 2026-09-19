@@ -236,10 +236,44 @@ test('F-6: a NON-quota infra report never touches the window (the classifier bou
   assert.ok(!isQuotaDetail('transport'));
   assert.ok(!isQuotaDetail(null));
   assert.ok(!isQuotaDetail('error-as-answer(invalid api key)'), 'key-marker class, not quota');
-  // DESIGN LETTER (F-6): ANY lane-exhausted detail matches — the pause is a
-  // GENERIC stop-burn (a 401-exhausted chain parks too; the alert's verbatim
-  // detail tells the operator WHICH fix applies — key vs quota wait).
-  assert.ok(isQuotaDetail('lane-exhausted(3/3 lanes, last lane-401)'), 'exhaustion of any flavor parks the epoch (stop-burn is flavor-agnostic; the alert disambiguates)');
+  // W-D review fold (lens-1 F2) — the FALSE-PAUSE negative pin: the matcher
+  // is narrowed to the QUOTA shape. The old bare `lane-exhausted(` prefix
+  // matched every exhaustion flavor, so a 401-quarantined dead-key task
+  // armed the F-6 window + the OR-backstop ⇒ BUDGET-PAUSE-TRIGGER on a
+  // non-quota cause (the W-C1 design letter's "stop-burn is flavor-agnostic"
+  // reading is SUPERSEDED: the pause parks the epoch for a quota WAIT, but
+  // a dead key's remedy is a pool-secret SWAP — and the turn-side rotation
+  // now recovers live keys within the turn, so parking buys nothing).
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last lane-401)'), 'dead-key exhaustion does NOT arm the budget pause');
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last lane-402)'), 'credits-death exhaustion does not either');
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last lane-503)'), 'upstream 5xx exhaustion does not');
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last lane-transport)'), 'transport walls do not');
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last dead-model-404)'), 'config (dead-model) exhaustion does not');
+});
+
+// T46/W-D review fold (lens-1 F2) — the FALSE-PAUSE integration negative:
+// the full dead-key ladder (3 infra reports, detail = the 401 exhaustion
+// shape) parks the task infra-exhausted WITHOUT firing the OR-backstop or
+// the window. Pre-fold this exact sequence minted BUDGET-PAUSE-TRIGGER on a
+// non-quota cause.
+test('F-6 false-pause (the fold, lens-1 F2): a 401-quarantined dead-key task does NOT fire the OR-backstop', () => {
+  const s = assignedState({ max_parallel: 1 });
+  const id = Object.values(s.tasks).find(t => t.status === 'assigned').id;
+  const n = makeNow(T0 + 60_000);
+  let st = structuredClone(s);
+  for (let i = 1; i <= 3; i++) {
+    const out = conductorTick({
+      cur: st,
+      queue: [quotaReport(st, id, `dk${i}`, 'lane-exhausted(3/3 lanes, last lane-401)')],
+      controlQueue: [], queueBad: [], ctlBad: [],
+      ev: tickEv(`dk${i}`), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+    });
+    assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), `round ${i}: NO alert on the dead-key class`);
+    st = out.state;
+  }
+  assert.equal(st.tasks[id].status, 'quarantined', 'the infra ladder itself is flavor-agnostic — the task still parks');
+  assert.equal(st.tasks[id].infra_attempts, 3);
+  assert.ok(!Array.isArray(st.budget_window) || st.budget_window.length === 0, 'the budget window stayed EMPTY (no false quota entry)');
 });
 
 test('F-6/F-8: an already-PAUSED chain never re-triggers (idempotent under the hold)', () => {
