@@ -132,6 +132,17 @@ const gcCount = (origin) =>
   lsTree(origin).length && String(g(['--git-dir', origin, 'log', '--format=%s', 'fsm-sessions'], dirOf(origin)).stdout || '')
     .split('\n').filter(s => s.startsWith('gc-transcripts:')).length;
 
+// read a file off a branch of the bare origin (the s21/A-3 charter pins read
+// fsm-state's state.json + journal directly)
+const readBranchFile = (origin, path, branch = 'fsm-state') =>
+  String(g(['--git-dir', origin, 'show', `${branch}:${path}`], dirOf(origin)).stdout || '');
+const journalRecordsOn = (origin, branch = 'fsm-state') =>
+  lsTree(origin, branch)
+    .filter(f => /^state\/journal-\d+\.jsonl$/.test(f))
+    .flatMap(f => readBranchFile(origin, f, branch).split('\n').map(s => s.trim()).filter(Boolean))
+    .map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean);
+
 async function runGc({ origin, state = STD_STATE, env = {}, now = () => NOW, hooks }) {
   const logs = [];
   const r = await runTranscriptGc({
@@ -650,10 +661,11 @@ function runScan(clone, extraEnv = {}) {
   return spawnSync('node', [join(REPO_ROOT, 'watchdog', 'scan.mjs')], { cwd: clone, encoding: 'utf8', env, timeout: 60_000 });
 }
 
-test('F-15a placement (PRIMARY TARGET): a HALTED chain still runs the GC — and fsm-state stays READ-ONLY', async () => {
+test('F-15a placement (PRIMARY TARGET): a HALTED chain still runs the GC — and fsm-state stays NON-SEMANTIC (the s21/A-3 amended charter)', async () => {
   const lab = mkScanLab({ stateJson: { ...STD_STATE, chain: { ...STD_STATE.chain, halted: true, paused: false } } });
   try {
     const fsmStateBefore = tipOf(lab.origin, 'fsm-state');
+    const stateBefore = JSON.parse(readBranchFile(lab.origin, 'state/state.json'));
     const sessionsBefore = tipOf(lab.origin, 'fsm-sessions');
     const p = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url });
     assert.equal(p.status, 0, `scan rc=${p.status}\nstdout: ${p.stdout}\nstderr: ${p.stderr}`);
@@ -665,23 +677,46 @@ test('F-15a placement (PRIMARY TARGET): a HALTED chain still runs the GC — and
     assert.notEqual(tipOf(lab.origin, 'fsm-sessions'), sessionsBefore);
     const tree = new Set(lsTree(lab.origin));
     for (const v of STD_VICTIMS) assert.ok(!tree.has(v), `${v} deleted by the halted-scan GC`);
-    // THE charter pin (runtime): fsm-state tip unchanged — no write path fired
-    assert.equal(tipOf(lab.origin, 'fsm-state'), fsmStateBefore, 'the watchdog NEVER writes fsm-state');
+    // THE amended charter pin (s21/A-3 — was "tip unchanged"): the scan's
+    // ONE fsm-state write is the audit-only deadman marker. The tip MAY move
+    // (a fresh lab has no prior marker -> the heartbeat fires), but the
+    // SEMANTIC state is byte-identical — chain/tasks/stats/config/version
+    // untouched — and journal_seq advanced by exactly one.
+    assert.notEqual(tipOf(lab.origin, 'fsm-state'), fsmStateBefore, 'the deadman marker commit moved the tip (expected on a fresh lab)');
+    const stateAfter = JSON.parse(readBranchFile(lab.origin, 'state/state.json'));
+    assert.deepEqual(stateAfter.chain, stateBefore.chain, 'chain untouched — the marker is journal-only');
+    assert.deepEqual(stateAfter.tasks, stateBefore.tasks, 'tasks untouched');
+    assert.deepEqual(stateAfter.stats, stateBefore.stats, 'stats untouched');
+    assert.deepEqual(stateAfter.config, stateBefore.config, 'config untouched');
+    assert.equal(stateAfter.version, stateBefore.version, 'version never bumps on TICK-class records');
+    assert.equal(stateAfter.journal_seq, (stateBefore.journal_seq ?? 0) + 1, 'the ONLY state delta: journal_seq +1 (the marker id)');
+    // the journal delta: exactly ONE audit-only watchdog record, the X24 shape
+    const wd = journalRecordsOn(lab.origin).filter(r => r.kind === 'TICK' && r.actor === 'watchdog');
+    assert.equal(wd.length, 1, `exactly one watchdog marker (got ${wd.length})`);
+    assert.equal(wd[0].applied, false, 'audit-only — the marker is NOT an applied event');
+    assert.match(wd[0].event_id, /^watchdog-scan-\d+$/, 'the minted id shape');
+    assert.ok(typeof wd[0].note === 'string' && wd[0].note.startsWith('watchdog-scan (audit-only'));
+    assert.ok(p.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), 'the heartbeat is visible in the scan log');
   } finally { lab.cleanup(); }
 });
 
-test('charter (source shape): the scan constructs NO fsm-state write path (read-only member set)', async () => {
+test('charter (source shape): the scan constructs NO semantic fsm-state write path (read-only members + the journal-only deadman commit)', async () => {
   const src = await import('node:fs').then(fs => fs.readFileSync(join(REPO_ROOT, 'watchdog', 'scan.mjs'), 'utf8'));
   const used = new Set();
   for (const m of src.matchAll(/\bstore\.(\w+)/g)) {
     if (m[1] === 'mjs') continue; // the module path in the import line
     used.add(m[1]);
   }
-  const allowed = new Set(['fetch', 'readState', 'branch']); // read-only + the log's branch name
-  for (const u of used) assert.ok(allowed.has(u), `scan.mjs touches store.${u} — outside the read-only charter set`);
-  // no journal write, no queue enqueue, no commit builder anywhere in the GC lane
+  // s21/A-3 charter amendment: readJournalTail (the throttle read) + commit
+  // (the journal-only deadman marker — the SAME CAS API every queue pusher
+  // uses) join the read-only set. Every OTHER store member stays forbidden.
+  const allowed = new Set(['fetch', 'readState', 'branch', 'readJournalTail', 'commit']);
+  for (const u of used) assert.ok(allowed.has(u), `scan.mjs touches store.${u} — outside the amended charter set`);
+  // no queue write, no raw commit builder, no full journal scan anywhere
   assert.ok(!/\.(enqueueControl|enqueueReport|enqueueIntake|buildCommit|readJournals)\s*\(/.test(src), 'no write-path construction');
-  // and the GC pass never writes fsm-state: the only push in the file targets fsm-sessions
+  // and the GC pass never writes fsm-sessions through any OTHER lane: the
+  // only push in the FILE targets fsm-sessions (the deadman marker rides the
+  // Store's own CAS push, not a scan-local one)
   const pushes = [...src.matchAll(/git\(\['push',[^\]]*\]\)/g)].map(m => m[0]);
   assert.ok(pushes.length > 0 && pushes.every(p => p.includes('fsm-sessions')), `push targets: ${pushes.join(' ; ')}`);
 });
@@ -727,5 +762,75 @@ test('F-15 isolation: a GC failure NEVER breaks the scan (contained — primary 
     assert.equal(p.status, 0, `scan rc=${p.status}\nstdout: ${p.stdout}\nstderr: ${p.stderr}`);
     assert.ok(p.stdout.includes('GC-ERROR'), `stdout: ${p.stdout}`);
     assert.ok(p.stdout.includes('WATCHDOG-DONE mode=halted'), 'the primary duty completed after the GC error');
+  } finally { lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// 7. s21/A-3 — the deadman marker, adapter e2e (healthy path + throttle).
+// ---------------------------------------------------------------------------
+
+test('s21/A-3: a HEALTHY scan journals the deadman marker — the heartbeat lands on the trace-free exit', async () => {
+  // the healthy exit was the audit's exemplar: 'WATCHDOG-DONE mode=healthy'
+  // left ZERO durable trace (one expiring log line). Now the scan heartbeats
+  // BEFORE the staleness branch — the marker is the pinger-watch duty's
+  // watchdog-liveness source.
+  const lab = mkScanLab({
+    stateJson: {
+      ...STD_STATE,
+      chain: { ...STD_STATE.chain, last_tick: new Date().toISOString(), halted: false, paused: false },
+    },
+  });
+  try {
+    const stateBefore = JSON.parse(readBranchFile(lab.origin, 'state/state.json'));
+    const p = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url });
+    assert.equal(p.status, 0, `scan rc=${p.status}\nstdout: ${p.stdout}\nstderr: ${p.stderr}`);
+    assert.ok(p.stdout.includes('WATCHDOG-DONE mode=healthy'), `stdout: ${p.stdout}`);
+    assert.ok(p.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), 'the healthy exit heartbeats');
+    // the marker landed: exactly one audit-only watchdog record
+    const wd = journalRecordsOn(lab.origin).filter(r => r.kind === 'TICK' && r.actor === 'watchdog');
+    assert.equal(wd.length, 1);
+    assert.equal(wd[0].applied, false);
+    // semantic state identical except journal_seq
+    const stateAfter = JSON.parse(readBranchFile(lab.origin, 'state/state.json'));
+    assert.deepEqual(stateAfter.chain, stateBefore.chain);
+    assert.deepEqual(stateAfter.tasks, stateBefore.tasks);
+    assert.equal(stateAfter.journal_seq, (stateBefore.journal_seq ?? 0) + 1);
+  } finally { lab.cleanup(); }
+});
+
+test('s21/A-3: the heartbeat THROTTLES — an immediate second scan journals nothing (<=1 marker/hour)', async () => {
+  const lab = mkScanLab({
+    stateJson: {
+      ...STD_STATE,
+      chain: { ...STD_STATE.chain, last_tick: new Date().toISOString(), halted: false, paused: false },
+    },
+  });
+  try {
+    const p1 = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url });
+    assert.ok(p1.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), `scan1: ${p1.stdout}`);
+    // the second scan, seconds later (FSM_TEST_NOW_MS pins BOTH scans to the
+    // same epoch -> the newest marker reads 0min old -> throttled)
+    const p2 = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url });
+    assert.equal(p2.status, 0, `scan2 rc=${p2.status}\nstdout: ${p2.stdout}\nstderr: ${p2.stderr}`);
+    assert.ok(!p2.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), `scan2 must NOT heartbeat again inside the throttle window: ${p2.stdout}`);
+    // still exactly ONE watchdog marker on fsm-state
+    const wd = journalRecordsOn(lab.origin).filter(r => r.kind === 'TICK' && r.actor === 'watchdog');
+    assert.equal(wd.length, 1, `one marker total (got ${wd.length})`);
+  } finally { lab.cleanup(); }
+});
+
+test('s21/A-3: the throttle knob — WATCHDOG_MARKER_MIN=0-equivalent garbage falls back to the default (env guard)', async () => {
+  // the env parse is guarded in journalDeadmanMarker (garbage -> 55min): a
+  // garbage value must never mint a zero window (a marker per scan = 6/hour
+  // journal noise on a held chain). Same double-scan shape as the throttle
+  // pin, with the garbage env set.
+  const lab = mkScanLab({ stateJson: { ...STD_STATE, chain: { ...STD_STATE.chain, halted: true } } });
+  try {
+    const p1 = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url, WATCHDOG_MARKER_MIN: 'garbage' });
+    assert.ok(p1.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), `scan1: ${p1.stdout}`);
+    const p2 = runScan(lab.clone, { FSM_SESSIONS_ORIGIN: lab.url, WATCHDOG_MARKER_MIN: 'garbage' });
+    assert.ok(!p2.stdout.includes('WATCHDOG-DEADMAN-MARKER journaled'), `garbage env still throttles at the default: ${p2.stdout}`);
+    const wd = journalRecordsOn(lab.origin).filter(r => r.kind === 'TICK' && r.actor === 'watchdog');
+    assert.equal(wd.length, 1);
   } finally { lab.cleanup(); }
 });
