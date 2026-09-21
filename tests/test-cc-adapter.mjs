@@ -129,6 +129,17 @@ test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are t
   assert.deepEqual(ccModelChain({}), CC_MODEL_CHAIN_DEFAULTS);
   assert.equal(ccModelChain({ CC_MODEL: ' x/y ' })[0], 'x/y');
   assert.deepEqual(ccModelChain({ CC_MODEL: '' }), CC_MODEL_CHAIN_DEFAULTS, 'empty = absent');
+  // s21/W7 pins: the custom head DEDUPS against the defaults (custom wins)
+  // — the deployed CC_MODEL == defaults[0] used to mint lane 2 as an exact
+  // (key, model) repeat of lane 1, a no-backoff plain retry burning a
+  // dispatched slot (compounds W1's unreachable key-2 failover).
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'deepseek/deepseek-v4.1-flash' }), CC_MODEL_CHAIN_DEFAULTS,
+    'W7: the DEPLOYED shape — a duplicate head collapses to the defaults, no repeat lane');
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'z-ai/glm-5.3-flash' }),
+    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'nvidia/nemotron-3.5-lightning:free'],
+    'W7: custom wins the head; the duplicated default slot drops (3 lanes/key, not 4)');
+  assert.equal(ccLanes({ OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2, CC_MODEL: 'deepseek/deepseek-v4.1-flash' }).length, 6,
+    'W7 end-to-end: the deployed config is 2 keys × 3 distinct models = 6 lanes, not 8');
   assert.ok(!JSON.stringify(ccModelChain({})).includes('minimax'), 'the retired slug stays dead');
   assert.ok(!JSON.stringify(CC_MODEL_CHAIN_DEFAULTS).includes('deepseek-v4-flash-0731'),
     'D2 NEVER: the hallucinating free slug on the cc lane (silent content-poison, measured live)');

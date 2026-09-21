@@ -112,7 +112,13 @@ export const CC_SCRATCH_EXCLUDE = ['.claude', '.claude.json'];
 
 export function ccModelChain(env = process.env) {
   const custom = typeof env.CC_MODEL === 'string' && env.CC_MODEL.trim() !== '' ? [env.CC_MODEL.trim()] : [];
-  return [...custom, ...CC_MODEL_CHAIN_DEFAULTS];
+  // s21/W7 (a2): dedup the custom head against the defaults — the deployed
+  // CC_MODEL (deepseek/deepseek-v4.1-flash == CC_MODEL_CHAIN_DEFAULTS[0])
+  // made lane 2 an EXACT (key, model) repeat of lane 1: a no-backoff plain
+  // retry that pushes glm/nemotron and KEY_2's block further out of the
+  // 3-slot dispatched budget (compounds W1, the unreachable failover).
+  // Custom wins (the operator's head position); the duplicate slot drops.
+  return [...custom, ...CC_MODEL_CHAIN_DEFAULTS.filter((m) => !custom.includes(m))];
 }
 
 export function ccKeyPool(env = process.env) {
