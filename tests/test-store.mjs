@@ -219,12 +219,17 @@ test('corruption recovery: state.json corrupted -> last good state from git hist
       });
     }
     // now corrupt state.json on the branch tip (raw push of garbage)
+    // s21 CI fix: the runner has NO ambient git identity (the Store's own
+    // commit path passes GIT_AUTHOR_*/GIT_COMMITTER_* env explicitly — this
+    // raw bash must do the same or commit-tree fails silently there and the
+    // corruption never lands, failing the pin at the wrong place).
     spawnSync('bash', ['-c',
       `cd ${lab.clone} && git fetch origin fsm-state && ` +
       `tree=$(git rev-parse origin/fsm-state^{tree}) && ` +
       `blob=$(printf 'THIS IS NOT JSON{{{' | git hash-object -w --stdin) && ` +
       `git read-tree $tree && git update-index --cacheinfo 100644,$blob,state/state.json && ` +
-      `t2=$(git write-tree) && c=$(git commit-tree $t2 -p origin/fsm-state -m corrupt) && ` +
+      `t2=$(git write-tree) && ` +
+      `c=$(GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t.invalid GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t.invalid git commit-tree $t2 -p origin/fsm-state -m corrupt) && ` +
       `git push origin $c:refs/heads/fsm-state`], { encoding: 'utf8' });
     st.fetch();
     const { state, corrupt } = st.readState();
