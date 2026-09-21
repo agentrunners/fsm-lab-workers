@@ -1,7 +1,10 @@
 // watchdog/scan.mjs — the chain-health backstop.
 //
-// The watchdog NEVER writes state (single-writer discipline: the conductor
-// group owns state). Its powers are READ + DISPATCH + ALERT-ISSUE only:
+// The watchdog stays a NON-SEMANTIC fsm-state writer (s21/A-3 charter
+// amendment: the ONE write is the audit-only deadman marker — see
+// journalDeadmanMarker below; chain/tasks/stats/config are never touched,
+// enforced by the content pin in tests/test-gc.mjs). Its other powers are
+// READ + DISPATCH + ALERT-ISSUE only:
 //   1. read state (via git fetch of the fsm-state branch — read-only)
 //   2. T46/W-C2 (§5a, F-15): transcript GC — BEFORE the halted/paused exits
 //      (a completed epoch is the GC's PRIMARY target, so the pass runs even
@@ -39,6 +42,7 @@ import {
   gcDaysFromEnv, gcPlan, gcParseTouchLog, gcCommitMessage,
   GC_TREE_LIMIT, GC_DAY_MS,
 } from '../lib/watchdog-core.mjs';
+import { newestWatchdogJournalNote } from '../lib/pinger-watch.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -308,6 +312,92 @@ export async function runTranscriptGc({ state, env = process.env, log = () => {}
   }
 }
 
+// s21/A-3 (audit a3, MAJOR): the DEADMAN MARKER — the watchdog's completed
+// scans leave a durable heartbeat on fsm-state. Previously the healthy path
+// (and the held-chain early exits — the LIVE shape between epochs) left ZERO
+// durable trace: no journal, no issue, no comment, so if watchdog runs STOP
+// (admin disables the workflow, GHA schedule sparsity — live-proven, on a
+// ~1h-old repo NEITHER cron fired all session — org outage, runner
+// starvation) the chain keeps looking healthy and the safety net is
+// SILENTLY gone; the compound worst case ends in GH's 60-day
+// scheduled-workflow auto-disable with zero alerts anywhere.
+//
+// Shape: ONE audit-only journal record per completed scan, throttled to
+// ~1/hour (WATCHDOG_MARKER_MIN, default 55min) — the X24 tick-pinger
+// pattern reused verbatim: kind TICK, actor 'watchdog', event_id
+// `watchdog-scan-<ms>`, applied:false (no seq bump, no semantic state
+// change; rebuild skips it). The pinger-watch duty scans these markers
+// (lib/pinger-watch.mjs watchdogDeadmanVerdict) and alarms when they stop.
+//
+// CHARTER AMENDMENT (deliberate, s21/A-3): the watchdog becomes a
+// JOURNAL-ONLY fsm-state writer through the Store's CAS commit — the SAME
+// discipline every queue pusher uses (workers append report lines from
+// outside the conductor group through this exact loop). It NEVER touches
+// chain/tasks/stats/config semantics: the committed state.json differs from
+// the read one ONLY in journal_seq. The enforcement moves from "tip
+// unchanged" to the STRONGER content pin (tests/test-gc.mjs: semantic
+// state identical, exactly one applied:false watchdog record).
+//
+// Contained: a marker failure NEVER breaks the scan's primary duty —
+// log + soft return (the runTranscriptGc discipline).
+export const WATCHDOG_MARKER_MIN_DEFAULT = 55;
+
+export function journalDeadmanMarker(store, { env = process.env, log = () => {}, nowMs = Date.now } = {}) {
+  const throttleMin = (() => {
+    const n = parseInt(env.WATCHDOG_MARKER_MIN, 10);
+    return Number.isFinite(n) && n > 0 ? n : WATCHDOG_MARKER_MIN_DEFAULT;
+  })();
+  const stampMs = nowMs();
+  try {
+    // the throttle read: the newest watchdog note in the journal's TICK-class
+    // tail (64 records deep — markers are sparse in the class; after a marker
+    // lands it is the newest record, so subsequent scans see it immediately).
+    // A busy burst that pushes 64+ records past the newest marker just fires
+    // one extra marker — bounded noise, never a lost heartbeat.
+    const newest = newestWatchdogJournalNote(store.readJournalTail(64, 'TICK'));
+    if (newest) {
+      const ageMs = stampMs - Date.parse(newest.ts);
+      if (Number.isFinite(ageMs) && ageMs >= 0 && ageMs < throttleMin * 60_000) {
+        return { ok: true, outcome: 'throttled', ageMin: Math.round(ageMs / 60_000) };
+      }
+    }
+    const out = store.commit({
+      attempts: 3,
+      message: 'watchdog deadman marker (audit-only — the scan ran)',
+      mutate: (cur) => {
+        if (!cur || typeof cur !== 'object' || cur.chain == null) {
+          return { noop: true, reason: 'deadman-no-state' };
+        }
+        // the id mint mirrors conductorTick's mkJ (id = e<journal_seq>, the
+        // committed state carries journal_seq+1); the 0-floor guards lab /
+        // hand-seeded states that omit the field
+        const seqBase = Number.isInteger(cur.journal_seq) ? cur.journal_seq : 0;
+        const rec = {
+          id: `e${seqBase}`,
+          ts: new Date(stampMs).toISOString(),
+          applied: false,
+          kind: 'TICK',
+          actor: 'watchdog',
+          event_id: `watchdog-scan-${stampMs}`,
+          note: 'watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)',
+        };
+        const state = structuredClone(cur);
+        state.journal_seq = seqBase + 1;
+        return { state, journal: [rec] };
+      },
+    });
+    if (out && out.committed) {
+      log(`WATCHDOG-DEADMAN-MARKER journaled watchdog-scan-${stampMs} (audit-only — the scan's heartbeat; the pinger-watch duty alarms when it stops)`);
+      return { ok: true, outcome: 'journaled', event_id: `watchdog-scan-${stampMs}` };
+    }
+    return { ok: true, outcome: (out && out.reason) || 'noop' };
+  } catch (e) {
+    // contained — the scan's alerting duty is the thing that must never die
+    log(`WATCHDOG-DEADMAN-SKIPPED ${String(e?.message ?? e).slice(0, 160)} (contained — the scan proceeds; next scan retries the heartbeat)`);
+    return { ok: false, outcome: 'error' };
+  }
+}
+
 async function main() {
   const store = new Store({ cwd: process.cwd() });
   store.fetch();
@@ -340,6 +430,13 @@ async function main() {
   // deterministically; unset on live runners -> Date.now, behavior identical.
   const nowMs = Number(process.env.FSM_TEST_NOW_MS) || Date.now();
   await runTranscriptGc({ state, env: process.env, log: console.log, now: () => nowMs });
+
+  // s21/A-3: the deadman heartbeat — AFTER readState (a corrupt-state scan
+  // alerts instead) and BEFORE the halted/paused early-exits: a HELD chain
+  // is the live shape between epochs and its scans must heartbeat exactly
+  // like the healthy path's, or the duty's watchdog-staleness predicate
+  // false-alarms on every parked chain. Throttled to ~1/hour; contained.
+  journalDeadmanMarker(store, { env: process.env, log: console.log, nowMs: () => nowMs });
 
   if (state.chain.halted) { console.log('WATCHDOG-DONE mode=halted (project complete or halted)'); return; }
   if (state.chain.paused) { console.log('WATCHDOG-DONE mode=paused (operator hold)'); return; }

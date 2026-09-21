@@ -36,6 +36,11 @@ jobs:
           LAB_PAT: ${{ secrets.LAB_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           STALE_AFTER_MIN: '4'
+          # s21/A-3: the deadman-marker heartbeat throttle (minutes) — one
+          # audit-only `watchdog-scan-<ms>` journal record per completed scan,
+          # at most one per WATCHDOG_MARKER_MIN; the pinger-watch duty alarms
+          # when the markers stop (WATCHDOG_STALE_AFTER_MIN, default 3h).
+          WATCHDOG_MARKER_MIN: '55'
           # T46/W-C2 (§5a, F-15): transcript retention knob — default 7 days;
           # the scan HARD-CAPS at 90 (values >90 clamp, <1 or invalid reset
           # to the default) regardless of what lands here.

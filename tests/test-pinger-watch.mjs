@@ -21,6 +21,9 @@ import {
   isPingerJournalNote, newestPingerJournalNote, newestPingerRunNote,
   watchTheWatcherVerdict, pingerWatchComment, pingerStaleAfterMin,
   PINGER_NOTE_EVENT_ID_RE, PINGER_RUN_NAME_PREFIX, PINGER_STALE_AFTER_MIN,
+  isWatchdogJournalNote, newestWatchdogJournalNote,
+  watchdogDeadmanVerdict, watchdogDeadmanComment, watchdogStaleAfterMin,
+  WATCHDOG_NOTE_EVENT_ID_RE, WATCHDOG_STALE_AFTER_MIN,
 } from '../lib/pinger-watch.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
@@ -477,4 +480,120 @@ test('W-C3/X24 duty: end-to-end fixture — journal + runs through the verdict a
   const body = pingerWatchComment({ repo: 'claudecode-headless/fsm-lab', staleAfterMin: 300, note: v.note, ageMin: v.ageMin });
   assert.ok(body.startsWith('**[pinger-watch]**'));
   assert.ok(body.includes('source: runs'), 'the runs source is named — the pre-deploy signal');
+});
+
+// ---------------------------------------------------------------------------
+// 6. s21/A-3 — the WATCHDOG DEADMAN (the watch-the-watch-the-watcher half).
+//    The watchdog journals an audit-only `watchdog-scan-<ms>` marker per
+//    completed scan (throttled ~1/hour); the duty scans the SAME journal and
+//    alarms when the markers stop. These pins bite the canonical spec the
+//    executor driver mirrors.
+// ---------------------------------------------------------------------------
+
+const DEADMAN_FIXTURE = [
+  { id: 'e301', ts: '2026-09-21T06:40:00.000Z', applied: true, kind: 'TICK', seq: 110, actor: 'chain', event_id: 'tick-chain-1' },
+  { id: 'e302', ts: '2026-09-21T06:35:00.000Z', applied: false, kind: 'TICK', actor: 'watchdog', event_id: 'watchdog-scan-1789980000000', note: 'watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)' },
+  { id: 'e303', ts: '2026-09-21T06:30:00.000Z', applied: false, kind: 'TICK', actor: 'pinger', event_id: 'tick-pinger-1789979400000', note: 'pinger-liveness (held chain — audit-only marker, no state change, no self-dispatch)' },
+  { id: 'e304', ts: '2026-09-21T02:00:00.000Z', applied: false, kind: 'TICK', actor: 'watchdog', event_id: 'watchdog-scan-1789963200000' },
+  { id: 'e305', ts: '2026-09-21T06:41:00.000Z', applied: true, kind: 'REPORT', task: 'T-301', to: 'done', run_id: 'r9' },
+];
+
+test('s21/A-3 deadman: the journal scan predicate — watchdog markers out of the noise, NEVER conflated with pinger markers', () => {
+  // both arms: the actor arm ('watchdog') and the event_id arm
+  assert.equal(isWatchdogJournalNote(DEADMAN_FIXTURE[1]), true, 'the audit-only watchdog marker matches');
+  assert.equal(isWatchdogJournalNote(DEADMAN_FIXTURE[3]), true, 'the earlier watchdog marker matches');
+  // THE non-conflation pin: a PINGER marker is NOT a watchdog note (and vice
+  // versa — the two watchers must stay distinguishable: a dead watchdog must
+  // not read as a dead pinger)
+  assert.equal(isWatchdogJournalNote(DEADMAN_FIXTURE[2]), false, 'a pinger marker never matches the watchdog predicate');
+  assert.equal(isPingerJournalNote(DEADMAN_FIXTURE[1]), false, 'a watchdog marker never matches the pinger predicate');
+  assert.equal(isWatchdogJournalNote(DEADMAN_FIXTURE[0]), false, 'a chain tick does not match');
+  assert.equal(isWatchdogJournalNote(DEADMAN_FIXTURE[4]), false, 'a REPORT does not match');
+  // the event_id arm alone matches (future actor-shape drift tolerance)
+  assert.equal(isWatchdogJournalNote({ kind: 'TICK', actor: 'mystery', event_id: 'watchdog-scan-42' }), true);
+  assert.equal(isWatchdogJournalNote({ kind: 'TICK', actor: 'mystery', event_id: 'tick-pinger-42' }), false);
+  assert.equal(isWatchdogJournalNote(null), false);
+  assert.equal(isWatchdogJournalNote('not-an-object'), false);
+  // the newest watchdog note wins regardless of position
+  const n = newestWatchdogJournalNote(DEADMAN_FIXTURE);
+  assert.equal(n.ts, '2026-09-21T06:35:00.000Z');
+  assert.equal(n.source, 'journal');
+  // an unparseable ts is skipped, not fatal; empty corpus -> null
+  assert.equal(newestWatchdogJournalNote([{ kind: 'TICK', actor: 'watchdog', ts: 'garbage' }, { kind: 'TICK', actor: 'watchdog', ts: iso(T0), event_id: 'watchdog-scan-1' }]).ts, iso(T0));
+  assert.equal(newestWatchdogJournalNote([]), null);
+  assert.equal(newestWatchdogJournalNote(DEADMAN_FIXTURE.filter(r => r.kind === 'REPORT')), null);
+});
+
+test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) is STALE; the healthy heartbeat is fresh', () => {
+  const NOW = Date.parse('2026-09-21T09:35:00.000Z');
+  // THE deadman pin: the newest marker is 3h old (06:35 -> 09:35) — exactly
+  // the default window -> STALE. A stalled watchdog (runs stopped ~3h ago,
+  // 3 missed hourly heartbeats) yields the alarm.
+  const stalled = watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW });
+  assert.equal(stalled.verdict, 'stale', 'a 3h-old marker is stale at the 180min window (the boundary convention)');
+  assert.equal(stalled.ageMin, 180);
+  assert.equal(stalled.reason, 'marker-at-or-older-than-window');
+  // one minute inside is fresh
+  const fresh = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T06:36:00.000Z' }, nowMs: NOW });
+  assert.equal(fresh.verdict, 'fresh', 'age 179 < window -> fresh');
+  // NO markers at all -> stale (the watchdog is expected to run)
+  const none = watchdogDeadmanVerdict({ nowMs: NOW });
+  assert.equal(none.verdict, 'stale');
+  assert.equal(none.note, null);
+  assert.equal(none.reason, 'no-watchdog-markers');
+  // an unparseable marker ts -> stale, fail-loud (never a false fresh)
+  const bad = watchdogDeadmanVerdict({ journalNote: { ts: 'garbage' }, nowMs: NOW });
+  assert.equal(bad.verdict, 'stale');
+  assert.equal(bad.reason, 'marker-unparseable');
+  // the default window is 180 (hourly heartbeat, ~3 missed)
+  assert.equal(WATCHDOG_STALE_AFTER_MIN, 180);
+  // window override + guards
+  assert.equal(watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T06:35:00.000Z' }, nowMs: NOW, staleAfterMin: 240 }).verdict, 'fresh', '180 < 240 with the override');
+  assert.throws(() => watchdogDeadmanVerdict({ nowMs: NaN }), /nowMs/);
+  assert.throws(() => watchdogDeadmanVerdict({ nowMs: NOW, staleAfterMin: 0 }), /staleAfterMin/);
+  // a future marker clamps age to 0 (clock skew — never a false stale)
+  assert.equal(watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T11:00:00.000Z' }, nowMs: NOW }).ageMin, 0);
+});
+
+test('s21/A-3 deadman: the alert note — watchdogDeadmanComment (the stalled-watchdog alarm body)', () => {
+  // THE brief's pin: a stalled watchdog yields the alert note
+  const NOW = Date.parse('2026-09-21T09:35:00.000Z');
+  const v = watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW });
+  assert.equal(v.verdict, 'stale');
+  const c = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab', staleAfterMin: 180, note: v.note, ageMin: v.ageMin });
+  // the dedup marker prefix — DISTINCT from the pinger-watch marker (the two
+  // watches never collide on one issue thread)
+  assert.ok(c.startsWith('**[fsm-watchdog-deadman]**'), 'the body starts with the deadman dedup marker');
+  const lines = c.split('\n');
+  assert.equal(lines[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on claudecode-headless/fsm-lab in 180min (newest: 2026-09-21T06:35:00.000Z (age 180min)).');
+  assert.equal(lines[1], '');
+  assert.equal(lines.length, 3);
+  // the load-bearing semantics
+  assert.ok(lines[2].includes('the WATCHDOG itself has stopped running'), 'the stall named');
+  assert.ok(lines[2].includes('the safety net is silently gone'), 'the consequence named');
+  assert.ok(lines[2].includes('fsm-watchdog workflow'), 'the remedy pointer');
+  assert.ok(lines[2].includes('cron 3,13,…,53'), 'the watchdog cadence');
+  assert.ok(lines[2].includes('throttled to ~1/hour'), 'the heartbeat contract');
+  assert.ok(lines[2].includes('24h-deduped marker'), 'the dedup contract');
+  // the no-marker variant (the default window renders as 180)
+  const c2 = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab' });
+  assert.ok(c2.includes('newest: none found'), 'the none-found line');
+  assert.ok(c2.includes('no watchdog-scan journal markers'), 'the absent signal named');
+  assert.equal(watchdogDeadmanComment({ repo: 'x', note: null }).split('\n')[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on x in 180min (newest: none found (no watchdog-scan journal markers in the scan window)).');
+  assert.throws(() => watchdogDeadmanComment({}), /repo/);
+});
+
+test('s21/A-3 deadman: watchdogStaleAfterMin(env) — the WATCHDOG_STALE_AFTER_MIN override with the guarded fallback', () => {
+  assert.equal(watchdogStaleAfterMin({}), 180);
+  assert.equal(watchdogStaleAfterMin(), 180);
+  assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '60' }), 60);
+  assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '720' }), 720);
+  for (const bad of ['garbage', '0', '-5', '', 'min60', 'NaN']) {
+    assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: bad }), 180, `bad env ${JSON.stringify(bad)} falls back to the default`);
+  }
+  // the override threads into the verdict (the duty-host wiring)
+  const NOW = Date.parse('2026-09-21T07:35:00.000Z');
+  const note = { ts: '2026-09-21T06:35:00.000Z' };   // 60min old
+  assert.equal(watchdogDeadmanVerdict({ journalNote: note, nowMs: NOW, staleAfterMin: watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '30' }) }).verdict, 'stale', 'a 30min override alarms on a 60min-old marker');
+  assert.equal(watchdogDeadmanVerdict({ journalNote: note, nowMs: NOW, staleAfterMin: watchdogStaleAfterMin({}) }).verdict, 'fresh', 'the default wiring stays fresh');
 });
