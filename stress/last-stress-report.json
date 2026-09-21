@@ -1,68 +1,62 @@
 {
- "generatedAt": "2026-09-21T05:29:58.636Z",
+ "generatedAt": "2026-09-21T05:32:22.234Z",
  "mode": "quick",
  "seed": 20260922,
  "batteries": 1,
  "batteryPass": 1,
- "checks": "7/7",
+ "checks": "6/6",
  "batteryReports": [
   {
-   "battery": "quota-wall",
+   "battery": "dead-key-storm",
    "pass": true,
    "checks": [
     {
-     "name": "qw4x2x12: the budget-pause FIRED at the wall",
+     "name": "cc-storm/W1-FIX: a 50% dead-key pool completes ALL tasks via key-jump",
      "pass": true,
-     "detail": "rounds=3 distinctTasks=4 backstop=false"
+     "detail": "done=12/12 lanes=6"
     },
     {
-     "name": "qw4x2x12: ALERT-FIRST — the alert issue exists before the pause event applies",
+     "name": "cc-storm/W1-FIX: KEY_2 SERVES (the designed 2-key failover exists — pre-W1 it was unreachable)",
      "pass": true,
-     "detail": "alert@2026-09-22T08:00:00.037Z pause@1790064000038"
+     "detail": "servedKeys={[2]}"
     },
     {
-     "name": "qw4x2x12: the pause fired at ≤ threshold+1 distinct tasks (immediate — no extra burn waiting)",
+     "name": "cc-storm/W1-FIX: per-task lane attempts bounded (≤2 hops: 1 dead + 1 served)",
      "pass": true,
-     "detail": "tasks in window=4 threshold=3 max_parallel=4"
+     "detail": "maxHops=2"
     },
     {
-     "name": "qw4x2x12: ZERO work-ladder burn through the wall (attempts ≤ 1, the X21 12×3 burn is dead)",
+     "name": "cc-storm/W1-CONTRAST: the pre-W1 policy leaves KEY_2 UNSERVED (the pin detects the class)",
      "pass": true,
-     "detail": "maxAttempts=1 quarantined=0"
+     "detail": "servedKeys={} done=0/12 — the a2 W1 wrong number reproduced"
     },
     {
-     "name": "qw4x2x12: zero post-pause assigns",
+     "name": "free-storm/50%: ALL tasks complete via rotation (the 50% dead pool still serves)",
      "pass": true,
-     "detail": "assigned 4 -> 4 across the held tick"
+     "detail": "done=12/12 rounds=1"
     },
     {
-     "name": "qw4x2x12: resume-on-fresh-quota drains the epoch clean",
+     "name": "free-storm/50%: the cross-turn re-land count is BOUNDED (≤ 2 per task)",
      "pass": true,
-     "detail": "phase=done done=12/12 quarantined=0 roundsPostResume=1"
-    },
-    {
-     "name": "qw4x2x12: the day-rollover reset fired (per-key counters reborn)",
-     "pass": true,
-     "detail": "rollovers=1"
+     "detail": "maxRelands/task=1 totalRelands=7 tasksWithDeadFirstPick=7/12"
     }
    ],
    "metrics": {
-    "qw4x2x12_rotation_coverage": 4,
-    "qw4x2x12_keys_pool": 4,
-    "qw4x2x12_calls": 16,
-    "qw4x2x12_ok200": 8,
-    "qw4x2x12_err429": 8,
-    "qw4x2x12_first_429_at": "2026-09-22T08:00:00.000Z",
-    "qw4x2x12_rounds_to_pause": 3,
-    "qw4x2x12_attempts_at_wall": 1,
-    "qw4x2x12_done": 12,
-    "qw4x2x12_post_resume_rounds": 1,
-    "qw4x2x12_final_max_attempts": 1
+    "cc_storm_served_keys": [
+     2
+    ],
+    "cc_storm_touched_keys": [
+     1,
+     2
+    ],
+    "cc_storm_lanes": 6,
+    "free50_done": 12,
+    "free50_max_relands_per_task": 1,
+    "free50_total_relands": 7,
+    "free50_dead_first_pick_tasks": 7
    },
-   "notes": [
-    "qw4x2x12: hop-ladder reach = 2 keys/turn (hash, hash+1 mod 4) — rotation coverage across the fleet is 4/4 keys; stranded-capacity risk exists when demand ≈ capacity (the W1/W3 reachability family)"
-   ],
-   "durationMs": 14,
+   "notes": [],
+   "durationMs": 9,
    "mode": "quick",
    "seed": 20260922
   }
