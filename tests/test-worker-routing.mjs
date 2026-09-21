@@ -612,7 +612,15 @@ test('routing: W2 payload with mode=cc — the envelope budget bounds the lane c
   assert.equal(rep.outcome.status, 'infra_failed', 'every lane answered 429-text-as-answer → infra hop, hop, exhausted');
   assert.equal(rep.outcome.telemetry.lane_attempts_used, 3, 'W2 mints lane_attempts:3 — exactly three fake spawns');
   assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
-  assert.equal(rep.outcome.telemetry.lanes?.[2]?.model, 'nvidia/nemotron-3.5-lightning:free', 'key-major flatten: three models on key 1');
+  // s21/W1: the E11 429 conviction is KEY-CLASS — attempt 1 (key-1 deepseek)
+  // JUMPS to key 2's first lane; attempts 2-3 burn key-2 lanes (no next key
+  // to jump to → ordinary model advance). Both keys rate-limited = the
+  // honest exhaustion shape; the budget still bounds the spawns exactly.
+  assert.deepEqual(rep.outcome.telemetry.lanes?.map(l => [l.key_index, l.model]), [
+    [1, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'z-ai/glm-5.3-flash'],
+  ], 'key-jump after the key-1 429, then key-2 model advance — three spawns, two keys served');
 });
 
 test('routing: W2 payload with mode=real — the envelope budget bounds the lane chain (lane_attempts rides the dispatch)', async () => {

@@ -389,16 +389,41 @@ test('classify: both-empty -> work_failed \'empty-completion\' (the lane ANSWERE
 });
 
 test('classify: error-as-answer — marker TEXT packaged as the success answer -> infra_failed BEFORE done', () => {
-  // the E11 classes against the DEFAULT markers
+  // the E11 classes against the DEFAULT markers — all ERROR-LINE shaped
+  // (s21/W4 gate): an error prefix, a bare status opener, or marker-headed
   assert.deepEqual(classifyOutcome({ content: 'Error: invalid API key provided' }), { status: 'infra_failed', detail: 'error-as-answer(invalid api key)' });
   assert.deepEqual(classifyOutcome({ content: '401 Unauthorized — check your credentials' }), { status: 'infra_failed', detail: 'error-as-answer(unauthorized)' });
   assert.deepEqual(classifyOutcome({ content: 'Insufficient credits: add more' }), { status: 'infra_failed', detail: 'error-as-answer(insufficient credits)' });
   assert.deepEqual(classifyOutcome({ content: 'RATE LIMIT exceeded, slow down' }), { status: 'infra_failed', detail: 'error-as-answer(rate limit)' });
+  // the upstream passthrough shape (X21-final verbatim opener)
+  assert.equal(classifyOutcome({ content: 'API Error: Request rejected (429) · Rate limit exceeded: free-models-per-day-high-balance' }).status, 'infra_failed');
+  assert.equal(classifyOutcome({ content: 'FATAL: the provider rejected the call' }, { errorMarkers: ['provider rejected'] }).status, 'infra_failed');
   assert.deepEqual(DEFAULT_ERROR_MARKERS, ['invalid api key', 'unauthorized', 'insufficient credits', 'rate limit']);
   // the E11 re-check fires EVEN when the harness already stamped status:'done'
   assert.deepEqual(classifyOutcome({ status: 'done', content: 'unauthorized' }), { status: 'infra_failed', detail: 'error-as-answer(unauthorized)' });
   // normal content stays done
   assert.equal(classifyOutcome({ content: 'all good, no markers here' }).status, 'done');
+});
+
+test('classify: E11 NEGATIVE pins (s21/W4, a2 T10) — a good done answer DISCUSSING a marker stays done', () => {
+  // the pre-W4 false-positive class verbatim: ANY non-empty content
+  // CONTAINING a marker substring convicted — a legitimately DONE turn whose
+  // result mentioned 'rate limit'/'unauthorized'/'insufficient credits'
+  // (this repo's own task mix: runbooks for the 429 lane, quota docs) flipped
+  // to infra → net-zero ×3 → infra-exhausted QUARANTINE of good, landed work.
+  // The W4 gate requires an error-line context; mid-prose mentions are DONE.
+  const prose = [
+    'Done: documented the 429 retry ladder — when a rate limit hits the shared lane the pool rotates keys, and the backoff cadence is now in the runbook.',
+    'The 401 unauthorized errors were traced to the revoked secondary key; after the secret swap all 12 calls succeeded and the summary table landed in the report.',
+    'Fixed the quota docs: the insufficient credits section now covers the paid-lane failover (turn completed, artifact staged).',
+  ];
+  for (const content of prose) {
+    assert.equal(classifyOutcome({ content }).status, 'done', `prose mentioning a marker stays done: ${content.slice(0, 48)}…`);
+  }
+  // ... and even when the harness already stamped status:'done' (the step-1
+  // re-check is gated the same way — runTurn calls ctx-less, defaults on)
+  assert.equal(classifyOutcome({ status: 'done', content: prose[0] }).status, 'done');
+  assert.equal(classifyOutcome({ status: 'done', content: prose[1] }).status, 'done');
 });
 
 test('classify: ctx.errorMarkers — custom markers replace the defaults; [] disables the check', () => {

@@ -13,8 +13,9 @@
 //     F-M8 env contract (ANTHROPIC_BASE_URL/AUTH_TOKEN/MODEL/SMALL_FAST_MODEL,
 //     DISABLE_TELEMETRY, OX_AGENT_DEADLINE_UTC from envelope.deadline_ms) —
 //     lane key index, model, deadline, max-turns all visible and correct
-//   * the LANE ROTATION: fixture:429 on the key-1 lanes → lane 2's echo shows
-//     the rotated model (same key), lane 4's shows the rotated KEY
+//   * the LANE ROTATION: fixture:429 on the key-1 lane → lane 2's echo
+//     shows the JUMPED KEY (s21/W1: key-class failures skip the dead key's
+//     remaining models instead of grinding them)
 //   * the LANE_ATTEMPTS BOUND: exactly budget.lane_attempts spawns
 //   * the DEADLINE KILL: the process-group SIGKILL at the wall → status
 //     'deadline' (rc=124-equivalent), no orphan CLI past the report
@@ -252,17 +253,37 @@ matrix.push(await matrixRow({
   rmSync(roots, { recursive: true, force: true });
 }
 {
-  // m-1 (rotation recovery): the key-1 lanes exit with the API error, the
-  // key-2 lane completes — the F-1 fix recovers the turn in-process
+  // m-1 (rotation recovery): the key-1 lane exits with the API error, the
+  // key-2 lane completes — the F-1 fix recovers the turn in-process.
+  // s21/W1: the 429 is KEY-CLASS — the recovery JUMPS to key 2's first
+  // lane on attempt 2 (was 4 attempts: the whole dead-key model chain first)
   const { result, roots } = await adapterTurn(mkEnvelope({
     prompt: '[fixture:exit-api-429-if:conformance-key-one] go',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
   }));
-  check('shape:real CLI error-exit — the rotation RECOVERS (key-2 lane completes)',
-    eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 4)
-    && eq(JSON.stringify(result.telemetry.lanes.map(l => [l.key_index, l.class])),
-      JSON.stringify([[1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done']])),
+  check('shape:real CLI error-exit — the key-jump RECOVERS (key-2 lane completes)',
+    eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 2)
+      && eq(JSON.stringify(result.telemetry.lanes.map(l => [l.key_index, l.class])),
+        JSON.stringify([[1, 'infra'], [2, 'done']])),
     `status=${classifyOutcome(result).status} used=${result.lane_attempts_used}`);
+  rmSync(roots, { recursive: true, force: true });
+}
+{
+  // s21/W1 HEADLINE (a2): the DISPATCHED budget (lane_attempts: 3) + the
+  // deployed CC_MODEL (== defaults[0], W7-deduped) + a drained primary —
+  // key 1 402s on every lane it could ever serve; the key-jump puts key 2's
+  // first lane INSIDE the budget and the turn completes. Pre-W1 this shape
+  // was lane-exhausted(402×3) → net-zero ×3 → infra-exhausted quarantine
+  // while a healthy KEY_2 sat idle (the unreachable failover).
+  const { result, roots } = await adapterTurn(mkEnvelope({
+    prompt: '[fixture:exit-api-402-if:conformance-key-one] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  }), { env: { ...fakeEnv, CC_MODEL: 'deepseek/deepseek-v4.1-flash' } });
+  check('W1: drained primary (402) at the dispatched budget — key 2 serves, the turn completes',
+    eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 2)
+      && eq(JSON.stringify(result.telemetry.lanes.map(l => [l.key_index, l.class])),
+        JSON.stringify([[1, 'infra'], [2, 'done']])),
+    `status=${classifyOutcome(result).status} used=${result.lane_attempts_used} lanes=${JSON.stringify(result.telemetry.lanes.map(l => [l.key_index, l.class]))}`);
   rmSync(roots, { recursive: true, force: true });
 }
 {
@@ -362,18 +383,19 @@ matrix.push(await matrixRow({
 // ---------------------------------------------------------------------------
 
 {
+  // s21/W1: the E11 429-text conviction is key-class — lane 2 is already
+  // the JUMPED KEY (same model); the turn recovers in 2 attempts (was 4:
+  // lane 2 rotated the model, lane 4 the key — the pre-W1 economics)
   const { result, roots } = await adapterTurn(mkEnvelope({
     prompt: '[fixture:429-if:conformance-key-one] rotate',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
   }), { keepRoots: true });
   const e2 = readEcho(roots, 1);
-  const e4 = readEcho(roots, 3);
-  const lane2Rotated = eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY1) && eq(e2.env.ANTHROPIC_MODEL, 'z-ai/glm-5.3-flash');
-  const keyRotated = eq(e4.env.ANTHROPIC_AUTH_TOKEN, KEY2) && eq(e4.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
-  const recovered = eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 4);
-  check('rotation: lane 2 shows the rotated MODEL; lane 4 the rotated KEY; the turn recovers',
-    lane2Rotated && keyRotated && recovered,
-    `lane2=${e2.env.ANTHROPIC_MODEL} lane4=${e4.env.ANTHROPIC_AUTH_TOKEN === KEY2 ? 'key2' : 'key1'} used=${result.lane_attempts_used}`);
+  const keyJumped = eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2) && eq(e2.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
+  const recovered = eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 2);
+  check('rotation: lane 2 shows the JUMPED KEY (same model); the turn recovers in 2 attempts',
+    keyJumped && recovered,
+    `lane2=${e2.env.ANTHROPIC_AUTH_TOKEN === KEY2 ? 'key2' : 'key1'} model=${e2.env.ANTHROPIC_MODEL} used=${result.lane_attempts_used}`);
   rmSync(roots, { recursive: true, force: true });
 }
 {

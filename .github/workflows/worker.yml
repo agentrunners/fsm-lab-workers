@@ -101,7 +101,22 @@ jobs:
         run: |
           MODE=$(printf '%s' "$OX_RAW" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(typeof o==="object"&&o?String(o.mode||""):"")}catch{console.log("")}})')
           if [ "$MODE" = "cc" ] || [ -z "$MODE" ]; then
-            npm install -g @anthropic-ai/claude-code@${CC_VERSION:-latest} && claude --version
+            # s21/W2 (a2): the install default IS the adapter's M-4 pin
+            # (ccCliVersion() in worker/cc-adapter.mjs → 2.1.273), never
+            # 'latest' — an unset vars.CC_VERSION used to install @latest
+            # while the spawn argv pinned 2.1.273: npx could not use the
+            # global install and paid a fresh package download INSIDE the
+            # wall budget (the ~7-min m-9 tax this step exists to avoid).
+            # Keep in sync with ccCliVersion() — pinned by
+            # tests/test-cc-adapter.mjs (the install/spawn alignment pin).
+            CC_PIN="${CC_VERSION:-2.1.273}"
+            npm install -g "@anthropic-ai/claude-code@${CC_PIN}"
+            INSTALLED="$(claude --version)"
+            echo "CC-CLI-VERSION ${INSTALLED} (pin ${CC_PIN})"
+            case "$INSTALLED" in
+              *"$CC_PIN"*) ;;
+              *) echo "::error::claude --version (${INSTALLED}) does not match the pin ${CC_PIN} — refusing to let the spawn lane pay a fresh npx download inside the wall budget (s21/W2)"; exit 1;;
+            esac
           else
             echo "INSTALL-SKIPPED mode=$MODE (non-cc dispatch — no CC CLI needed)"
           fi
@@ -167,7 +182,9 @@ jobs:
           # #6 secondary; empty/absent lanes are simply not in the pool) and
           # the model chain head (OPTIONAL repo variable CC_MODEL; empty = the
           # free-lane defaults in worker/cc-adapter.mjs). The CLI pin
-          # (OPTIONAL CC_VERSION, default 'latest') + the determinism mode
+          # (OPTIONAL CC_VERSION, default 2.1.273 — the adapter's M-4 pin,
+          # s21/W2: the INSTALL step above defaults to the SAME literal, and
+          # asserts the installed version matches) + the determinism mode
           # (CC_FAKE_LLM — NEVER in live dispatches) complete the env surface.
           OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
           CC_MODEL: ${{ vars.CC_MODEL || '' }}

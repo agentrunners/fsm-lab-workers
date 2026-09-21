@@ -21,10 +21,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
-  ccExitJson, ccApiErrorStatus, ccChildEnv, CC_ENV_DENYLIST,
+  ccExitJson, ccApiErrorStatus, ccChildEnv, ccNextLaneIndex, CC_ENV_DENYLIST,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
+  CC_KEY_CLASS_STATUSES,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
 
@@ -129,6 +131,17 @@ test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are t
   assert.deepEqual(ccModelChain({}), CC_MODEL_CHAIN_DEFAULTS);
   assert.equal(ccModelChain({ CC_MODEL: ' x/y ' })[0], 'x/y');
   assert.deepEqual(ccModelChain({ CC_MODEL: '' }), CC_MODEL_CHAIN_DEFAULTS, 'empty = absent');
+  // s21/W7 pins: the custom head DEDUPS against the defaults (custom wins)
+  // — the deployed CC_MODEL == defaults[0] used to mint lane 2 as an exact
+  // (key, model) repeat of lane 1, a no-backoff plain retry burning a
+  // dispatched slot (compounds W1's unreachable key-2 failover).
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'deepseek/deepseek-v4.1-flash' }), CC_MODEL_CHAIN_DEFAULTS,
+    'W7: the DEPLOYED shape — a duplicate head collapses to the defaults, no repeat lane');
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'z-ai/glm-5.3-flash' }),
+    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'nvidia/nemotron-3.5-lightning:free'],
+    'W7: custom wins the head; the duplicated default slot drops (3 lanes/key, not 4)');
+  assert.equal(ccLanes({ OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2, CC_MODEL: 'deepseek/deepseek-v4.1-flash' }).length, 6,
+    'W7 end-to-end: the deployed config is 2 keys × 3 distinct models = 6 lanes, not 8');
   assert.ok(!JSON.stringify(ccModelChain({})).includes('minimax'), 'the retired slug stays dead');
   assert.ok(!JSON.stringify(CC_MODEL_CHAIN_DEFAULTS).includes('deepseek-v4-flash-0731'),
     'D2 NEVER: the hallucinating free slug on the cc lane (silent content-poison, measured live)');
@@ -155,6 +168,21 @@ test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output
   assert.equal(ccCliVersion({ CC_VERSION: ' 2.1.273 ' }), '2.1.273', 'trimmed env pin');
   assert.equal(ccArgv(envelope({ budget: { max_turns: 12, wall_ms: 60_000, lane_attempts: 3 } }), { max_turns: 12 }, { CC_VERSION: '9.9.999' })[1],
     '@anthropic-ai/claude-code@9.9.999', 'CC_VERSION overrides the pin');
+});
+
+test('cc W2: worker.yml\'s INSTALL default == the adapter pin — the install lane and the spawn lane agree (never latest)', () => {
+  // s21/W2 (a2): the install step defaulted to @latest while the spawn argv
+  // pinned 2.1.273 — an unset vars.CC_VERSION installed a version the spawn
+  // lane would not use, so npx paid a fresh package download INSIDE the wall
+  // budget (the ~7-min m-9 tax the install step exists to avoid). The yml
+  // default and ccCliVersion() must move together — THIS pin is the tie.
+  const yml = readFileSync(fileURLToPath(new URL('../.github/workflows/worker.yml', import.meta.url)), 'utf8');
+  const m = /CC_PIN="\$\{CC_VERSION:-(.+?)\}"/.exec(yml);
+  assert.ok(m, 'the install step defines CC_PIN with a ${CC_VERSION:-<literal>} default');
+  assert.equal(m[1], ccCliVersion({}),
+    `the install default (${m[1]}) must equal the adapter's ccCliVersion pin (${ccCliVersion({})}) — drift = the npx-download-inside-the-wall class`);
+  assert.ok(yml.includes('npm install -g "@anthropic-ai/claude-code@${CC_PIN}"'), 'the install consumes the pin');
+  assert.ok(!/\$\{CC_VERSION:-latest\}/.test(yml), 'the stale latest default is dead');
 });
 
 test('cc lane env: the FULL F-M8 contract shape (pure)', () => {
@@ -347,6 +375,23 @@ test('cc classify: 429 text-as-answer → infra HOP; work-class shapes do NOT ho
   mt.roots.cleanup();
 });
 
+test('cc classify (W4 NEGATIVE): a DONE answer DISCUSSING rate limits/unauthorized stays done — no hop, no quarantine', async () => {
+  // the a2 W4 false-positive class, adapter end-to-end: a legitimately DONE
+  // turn whose result prose MERELY MENTIONS the E11 markers (runbooks for
+  // the 429 lane, quota docs — this repo's own task mix). Pre-W4 the bare
+  // substring scan flipped it infra → rotation → lane-exhausted → net-zero
+  // ×3 → infra-exhausted QUARANTINE of good, landed work.
+  const { result, roots } = await turn(fakeEnv(), { prompt: '[fixture:done-marker-prose] go' });
+  const cls = classifyOutcome(result);
+  assert.equal(cls.status, 'done', 'the marker-mentioning prose answer stays done');
+  assert.match(cls.artifact, /Done: documented the ops runbook/);
+  assert.equal(result.lane_attempts_used, 1, 'NO hop — the answer is the work, not an error');
+  assert.equal(result.telemetry.lanes.length, 1);
+  assert.equal(result.telemetry.lanes[0].class, 'done');
+  assert.equal(readdirSync(roots.echoDir).length, 1, 'exactly one spawn — nothing rotated');
+  roots.cleanup();
+});
+
 test('cc classify: non-zero rc — transport-shaped stderr hops, app-shaped stderr is WORK', async () => {
   const transport = await turn(fakeEnv(), {
     prompt: '[fixture:exit-transport] go',
@@ -396,17 +441,81 @@ test('cc classify (B-1): EVERY numeric api_error_status rotates — 400/401/402/
   }
 });
 
-test('cc rotation (B-1): key-1 exit-api-429 lanes → hops to key 2 and RECOVERS — the F-1 fix end-to-end', async () => {
+test('cc rotation (B-1): key-1 exit-api-429 lane → JUMPS to key 2 and RECOVERS — the F-1 fix + the W1 key-jump end-to-end', async () => {
   const { result, roots } = await turn(fakeEnv(), {
     prompt: '[fixture:exit-api-429-if:cc-test-key-one] go',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
   });
   assert.equal(classifyOutcome(result).status, 'done', 'the rotation recovered the turn in-process');
-  assert.equal(result.lane_attempts_used, 4, '3 key-1 lanes exited api-429, the 4th (key 2, first model) completed');
+  // s21/W1: the 429 is KEY-CLASS — the dead key's remaining models are
+  // skipped (they would 429 too); the SECOND attempt is already key 2's
+  // like-for-like deepseek lane (was 4 attempts pre-W1: k1m1→k1m2→k1m3→k2m1)
+  assert.equal(result.lane_attempts_used, 2, 'attempt 1 = key-1 deepseek (exit-api-429), attempt 2 = key-2 deepseek — done');
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.class]), [
-    [1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done'],
+    [1, 'infra'], [2, 'done'],
   ]);
   roots.cleanup();
+});
+
+test('cc W1 HEADLINE: key-1 402s on every lane at the DISPATCHED budget (lane_attempts:3) + the deployed CC_MODEL — key 2 serves, the turn completes (the failover that did not exist)', async () => {
+  // the deployed shape verbatim: CC_MODEL = defaults[0] (the W7 dedup makes
+  // it 3 distinct models), 2 keys in the pool, lane_attempts 3 — the budget
+  // assembleDispatchPayload mints. Pre-W1: all 3 served lanes were key-1
+  // lanes (key-major flatten) → 402×3 → lane-exhausted → net-zero ×3 →
+  // infra-exhausted quarantine while a HEALTHY key 2 sat idle (a2 W1).
+  const { result, roots } = await turn(fakeEnv({ CC_MODEL: 'deepseek/deepseek-v4.1-flash' }), {
+    prompt: '[fixture:exit-api-402-if:cc-test-key-one] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(classifyOutcome(result).status, 'done', 'the drained primary fails over INSIDE the dispatched budget');
+  assert.equal(result.lane_attempts_used, 2, 'one 402 lane on key 1, then key 2 answers');
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model, l.class]), [
+    [1, 'deepseek/deepseek-v4.1-flash', 'infra'],
+    [2, 'deepseek/deepseek-v4.1-flash', 'done'],
+  ], 'key 2 SERVED — the like-for-like retry on the next key');
+  const e2 = readEcho(roots, 1);
+  assert.equal(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the second spawn rode the second key');
+  roots.cleanup();
+});
+
+test('cc W1: single-key pool — the key-jump degenerates to ordinary advance (byte-identical rotation)', async () => {
+  // no second key: ccNextLaneIndex has no next key to jump to — the advance
+  // is +1 exactly as before (the 1-key deployment is unchanged by W1)
+  const { result, roots } = await turn({ CC_FAKE_LLM: '1', OPENROUTER_API_KEY: KEY1 }, {
+    prompt: '[fixture:exit-api-429] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 2 },
+  });
+  assert.equal(result.status, 'infra_failed');
+  assert.match(result.detail, /lane-exhausted\(2\/3 lanes, last lane-429\)/);
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
+    [1, 'deepseek/deepseek-v4.1-flash'],
+    [1, 'z-ai/glm-5.3-flash'],
+  ], 'same-key model-chain rotation — the pre-W1 shape');
+  roots.cleanup();
+});
+
+test('cc lane advance (W1 pure): ccNextLaneIndex — key-class jumps the key block, everything else advances one', () => {
+  const lanes = ccLanes(fakeEnv());   // 6 lanes: k1m1..k1m3, k2m1..k2m3
+  assert.equal(lanes.length, 6);
+  // key-class at k1m1 → the next key's FIRST lane (k2m1 — like-for-like here)
+  assert.equal(ccNextLaneIndex(lanes, 0, true), 3);
+  // key-class mid-block (k1m2) → still the next key's FIRST lane (k2m1):
+  // the product is consumed strictly in order, dead-key tails skipped
+  assert.equal(ccNextLaneIndex(lanes, 1, true), 3);
+  // key-class on the LAST key (k2m2) → no next key: ordinary advance
+  assert.equal(ccNextLaneIndex(lanes, 4, true), 5);
+  // key-class on the very last lane → advance past the end (exhaustion)
+  assert.equal(ccNextLaneIndex(lanes, 5, true), 6);
+  // non-key-class (transport/5xx/400/404/bridge) — always +1
+  assert.equal(ccNextLaneIndex(lanes, 0, false), 1);
+  assert.equal(ccNextLaneIndex(lanes, 3, false), 4);
+  // degenerate inputs stay boring
+  assert.equal(ccNextLaneIndex([], 0, true), 1);
+  assert.equal(ccNextLaneIndex(lanes, -1, true), 0);
+  assert.equal(ccNextLaneIndex(lanes, 99, true), 100);
+  assert.equal(ccNextLaneIndex(null, 0, true), 1);
+  // the key-class set is exactly the free lane's M5 rotate-class
+  assert.deepEqual([...CC_KEY_CLASS_STATUSES].sort(), [401, 402, 429]);
 });
 
 test('cc exit-json helpers (B-1 pure): the stdout parse + the numeric-status trigger', () => {
@@ -440,29 +549,25 @@ test('cc dup-report: the fixture rides repeat_report — the caller enqueues the
 // The lane rotation (fixture:429 on key 1) + the lane_attempts bound.
 // ---------------------------------------------------------------------------
 
-test('cc rotation: key-1 lanes 429 → hops through the chain to a KEY-2 lane → done; every spawn boundary visible', async () => {
+test('cc rotation: key-1 lane 429 → JUMPS to a KEY-2 lane → done; every spawn boundary visible', async () => {
   const { result, roots } = await turn(fakeEnv(), {
     prompt: '[fixture:429-if:cc-test-key-one] go',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 5 },
   });
   assert.equal(classifyOutcome(result).status, 'done', 'the rotation recovered the turn in-process');
-  assert.equal(result.lane_attempts_used, 4, '3 key-1 lanes burned, the 4th (key 2, first model) completed');
+  // s21/W1: the E11 429-text conviction is key-class — attempt 2 is already
+  // the key-2 like-for-like deepseek lane (was 4 attempts pre-W1)
+  assert.equal(result.lane_attempts_used, 2, '1 key-1 lane burned (429 marker), the 2nd (key 2, same model) completed');
   assert.deepEqual(result.models, [
     'deepseek/deepseek-v4.1-flash',
-    'z-ai/glm-5.3-flash',
-    'nvidia/nemotron-3.5-lightning:free',
     'deepseek/deepseek-v4.1-flash',
-  ], 'key-major: the full chain on key 1, then key 2');
-  // the SECOND spawn's boundary already shows the rotated MODEL (same key)
+  ], 'the like-for-like retry: same model, next key');
+  // the SECOND spawn's boundary already shows the rotated KEY (same model)
   const e1 = readEcho(roots, 1);
-  assert.equal(e1.env.ANTHROPIC_AUTH_TOKEN, KEY1);
-  assert.equal(e1.env.ANTHROPIC_MODEL, 'z-ai/glm-5.3-flash', 'lane 2 = the next model on key 1');
-  // the KEY rotation is visible from spawn 4 on
-  const e4 = readEcho(roots, 3);
-  assert.equal(e4.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the key pool rotated');
-  assert.equal(e4.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
+  assert.equal(e1.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the key pool jumped (E11 markers are key-class)');
+  assert.equal(e1.env.ANTHROPIC_MODEL, 'deepseek/deepseek-v4.1-flash');
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.class]), [
-    [1, 'infra'], [1, 'infra'], [1, 'infra'], [2, 'done'],
+    [1, 'infra'], [2, 'done'],
   ]);
   roots.cleanup();
 });
