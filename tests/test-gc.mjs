@@ -19,6 +19,10 @@
 // Clock discipline: NOW is fixed at 2026-09-13T12:00:00Z; transcript commit
 // dates are minted relative to it. gcDays=7 → the shallow window reaches
 // 2026-09-04 (the +2d slack); the boundary commit at 2026-09-05 is inside it.
+// The adapter e2e pass injects the SAME epoch into the spawned scan via
+// FSM_TEST_NOW_MS (the T1 seam — clock injection at the adapter boundary),
+// so the F-15a placement pins are deterministic forever, independent of the
+// wall clock.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -637,6 +641,7 @@ function runScan(clone, extraEnv = {}) {
     GH_TOKEN: 'bogus',
     LAB_PAT: '',
     STALE_AFTER_MIN: '4',
+    FSM_TEST_NOW_MS: String(NOW), // T1: pin the adapter clock to the fixture epoch
     NODE_USE_ENV_PROXY: '1',
     HTTPS_PROXY: 'http://127.0.0.1:9',
     https_proxy: 'http://127.0.0.1:9',

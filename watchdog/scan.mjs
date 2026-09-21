@@ -325,7 +325,14 @@ async function main() {
   // as "every task is residue" — the worst moment to delete the audit trail.
   // Read-only over fsm-state (the charter); the ONLY write is the ONE
   // fsm-sessions deletion commit (F-15b: that commit is the audit).
-  await runTranscriptGc({ state, env: process.env, log: console.log, now: Date.now });
+  //
+  // T1 (s21 audit — clock injection at the adapter boundary): the GC age math
+  // is fixture-pinned in tests/test-gc.mjs (NOW frozen at 2026-09-13); a
+  // wall-clock Date.now() here let those pins ROT once the fixtures aged past
+  // the 7-day window (the 477/479 red gate). FSM_TEST_NOW_MS pins the clock
+  // deterministically; unset on live runners -> Date.now, behavior identical.
+  const nowMs = Number(process.env.FSM_TEST_NOW_MS) || Date.now();
+  await runTranscriptGc({ state, env: process.env, log: console.log, now: () => nowMs });
 
   if (state.chain.halted) { console.log('WATCHDOG-DONE mode=halted (project complete or halted)'); return; }
   if (state.chain.paused) { console.log('WATCHDOG-DONE mode=paused (operator hold)'); return; }
