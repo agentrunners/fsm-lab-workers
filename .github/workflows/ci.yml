@@ -1,0 +1,51 @@
+# fsm-ci — the gate that keeps the gate honest (s21 audit T2: no CI existed —
+# the 477/479 date-rot of the F-15a pins survived 2+ days precisely because
+# nothing ran validate.sh where merges land). Runs the FULL local pre-push
+# stack on every push / PR to main: YAML parse of every workflow + node
+# --check of every mjs + the 479-pin unit suite + all 4 sims + conformance-cc
+# (T3 folded sim3/sim4/conformance into validate.sh) → VALIDATE-OK or red.
+#
+# Discipline:
+#   - GITHUB_TOKEN ONLY (contents: read) — no PAT secret is read anywhere, and
+#     events created with the default token can NEVER wake other workflows, so
+#     this gate cannot self-trigger the machine plane (conductor/watchdog/...).
+#   - The repository guard keeps forks/mirrors from burning minutes on a tree
+#     where the fixtures may not exist.
+#   - workflow_dispatch (post-merge) lets an operator re-run the gate on demand
+#     — the T1-class-rot manual check.
+name: fsm-ci
+
+run-name: "gate · validate (${{ github.event_name }})"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: fsm-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'claudecode-headless/fsm-lab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node (match the local dev major)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: PyYAML for the YAML gate (no-op when preinstalled)
+        run: python3 -c "import yaml" || { sudo apt-get update -qq; sudo apt-get install -y -qq python3-yaml; }
+
+      - name: The gate (scripts/validate.sh)
+        run: bash scripts/validate.sh
