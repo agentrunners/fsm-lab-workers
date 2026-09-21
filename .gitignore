@@ -10,3 +10,4 @@
 bridge-lane.jsonl
 node_modules/
 *.log
+e2e/out/
