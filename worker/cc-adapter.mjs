@@ -39,7 +39,10 @@
 // key 1 before key 2's first), bounded by
 // budget.lane_attempts (default 3). INFRA-class lane failure (401/402/429/5xx
 // text-as-answer, transport-shaped stderr, budget-misconfigured truncation)
-// → next lane. WORK-class (the CLI ran and answered: empty completion,
+// → next lane. s21/W1: a KEY-CLASS failure (401/402/429) JUMPS to the next
+// key's first lane — a drained primary fails over to KEY_2 inside the
+// dispatched budget instead of grinding the dead key's remaining models
+// (ccNextLaneIndex). WORK-class (the CLI ran and answered: empty completion,
 // deterministic app error, max-turns) → NO hop: rotating the lane cannot
 // change the answer. GHA runners rotate IPs naturally (the TOS-multi-account
 // concern's real answer); sandbox-origin calls are validity probes only.
@@ -134,6 +137,34 @@ export function ccLanes(env = process.env) {
     for (const model of ccModelChain(env)) lanes.push({ key, keyIndex, model });
   }
   return lanes;
+}
+
+// s21/W1 (a2): the KEY-CLASS statuses — failures that implicate the KEY, not
+// the model: 401 (auth dead), 402 (credits drained), 429 (quota exhausted).
+// The same rotate-class the free lane's M5 uses (worker/turn.mjs). 5xx and
+// 400/404 are upstream/model conditions — ordinary rotation material.
+export const CC_KEY_CLASS_STATUSES = new Set([401, 402, 429]);
+
+// s21/W1 (a2): the lane ADVANCE policy (pure, exported for the unit suite).
+// KEY-MAJOR flatten × the dispatched budget (lane_attempts: 3) × a 3-model
+// chain meant every served lane rode key 1 — a drained/revoked primary
+// burned all 3 slots 402-ing while a healthy KEY_2 sat UNREACHABLE (the
+// designed failover did not exist). Remedy: on a KEY-CLASS failure the
+// failing key is dead for every model it still owes — burning the remaining
+// same-key lanes is a no-backoff retry of a known-dead key — so JUMP the
+// lane index to the NEXT KEY'S FIRST LANE (the key-major product is then
+// consumed strictly in order, with dead-key tails skipped: k1m1, k1m2(402),
+// [k1m3 skipped], k2m1, k2m2, k2m3 — the common case k1m1(402)→k2m1 is the
+// like-for-like retry). Everything else (transport, 5xx, 400/404, bridge
+// spawn) advances one lane as before.
+export function ccNextLaneIndex(lanes, i, keyClassFailure) {
+  if (!Array.isArray(lanes) || !Number.isInteger(i) || i < 0 || i >= lanes.length) return i + 1;
+  if (!keyClassFailure) return i + 1;
+  const dead = lanes[i].keyIndex;
+  for (let j = i + 1; j < lanes.length; j++) {
+    if (lanes[j].keyIndex !== dead) return j;
+  }
+  return i + 1;   // no other key in the pool — ordinary advance (exhaustion follows)
 }
 
 // M-4: the CLI pin — the live-proven X20/X21 version is the DEFAULT (the
@@ -739,8 +770,19 @@ export async function ccTurn(envelope, opts = {}) {
     }
 
     let lastClass = 'none';
-    for (let i = 0; i < maxLanes; i++) {
-      const lane = lanes[i];
+    // s21/W1 (a2): `i` is the ATTEMPT ordinal (what budget.lane_attempts
+    // bounds); `laneIdx` is the LANE INDEX into the key-major product. They
+    // used to coincide (advance was always +1) — which is exactly why the
+    // dispatched budget of 3 could never reach key 2: with a 3-model chain
+    // every served lane rode key 1. A KEY-CLASS failure (401/402/429 — see
+    // CC_KEY_CLASS_STATUSES) now JUMPS laneIdx to the next key's block
+    // (ccNextLaneIndex): the dead key's untried models are skipped as the
+    // no-backoff retries they are, and a drained primary fails over to
+    // KEY_2 WITHIN the budget. The D2 key-major order is unchanged — only
+    // the advance policy is failure-aware.
+    let laneIdx = 0;
+    for (let i = 0; i < maxLanes && laneIdx < lanes.length; i++) {
+      const lane = lanes[laneIdx];
       const argv = ccArgv(envelope, budget, env);
       const extraEnv = {};
       // T46/X20 run-3: real mode runs the LOCAL bridge per lane (the CLI's
@@ -758,7 +800,8 @@ export async function ccTurn(envelope, opts = {}) {
             class: 'infra', bridge_error: String(e?.message ?? e).slice(0, 120),
           });
           lastClass = `cc-bridge(${String(e?.message ?? e).slice(0, 80)})`;
-          continue;   // the bridge is infra — rotate the lane
+          laneIdx = ccNextLaneIndex(lanes, laneIdx, false);
+          continue;   // the bridge is infra — rotate the lane (not key-class: the env broke, not the key)
         }
       }
       if (fake) {
@@ -818,7 +861,8 @@ export async function ccTurn(envelope, opts = {}) {
         if (TRANSPORT_STDERR_RE.test(r.stderr)) {
           laneInfo.class = 'infra';
           lastClass = 'lane-transport';
-          continue;   // the lane never reached the model — rotate
+          laneIdx = ccNextLaneIndex(lanes, laneIdx, false);
+          continue;   // the lane never reached the model — rotate (transport is not key-class)
         }
         // B-1 (the X21-final F-1 fix — 12/16 tasks burned as work_failed on
         // a lane-quota 429): the CLI's error-exit prints its result JSON on
@@ -841,6 +885,10 @@ export async function ccTurn(envelope, opts = {}) {
         if (apiStatus !== null) {
           laneInfo.class = 'infra';
           lastClass = `lane-${apiStatus}`;
+          // s21/W1: 401/402/429 implicate the KEY — jump to the next key's
+          // block instead of re-trying the dead key's next model. 5xx/400/404
+          // are upstream/model conditions — ordinary one-lane advance.
+          laneIdx = ccNextLaneIndex(lanes, laneIdx, CC_KEY_CLASS_STATUSES.has(apiStatus));
           continue;   // the API error surface — rotate the lane
         }
         laneInfo.class = 'work';
@@ -875,6 +923,10 @@ export async function ccTurn(envelope, opts = {}) {
         if (markerCls?.status === 'infra_failed') {
           laneInfo.class = 'infra';
           lastClass = markerCls.detail;
+          // s21/W1: the E11 markers ('invalid api key', 'unauthorized',
+          // 'insufficient credits', 'rate limit' — the adapter's ctx-less
+          // defaults) are ALL key/quota classes — jump the key.
+          laneIdx = ccNextLaneIndex(lanes, laneIdx, true);
           continue;
         }
         laneInfo.class = 'work';
@@ -885,9 +937,14 @@ export async function ccTurn(envelope, opts = {}) {
       }
       cls = classifyOutcome({ content, reasoning, finish });
       if (cls.status === 'infra_failed') {
-        // error-as-answer (E11) or budget-misconfigured (F-M4) — rotate
+        // error-as-answer (E11) or budget-misconfigured (F-M4) — rotate.
+        // s21/W1: only the E11 marker conviction is key-class (the default
+        // markers name key/quota failures); a truncated-at-cap completion
+        // is the caller's budget error — ordinary advance.
         laneInfo.class = 'infra';
         lastClass = cls.detail;
+        laneIdx = ccNextLaneIndex(lanes, laneIdx,
+          typeof cls.detail === 'string' && cls.detail.startsWith('error-as-answer'));
         continue;
       }
       // done | work_failed — the lane ANSWERED: terminal, no hop. Return the
