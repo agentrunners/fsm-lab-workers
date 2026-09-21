@@ -35,7 +35,7 @@ for f in lib/*.mjs conductor/*.mjs worker/*.mjs watchdog/*.mjs probe/*.mjs sim/*
 done
 
 echo "== unit tests =="
-node --test tests/*.mjs 2>&1 | tail -4
+node --test tests/*.mjs 2>&1 | grep -E "^✖|^ℹ (tests|pass|fail)|expected:|actual:|operator:|at " | tail -60
 [ "${PIPESTATUS[0]}" -ne 0 ] && fail=1
 
 echo "== simulation (core) =="
