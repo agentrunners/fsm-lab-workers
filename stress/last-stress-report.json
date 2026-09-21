@@ -1,0 +1,64 @@
+{
+ "generatedAt": "2026-09-21T05:32:22.234Z",
+ "mode": "quick",
+ "seed": 20260922,
+ "batteries": 1,
+ "batteryPass": 1,
+ "checks": "6/6",
+ "batteryReports": [
+  {
+   "battery": "dead-key-storm",
+   "pass": true,
+   "checks": [
+    {
+     "name": "cc-storm/W1-FIX: a 50% dead-key pool completes ALL tasks via key-jump",
+     "pass": true,
+     "detail": "done=12/12 lanes=6"
+    },
+    {
+     "name": "cc-storm/W1-FIX: KEY_2 SERVES (the designed 2-key failover exists — pre-W1 it was unreachable)",
+     "pass": true,
+     "detail": "servedKeys={[2]}"
+    },
+    {
+     "name": "cc-storm/W1-FIX: per-task lane attempts bounded (≤2 hops: 1 dead + 1 served)",
+     "pass": true,
+     "detail": "maxHops=2"
+    },
+    {
+     "name": "cc-storm/W1-CONTRAST: the pre-W1 policy leaves KEY_2 UNSERVED (the pin detects the class)",
+     "pass": true,
+     "detail": "servedKeys={} done=0/12 — the a2 W1 wrong number reproduced"
+    },
+    {
+     "name": "free-storm/50%: ALL tasks complete via rotation (the 50% dead pool still serves)",
+     "pass": true,
+     "detail": "done=12/12 rounds=1"
+    },
+    {
+     "name": "free-storm/50%: the cross-turn re-land count is BOUNDED (≤ 2 per task)",
+     "pass": true,
+     "detail": "maxRelands/task=1 totalRelands=7 tasksWithDeadFirstPick=7/12"
+    }
+   ],
+   "metrics": {
+    "cc_storm_served_keys": [
+     2
+    ],
+    "cc_storm_touched_keys": [
+     1,
+     2
+    ],
+    "cc_storm_lanes": 6,
+    "free50_done": 12,
+    "free50_max_relands_per_task": 1,
+    "free50_total_relands": 7,
+    "free50_dead_first_pick_tasks": 7
+   },
+   "notes": [],
+   "durationMs": 9,
+   "mode": "quick",
+   "seed": 20260922
+  }
+ ]
+}
