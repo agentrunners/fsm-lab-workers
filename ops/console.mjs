@@ -308,7 +308,12 @@ const laneStatsGuard = (s) => s && typeof s === 'object' && !Array.isArray(s);
 // the shared accumulator: one lane_stats-shaped object per entry
 function accumulateLaneStats(statsList) {
   let calls = 0, ok = 0, err429 = 0, err5xx = 0, tokens = 0, cost = 0;
-  const lat = [];
+  // s21/O-2 (audit a5): BOTH latency arrays are collected — the per-record
+  // p50_ms (the per-turn medians) AND the per-record p95_ms (the per-turn
+  // p95s, produced at lane-telemetry.mjs:216-217 and previously DISCARDED
+  // here — the rendered "p95" was a percentile of the p50s).
+  const lat50 = [];
+  const lat95 = [];
   const models = {};
   const classes = {};
   for (const s of statsList) {
@@ -318,20 +323,40 @@ function accumulateLaneStats(statsList) {
     err5xx += Number(s.err5xx) || 0;
     tokens += Number(s.tokens) || 0;
     cost += Number(s.cost) || 0;
-    if (Number.isFinite(Number(s.p50_ms))) lat.push(Number(s.p50_ms));
+    // null/undefined are ABSENT (aggregateLaneStats sets p50_ms/p95_ms null
+    // when a turn's lanes never answered with an ms-bearing line) — coercing
+    // null to 0 would render a lie; absent values render the honest '?'
+    const fin = (v) => (v === null || v === undefined ? null : Number.isFinite(Number(v)) ? Number(v) : null);
+    const p50v = fin(s.p50_ms);
+    const p95v = fin(s.p95_ms);
+    if (p50v !== null) lat50.push(p50v);
+    if (p95v !== null) lat95.push(p95v);
     for (const [m, mm] of Object.entries(s.models || {})) models[m] = (models[m] || 0) + (Number(mm.calls) || 0);
     for (const [k, v] of Object.entries(s.rate_classes || {})) classes[k] = (classes[k] || 0) + (Number(v) || 0);
   }
-  return { calls, ok, err429, err5xx, tokens, cost, lat, models, classes };
+  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes };
 }
 
 function renderLaneLines(acc, sourceLabel) {
-  acc.lat.sort((a, b) => a - b);
-  const p = (q) => acc.lat.length ? acc.lat[Math.min(acc.lat.length - 1, Math.floor(acc.lat.length * q))] : null;
+  acc.lat50.sort((a, b) => a - b);
+  // s21/O-2 (audit a5, MAJOR): HONEST percentiles on the one latency line the
+  // operator reads. The old render computed a nearest-rank percentile over
+  // the per-record p50_ms array and LABELED it `p95` — a percentile-of-medians
+  // that with 2 records renders IDENTICAL to the p50 (the live screen said
+  // `p50 7384ms · p95 15593ms` where 15593 was max-of-p50s while the records'
+  // true p95s ran 12606–21406ms — systematic tail understatement with the
+  // label hiding it). Now: `p50` = the median of the per-turn medians (it IS
+  // that, and the label says p50), and `p95(max)` = the MAXIMUM of the
+  // per-turn p95s — an explicitly labeled upper bound, never a false
+  // percentile. (A true aggregate-over-hops percentile needs the raw ms
+  // histogram — the named residual in T46-WD-DESIGN; the label no longer
+  // asserts a computation the console never made.)
+  const p50 = acc.lat50.length ? acc.lat50[Math.min(acc.lat50.length - 1, Math.floor(acc.lat50.length * 0.5))] : null;
+  const p95max = acc.lat95.length ? Math.max(...acc.lat95) : null;
   const top = Object.entries(acc.models).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([m, n]) => `${m.split('/').pop()}:${n}`).join(' ');
   const cls = Object.entries(acc.classes).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([k, v]) => `${k}:${v}`).join(' ');
   const lines = [
-    `- lanes: ${acc.calls} calls (${acc.ok} ok · ${acc.err429}×429 · ${acc.err5xx}×5xx) · p50 ${p(0.5) ?? '?'}ms · p95 ${p(0.95) ?? '?'}ms · tokens ${acc.tokens} · cost $${acc.cost.toFixed(4)} · ${sourceLabel}`,
+    `- lanes: ${acc.calls} calls (${acc.ok} ok · ${acc.err429}×429 · ${acc.err5xx}×5xx) · p50 ${p50 ?? '?'}ms · p95(max) ${p95max ?? '?'}ms · tokens ${acc.tokens} · cost $${acc.cost.toFixed(4)} · ${sourceLabel}`,
   ];
   if (top) lines.push(`- lane models: ${top}${cls ? ` · limits: ${cls}` : ''}`);
   return lines;

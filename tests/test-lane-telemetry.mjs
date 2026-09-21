@@ -214,3 +214,36 @@ test('statusSummary (the fold, A4): journalReports drives the lane section; the 
   assert.match(s, /- phase: executing/);
   assert.match(s, /deepseek-v4\.1-flash:2/);
 });
+
+// ---------------------------------------------------------------------------
+// 9. s21/O-2 (audit a5, MAJOR) — the HONEST latency line. The accumulator
+//    collected only per-record p50_ms and the render percentile'd that array
+//    under an unqualified `p95` label: with 2 records the p50 and "p95"
+//    rendered IDENTICAL (percentile-of-medians), systematically understating
+//    the tail (live: `p50 7384ms · p95 15593ms` where 15593 was max-of-p50s
+//    and the records' true p95s ran 12606-21406ms). Now BOTH arrays collect:
+//    `p50` = the median of the per-turn medians, `p95(max)` = the MAXIMUM of
+//    the per-turn p95s — the label says exactly what was computed.
+test('laneSection (s21/O-2): p50-of-p50s and max-of-p95s render distinctly — the label says what it is', () => {
+  const journalReports = [
+    { kind: 'REPORT', task: 'T-1', lane_stats: { calls: 2, ok: 2, err429: 0, err5xx: 0, tokens: 40, cost: 0.01, p50_ms: 100, p95_ms: 900, models: {}, rate_classes: {} } },
+    { kind: 'REPORT', task: 'T-2', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0.02, p50_ms: 300, p95_ms: 1200, models: {}, rate_classes: {} } },
+  ];
+  const lines = laneSection([], journalReports);
+  // p50 = median of the per-record p50s [100,300] -> 300; p95(max) =
+  // max of the per-record p95s [900,1200] -> 1200. The OLD render here said
+  // `p50 300ms · p95 300ms` — the two lines were IDENTICAL.
+  assert.match(lines[0], /p50 300ms/);
+  assert.match(lines[0], /p95\(max\) 1200ms/);
+  const m = /p50 (\d+)ms · p95\(max\) (\d+)ms/.exec(lines[0]);
+  assert.ok(m, 'both latency tokens render');
+  assert.notEqual(m[1], m[2], 'p50 and p95(max) come from DIFFERENT arrays — the median-of-medians trap is dead');
+  // a single record: p50 = its p50, p95(max) = its OWN p95 (the audit's live
+  // 2-record case rendered p50 === p95; even 1 record now shows both truths)
+  const single = laneSection([], [journalReports[0]]);
+  assert.match(single[0], /p50 100ms · p95\(max\) 900ms/);
+  // records without p95_ms (or null) → the honest '?', never a re-labeled p50
+  const noP95 = laneSection([], [{ kind: 'REPORT', task: 'T-3', lane_stats: { calls: 1, ok: 1, tokens: 1, cost: 0, p50_ms: 500, p95_ms: null, models: {}, rate_classes: {} } }]);
+  assert.match(noP95[0], /p95\(max\) \?ms/);
+  assert.match(noP95[0], /p50 500ms/);
+});
