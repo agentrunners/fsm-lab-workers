@@ -1,0 +1,11 @@
+#!/bin/sh
+# e2e/bin/npx — the drill's CLI stand-in (CC_FAKE determinism at the REAL
+# spawn boundary). Unplanned package installs REFUSE (exit 127) — never
+# npm-install inside a drill.
+if [ "$#" -ge 2 ] && [ "$1" = "-y" ]; then
+  case "$2" in
+    @anthropic-ai/claude-code@*) shift 2; exec node "$DRILL_FAKE_CC" "$@" ;;
+  esac
+fi
+echo "drill-npx-shim: REFUSING unplanned npx invocation: $*" >&2
+exit 127

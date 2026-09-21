@@ -1,0 +1,5 @@
+{"i":1,"t":1789975205333,"method":"DIRECT","path":"POST /repos/local/fsm-lab/issues","status":201,"actor":"drill-operator","req":"{\"title\":\"[fsm] ops console anchor (drill seed)\",\"labels\":[]}","note":"issue #1"}
+{"i":2,"t":1789975205376,"method":"DIRECT","path":"POST /repos/local/fsm-lab/issues","status":201,"actor":"drill-operator","req":"{\"title\":\"[drill] DRILL-X22\",\"labels\":[]}","note":"issue #2"}
+{"i":3,"t":1789975205376,"method":"DIRECT","path":"POST /repos/local/fsm-lab/issues","status":201,"actor":"stranger-1","req":"{\"title\":\"[drill] stranger task\",\"labels\":[]}","note":"issue #3"}
+{"i":4,"t":1789975206812,"method":"GET","path":"/repos/local/fsm-lab/collaborators/stranger-1/permission","status":404,"actor":"github-actions[bot]"}
+{"i":5,"t":1789975206828,"method":"POST","path":"/repos/local/fsm-lab/issues/3/comments","status":404,"actor":"github-actions[bot]","req":"{\"body\":\"**[fsm-intake]** The door could not verify your permission (GitHub API error) — failing closed: a flaky permission check must never become a free compute lane.\\n\\nNothing was queued. Close and re-open this issue to retry, or ask an operator to nudge it.\"}"}
