@@ -447,3 +447,100 @@ test('W-C1-R/MAJOR-1: paused + done + queued spec -> PARK (no un-commanded resum
   assert.equal(out2.state.chain.paused, false, 'resumed');
   assert.notEqual(out2.state.project.issue ?? null, null, 'the resume tick rolled the queue over (phase done + unpaused)');
 });
+
+// ---------------------------------------------------------------------------
+// s21/C-3 — the straggler re-pause race (live-observed 3x: X23's re-pause,
+// the s20 close's 4th) — the cohort gate. Resume stamps
+// budget_window_cleared_at; a quota report whose lease predates the stamp
+// is a straggler of the OLD storm: journaled (operator audit) but excluded
+// from the count-trigger AND the backstop. A genuinely-new storm (leases
+// issued post-clear) still triggers.
+// ---------------------------------------------------------------------------
+
+test('s21/C-3: post-resume stragglers (pre-clear leases) do NOT re-trigger — the false re-pause is dead', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  // round 1: the original storm -> alert (window 3, distinct 3)
+  const n1 = makeNow(T0 + 60_000);
+  const r1 = conductorTick({
+    cur: structuredClone(s), queue: ids.map((id, i) => quotaReport(s, id, i)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('st1'), now: n1.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(r1.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'round 1: the alert fired (the real storm)');
+  // the storm's re-assignments carry leases issued at r1's clock (T0+60s+)
+  // pause (T0+120s), then resume (T0+180s) — the clear stamp
+  let st = apply(r1.state, { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: 'ctl-c3-p', ts: iso(T0 + 120_000) }, iso(T0 + 120_000), NM).state;
+  st = apply(st, { kind: 'CONTROL', command: 'resume', event_id: 'ctl-c3-r', ts: iso(T0 + 180_000) }, iso(T0 + 180_000), NM).state;
+  assert.equal(st.chain.paused, false, 'resumed');
+  assert.equal(st.budget_window.length, 0, 'the window cleared');
+  assert.ok(st.budget_window_cleared_at, 'the clear stamp landed');
+  // round 2: THE RACE — the paused cohort's in-flight grinds report post-resume.
+  // Their leases were issued at r1's clock (< the T0+180s stamp) -> stragglers.
+  const n2 = makeNow(T0 + 240_000);
+  const r2 = conductorTick({
+    cur: structuredClone(st), queue: ids.map((id, i) => quotaReport(st, id, `str${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('st2'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(!r2.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'THE RACE IS DEAD: 3 straggler reports, no re-pause');
+  assert.equal(r2.state.budget_window.length, 3, 'the stragglers are journaled (operator audit)');
+  assert.ok(r2.state.budget_window.every(e => e.straggler === true), 'every entry marked straggler: true');
+  // honest inverse: a genuinely NEW storm — r2's drain re-assigned with
+  // leases at r2's clock (> the stamp) -> 3 distinct non-stragglers -> ALERT
+  const n3 = makeNow(T0 + 300_000);
+  const r3 = conductorTick({
+    cur: structuredClone(r2.state), queue: ids.map((id, i) => quotaReport(r2.state, id, `new${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('st3'), now: n3.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(r3.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'honest inverse: a NEW storm still triggers');
+  assert.deepEqual(invariants(r3.state), []);
+});
+
+test('s21/C-3: the straggler gate is inert without a resume (fresh chain counts everything)', () => {
+  // no resume ever -> no stamp -> no straggler marking: the original F-6
+  // semantics unchanged (the 3-distinct alert fires on the first storm).
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: ids.map((id, i) => quotaReport(s, id, `f${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('st4'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'no stamp -> no gating (F-6 unchanged)');
+  assert.ok(out.state.budget_window.every(e => !e.straggler), 'no straggler marks without a clear stamp');
+});
+
+test('s21/C-3: a straggler\'s terminal infra-exhausted quarantine does NOT arm the backstop (stale pre-clear lane state)', () => {
+  // one task leased PRE-clear burns its full ladder POST-resume: the
+  // infra-exhausted quarantine lands (correct — the ladder is real) but the
+  // quota backstop must NOT fire (the report reflects the pre-resume lane).
+  const s = assignedState({ max_parallel: 1 });
+  const id = Object.values(s.tasks).find(t => t.status === 'assigned').id;
+  const n0 = makeNow(T0 + 60_000);
+  // two infra quota failures pre-pause (attempts 1->2, lease re-issued each time)
+  let st = structuredClone(s);
+  for (let i = 1; i <= 2; i++) {
+    const r = conductorTick({
+      cur: st, queue: [quotaReport(st, id, `bb${i}`)], controlQueue: [], queueBad: [], ctlBad: [],
+      ev: tickEv(`bb${i}`), now: n0.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+    });
+    st = r.state;
+  }
+  // pause + resume (stamp at T0+180s; the task's current lease is from the
+  // round-2 re-assign at T0+60s+ -> pre-clear)
+  st = apply(st, { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: 'ctl-c3b-p', ts: iso(T0 + 120_000) }, iso(T0 + 120_000), NM).state;
+  st = apply(st, { kind: 'CONTROL', command: 'resume', event_id: 'ctl-c3b-r', ts: iso(T0 + 180_000) }, iso(T0 + 180_000), NM).state;
+  // the straggler's THIRD failure -> attempts=3 -> infra-exhausted quarantine
+  const n2 = makeNow(T0 + 240_000);
+  const r = conductorTick({
+    cur: structuredClone(st), queue: [quotaReport(st, id, 'bb3')], controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('bb3'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(r.state.tasks[id].status, 'quarantined', 'the ladder-burn quarantine lands (attempts are real)');
+  assert.ok(r.state.tasks[id].history.some(h => h.why === 'infra-exhausted' || h.status === 'quarantined'), 'the quarantine is journaled');
+  assert.ok(!r.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'the backstay/backstop did NOT arm from the straggler (stale pre-clear lane state)');
+  assert.ok((r.state.budget_window || []).every(e => e.straggler), 'the terminal entry is straggler-marked');
+});
