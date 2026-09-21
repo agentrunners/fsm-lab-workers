@@ -414,3 +414,26 @@ the W-D review round: clear the window only after the in-flight cohort's
 reports drain, or accept the double-resume as operator routine.
 
 **Session-close amendment (01:44Z):** the epoch is STILL DRAINING at session close — M2 unlocked (4 ready + 4 assigned) after M1's terminals: the chain is alive and progressing post-resume (the resume→work-completes half beyond T-101: milestone advancement is the structural proof). The dots-studio lane quarantines honestly on the harder tasks (`error_max_turns` — weak-model symptoms, exactly what the W-D model swap fixes). Next session records the final halt tally. EPOCH_MODE restored to 'mock' at 01:45Z (mid-flight safe — mode is baked at genesis).
+
+## X26 — the concurrent-overflow live proof + THE CROSS-ORG CRACK (2026-09-21, session 21)
+
+**The setup:** main @ 6af1fa3 (C-1/C-2/C-3 all merged — the union verification, the pre-flight overflow target, the straggler gate), the mirror fast-forwarded to the same tree (full worker-code parity for the first time), full secret parity both buckets (LAB_PAT + the key pool + KEY_2 + or-074), live vars `WORKER_OVERFLOW_AT=1` + `WORKER_REPO_2=agentrunners/fsm-lab-workers`, `EPOCH_MODE=mock` (the cheap drill mode), chain halted+quiescent (the X23 close). The reset fired via the ops issue **#1** (the `OPS_ISSUE` var is ABSENT on main → the default '1' is the live value — the first attempt fired on #3 (the duty-alert issue) and the console correctly went CONSOLE-SILENT: the m-8 fail-closed gate works, no queue burn).
+
+**The arc (journal c-1789971997876, all timestamps live):**
+1. `06:26:37` — CONTROL reset consumed → the multi-task epoch births (8 tasks) → first multi-assign tick (T-101 + T-102/T-107/T-108).
+2. `06:28:21` — **DISPATCH-OVERFLOW-PREFLIGHT task=T-103 in-flight(3>=1) -> agentrunners/fsm-lab-workers** — the C-2 fix's pre-flight decision fired LIVE on its first real multi-assign tick: exactly ONE dispatch attempt, straight to bucket 2, the same-repo attempt skipped. (Conductor run 35568632604.)
+3. `06:28:55` — **DISPATCH-FAILED task=T-103 HTTP=404** — THE CRACK: the dispatch lane's PAT (`LAB_PAT` = the minimal-scope runtime identity zikomolapoutl) has only READ on the mirror (an outside-collaborator carryover from the X25 era) — repository_dispatch needs write. The org-admin PAT dispatches fine (probed 204) — the lane's runtime identity was the gap. The 20-e era probe had used the orchestrator's PAT from the sandbox, so this seam was NEVER live-tested until now — exactly what the drill existed to catch.
+4. **The live fix (06:31-06:34Z):** org-admin grants zikomolapoutl `write` on the mirror (invitation 333941981) → the invitee identity ACCEPTS it via its own PAT (`PATCH /user/repository_invitations/333941981` → 204) → the runtime PAT's dispatch probe returns **204**. The lane is open.
+5. `06:39:11` — the law-4 union verification (C-1) catches the 404'd dispatches exactly as designed: the unverified tasks flip to `infra-retry` (net-zero — the work ladder never burned) and re-assign.
+6. `06:39:14-49` — **THE OVERFLOW MOMENT**: the mirror's worker.yml runs `task-T-102 · flaky · a1`, `task-T-104 · succeed · a1`, `task-T-107 · dup · a1`, `task-T-102 · flaky · a2`, `task-T-108 · slow · a1` — real X26 tasks dispatched via the conductor's PAT lane, run on bucket 2's 20-parallel capacity.
+7. `06:39:45` — **THE ROUND-TRIP**: T-104 + T-107 REPORT `done` on MAIN's fsm-state — the mirror workers checked out TARGET_REPO, ran the turn, and CAS-appended their reports to the MAIN chain (T-107's dup-report absorbed by the dedup ring: `REJECTED duplicate`). The union verification saw the mirror runs — ZERO dispatch-unverified flips on bucket-2 tasks (C-1's exact failure class, dead).
+8. The epoch continues draining (6 done / 2 assigned at seq 42, M1→M2 rollover in flight) — the full halt tally lands in the next state read.
+
+**What X26 proves (the last unproven seam, closed):**
+- The overflow lane END-TO-END: pre-flight decision → PAT cross-org dispatch → mirror worker seat → TARGET_REPO checkout → report round-trip to main → union verification → terminal states. The capacity multiplier is REAL.
+- The C-2 fix live: exactly one dispatch per task (no double-dispatch on the both-buckets shape).
+- The C-1 fix live: bucket-2-only runs are SEEN by the law-4 scan (no false infra-churn).
+- The failure machinery live: a genuinely-broken dispatch lane self-heals through net-zero infra retry + law-4 verification + re-dispatch — zero work lost, zero ladder burn, the chain never stopped.
+- The m-8 fail-closed console gate live: a command on the wrong issue is silently ignored (no queue burn, no false epoch).
+
+**The residual recorded honestly:** the write-invitation acceptance was a one-time operator action; the LAB_PAT identity now holds write on both buckets (its blast radius grew — noted for the PAT-scope-audit duty). The mirror's OWN conductor/consumer duties woke on my two probe dispatches and quiesced harmlessly (its own fsm-state is a halted chain — no cross-talk).
