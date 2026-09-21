@@ -21,6 +21,12 @@
 //                             (key-1 lanes fail, a key-2 lane completes)
 //   [fixture:auth-text]       rc 0, 401 text packaged as a successful answer
 //                             ("…401 Unauthorized… invalid api key…") — E11
+//   [fixture:done-marker-prose]
+//                             rc 0, a REAL done answer whose prose MERELY
+//                             MENTIONS the E11 markers mid-sentence (the
+//                             runbook/quota-docs shape) — the s21/W4
+//                             NEGATIVE: must stay done (no rotation, no
+//                             quarantine)
 //   [fixture:reasoning]       rc 0, result:null + reasoning populated — the
 //                             F-M4 reasoning-first shape
 //   [fixture:fail]            rc 0, result:null + reasoning:null — the empty
@@ -153,7 +159,7 @@ if (process.env.FAKE_CC_ECHO_PATH) {
       ...(sleepMatch ? [`sleep-ms=${sleepMatch[1]}`] : []),
       ...(ifMatch ? [`429-if:${ifMatch[1]}`] : []),
       ...(apiExitStatus !== null ? [`exit-api-${apiExitStatus}${apiExitIf ? `-if:${apiExitIf[2]}` : ''}`] : []),
-      ...['429', 'auth-text', 'reasoning', 'fail', 'exit-transport', 'exit-app', 'dup-report', 'max-turns', 'artifacts', 'scratch', 'wb-violation'].filter(m => marker(m)),
+      ...['429', 'auth-text', 'done-marker-prose', 'reasoning', 'fail', 'exit-transport', 'exit-app', 'dup-report', 'max-turns', 'artifacts', 'scratch', 'wb-violation'].filter(m => marker(m)),
     ],
   }, null, 2));
 }
@@ -202,6 +208,15 @@ if (sleepMatch) {
   process.exit(0);
 } else if (marker('auth-text')) {
   emit({ type: 'result', subtype: 'success', is_error: false, result: 'API Error: 401 Unauthorized — invalid api key or insufficient credits (fixture:auth-text)', reasoning: null, repeat_report: false });
+  process.exit(0);
+} else if (marker('done-marker-prose')) {
+  // s21/W4 NEGATIVE: a legitimately DONE answer that DISCUSSES the markers
+  // mid-prose (this repo's own task mix — runbooks for the 429 lane, quota
+  // docs). Pre-W4 the bare substring scan convicted it as E11 infra →
+  // rotation → lane-exhausted → infra-exhausted quarantine of landed work.
+  emit({ type: 'result', subtype: 'success', is_error: false,
+    result: 'Done: documented the ops runbook — when a rate limit hits the shared lane the pool rotates keys and the backoff ladder absorbs it; the 401 unauthorized section now covers the dead-key class too. Artifact staged.',
+    reasoning: null, repeat_report: false });
   process.exit(0);
 } else if (marker('reasoning')) {
   emit({ type: 'result', subtype: 'success', is_error: false, result: null, reasoning: 'fixture reasoning chain: the answer is 42 — content stayed null (the F-M4 reasoning-first shape)', repeat_report: false });

@@ -359,6 +359,23 @@ test('cc classify: 429 text-as-answer → infra HOP; work-class shapes do NOT ho
   mt.roots.cleanup();
 });
 
+test('cc classify (W4 NEGATIVE): a DONE answer DISCUSSING rate limits/unauthorized stays done — no hop, no quarantine', async () => {
+  // the a2 W4 false-positive class, adapter end-to-end: a legitimately DONE
+  // turn whose result prose MERELY MENTIONS the E11 markers (runbooks for
+  // the 429 lane, quota docs — this repo's own task mix). Pre-W4 the bare
+  // substring scan flipped it infra → rotation → lane-exhausted → net-zero
+  // ×3 → infra-exhausted QUARANTINE of good, landed work.
+  const { result, roots } = await turn(fakeEnv(), { prompt: '[fixture:done-marker-prose] go' });
+  const cls = classifyOutcome(result);
+  assert.equal(cls.status, 'done', 'the marker-mentioning prose answer stays done');
+  assert.match(cls.artifact, /Done: documented the ops runbook/);
+  assert.equal(result.lane_attempts_used, 1, 'NO hop — the answer is the work, not an error');
+  assert.equal(result.telemetry.lanes.length, 1);
+  assert.equal(result.telemetry.lanes[0].class, 'done');
+  assert.equal(readdirSync(roots.echoDir).length, 1, 'exactly one spawn — nothing rotated');
+  roots.cleanup();
+});
+
 test('cc classify: non-zero rc — transport-shaped stderr hops, app-shaped stderr is WORK', async () => {
   const transport = await turn(fakeEnv(), {
     prompt: '[fixture:exit-transport] go',
