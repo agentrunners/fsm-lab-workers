@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
   ccExitJson, ccApiErrorStatus, ccChildEnv, ccNextLaneIndex, CC_ENV_DENYLIST,
@@ -167,6 +168,21 @@ test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output
   assert.equal(ccCliVersion({ CC_VERSION: ' 2.1.273 ' }), '2.1.273', 'trimmed env pin');
   assert.equal(ccArgv(envelope({ budget: { max_turns: 12, wall_ms: 60_000, lane_attempts: 3 } }), { max_turns: 12 }, { CC_VERSION: '9.9.999' })[1],
     '@anthropic-ai/claude-code@9.9.999', 'CC_VERSION overrides the pin');
+});
+
+test('cc W2: worker.yml\'s INSTALL default == the adapter pin — the install lane and the spawn lane agree (never latest)', () => {
+  // s21/W2 (a2): the install step defaulted to @latest while the spawn argv
+  // pinned 2.1.273 — an unset vars.CC_VERSION installed a version the spawn
+  // lane would not use, so npx paid a fresh package download INSIDE the wall
+  // budget (the ~7-min m-9 tax the install step exists to avoid). The yml
+  // default and ccCliVersion() must move together — THIS pin is the tie.
+  const yml = readFileSync(fileURLToPath(new URL('../.github/workflows/worker.yml', import.meta.url)), 'utf8');
+  const m = /CC_PIN="\$\{CC_VERSION:-(.+?)\}"/.exec(yml);
+  assert.ok(m, 'the install step defines CC_PIN with a ${CC_VERSION:-<literal>} default');
+  assert.equal(m[1], ccCliVersion({}),
+    `the install default (${m[1]}) must equal the adapter's ccCliVersion pin (${ccCliVersion({})}) — drift = the npx-download-inside-the-wall class`);
+  assert.ok(yml.includes('npm install -g "@anthropic-ai/claude-code@${CC_PIN}"'), 'the install consumes the pin');
+  assert.ok(!/\$\{CC_VERSION:-latest\}/.test(yml), 'the stale latest default is dead');
 });
 
 test('cc lane env: the FULL F-M8 contract shape (pure)', () => {
