@@ -1,0 +1,147 @@
+{
+  "drill": "x22",
+  "seed": 7,
+  "timeScale": 0.01,
+  "keep": false,
+  "started": "2026-09-21T07:24:49.293Z",
+  "wallMs": 189373,
+  "phases": [
+    {
+      "name": "BOOT",
+      "ok": true,
+      "ms": 15,
+      "asserts": 3,
+      "fails": 0
+    },
+    {
+      "name": "INTAKE",
+      "ok": false,
+      "ms": 3176,
+      "asserts": 7,
+      "fails": 3
+    },
+    {
+      "name": "EPOCH",
+      "ok": false,
+      "ms": 60145,
+      "asserts": 1,
+      "fails": 1,
+      "error": "until: TIMEOUT after 60000ms waiting for rollover + assign"
+    },
+    {
+      "name": "WORK",
+      "ok": false,
+      "ms": 337,
+      "asserts": 9,
+      "fails": 2
+    },
+    {
+      "name": "DRAIN-VERIFY",
+      "ok": false,
+      "ms": 120116,
+      "asserts": 1,
+      "fails": 1,
+      "error": "until: TIMEOUT after 120000ms waiting for drain -> done -> halt"
+    },
+    {
+      "name": "HALT-QUIESCE",
+      "ok": false,
+      "ms": 5531,
+      "asserts": 7,
+      "fails": 1
+    }
+  ],
+  "metrics": {
+    "maxConcurrentRuns": 2,
+    "repoQueueMaxDepth": 0,
+    "conductorStarvationEvents": 0,
+    "runsStarted": 7,
+    "runsCancelled": 0,
+    "runsQueuedBehindCap": 0,
+    "capDeferrals": 0,
+    "perRunLatencies": [
+      {
+        "run": 9000001,
+        "workflow": "intake",
+        "repo": "local/fsm-lab",
+        "name": "intake · #3",
+        "queuedMs": 1335,
+        "runMs": 162,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000002,
+        "workflow": "intake",
+        "repo": "local/fsm-lab",
+        "name": "intake · #2",
+        "queuedMs": 1387,
+        "runMs": 193,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000003,
+        "workflow": "conductor",
+        "repo": "local/fsm-lab",
+        "name": "intake · conductor",
+        "queuedMs": 1969,
+        "runMs": 25198,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000004,
+        "workflow": "worker",
+        "repo": "local/fsm-lab",
+        "name": "task-DRILL-X22 · real · a1",
+        "queuedMs": 1830,
+        "runMs": 479,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000005,
+        "workflow": "conductor",
+        "repo": "local/fsm-lab",
+        "name": "chain · conductor",
+        "queuedMs": 1688,
+        "runMs": 342,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000006,
+        "workflow": "conductor",
+        "repo": "local/fsm-lab",
+        "name": "schedule-backstop · conductor",
+        "queuedMs": 1584,
+        "runMs": 124,
+        "conclusion": "success",
+        "exitCode": 0
+      },
+      {
+        "run": 9000007,
+        "workflow": "watchdog",
+        "repo": "local/fsm-lab",
+        "name": "watchdog · scan",
+        "queuedMs": 1659,
+        "runMs": 122,
+        "conclusion": "success",
+        "exitCode": 0
+      }
+    ]
+  },
+  "notModeled": [
+    "PAT-comment trigger law (live GHA wakes workflows only on real-user-PAT-authored comments; the scheduler delivers every accepted dispatch)",
+    "secondary rate limits (the 403/429+Retry-After ladder shapes stay unit/sim-pinned; the stand-in always 204s dispatches)",
+    "runner cold-start, minute quotas, and cross-repo contention beyond the modeled repo-wide ParallelCap(5)",
+    "real authn/authz (the stand-in trusts its minted tokens; the door's permission classes are scenario data, not GitHub's)",
+    "the paid LLM lane (the cc lane runs the real adapter + bridge + spawn boundary against the deterministic fake CLI; no OpenRouter bytes move)",
+    "law-4's 360s pre-window is backdated by a drill fixture commit in the overflow scenario (a 6-minute real wait is priced out of CI; the scan path, the union fetch and the key match are fully real)",
+    "the budget-pause post-resume tail (round-3 infra exhaustion -> degraded halt or backstop re-pause) is timing-dependent across ticks; the drill's gates end at the C-3 characterization — that tail is pinned deterministically by sim4/test-budget",
+    "pagination beyond law-20's single newest-20 page (no Link headers; the adapters never walk them either — that IS the characterized bug)",
+    "issue/PR webhooks, check-runs, artifacts API, merge/close flows (the pull stand-in opens and stamps; nobody merges)"
+  ],
+  "verdict": "FAIL"
+}
