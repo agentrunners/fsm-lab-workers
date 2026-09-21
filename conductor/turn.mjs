@@ -35,7 +35,7 @@ import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
-  dispatchLadder, workerOverflowDecision, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
+  dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
   chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
@@ -48,8 +48,10 @@ const PAT = process.env.LAB_PAT;
 // variable, e.g. agentrunners/fsm-lab-workers; unset/empty = NO lane —
 // today's dispatch path bit-for-bit) + WORKER_OVERFLOW_AT (repo variable;
 // unset/bad = the core's default 6). The lane engages per-dispatch in the
-// action loop below (workerOverflowDecision); the PAT is REQUIRED — a
-// cross-repo dispatch cannot ride the ephemeral job token (X1a).
+// action loop below — T46/s21 C-2: PRE-FLIGHT (overflowPreFlight, the
+// occupancy arm, before any wire attempt) + the saturated-ladder fallback
+// (workerOverflowDecision, after a FAILED main attempt); the PAT is
+// REQUIRED — a cross-repo dispatch cannot ride the ephemeral job token (X1a).
 const WORKER_REPO_2 = process.env.WORKER_REPO_2 || null;
 const WORKER_OVERFLOW_AT = parseInt(process.env.WORKER_OVERFLOW_AT || '', 10) || WORKER_OVERFLOW_AT_DEFAULT;
 // X1a finding applied: same-repo dispatches ride the EPHEMERAL job token
@@ -404,24 +406,36 @@ async function main() {
         briefMd,
         { nowMs: Date.now(), mode: epochMode },
       );
-      let d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
-      // T46/ar (20-e): the overflow lane — when the main-repo ladder
-      // saturates (403-with-Retry-After exhaustion) or the main bucket holds
-      // >= WORKER_OVERFLOW_AT in-flight leases, THIS dispatch re-targets
-      // WORKER_REPO_2 on the PAT lane. The ENVELOPE is unchanged: the second
-      // bucket's workers read client_payload identically — their worker.yml
-      // TARGET_REPO checks out the MAIN repo and the report CAS-append
-      // follows the CHECKOUT (worker/turn.mjs's Store rides the checkout's
-      // origin), so the report lands on the MAIN fsm-state. Unset
-      // WORKER_REPO_2 -> workerOverflowDecision returns false for any input
-      // (byte-identical today path).
-      const ov = workerOverflowDecision({
-        d, inFlightNow: priorInFlight + dispatchIndex - 1,
+      // T46/s21 C-2 (audit a1, MAJOR — the double-dispatch): the target is
+      // decided BEFORE any wire attempt. The occupancy arm (in-flight >=
+      // WORKER_OVERFLOW_AT) is PRE-FLIGHT: this dispatch goes STRAIGHT to
+      // WORKER_REPO_2 and the same-repo attempt is SKIPPED — the old shape
+      // ran the main ladder first (204) and then re-sent the SAME payload to
+      // the second bucket: two workers grinding one task, 2x paid-key burn,
+      // the second report an orphan. The saturated-ladder fallback (a FAILED
+      // main attempt in the 403/429-with-Retry-After class) stays post-
+      // attempt — that is the true bucket-pressure shape. The ENVELOPE is
+      // unchanged either way: the second bucket's workers read client_payload
+      // identically — their worker.yml TARGET_REPO checks out the MAIN repo
+      // and the report CAS-append follows the CHECKOUT (worker/turn.mjs's
+      // Store rides the checkout's origin), so the report lands on the MAIN
+      // fsm-state. Unset WORKER_REPO_2 -> both decisions return false for
+      // any input (byte-identical today path).
+      const pre = overflowPreFlight({
+        inFlightNow: priorInFlight + dispatchIndex - 1,
         repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,
       });
-      if (ov.overflow) {
-        console.log(`DISPATCH-OVERFLOW task=${a.task} ${ov.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; envelope unchanged — the bucket-2 worker checks out TARGET_REPO and reports to the MAIN fsm-state)`);
+      let d;
+      if (pre.overflow) {
+        console.log(`DISPATCH-OVERFLOW-PREFLIGHT task=${a.task} ${pre.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; the same-repo attempt is SKIPPED — exactly one dispatch, one bucket; envelope unchanged — the bucket-2 worker checks out TARGET_REPO and reports to the MAIN fsm-state)`);
         d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });
+      } else {
+        d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
+        const ov = workerOverflowDecision({ d, repo2: WORKER_REPO_2, pat: PAT });
+        if (ov.overflow) {
+          console.log(`DISPATCH-OVERFLOW task=${a.task} ${ov.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; the main attempt FAILED saturated — envelope unchanged, the bucket-2 worker reports to the MAIN fsm-state)`);
+          d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });
+        }
       }
       if (!d.ok) {
         // X21 lesson: 4 dispatchFailures with ZERO logged detail (the 422

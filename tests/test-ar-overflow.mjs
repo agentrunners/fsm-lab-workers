@@ -31,7 +31,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
-  dispatchLadder, workerOverflowDecision, priorInFlightCount,
+  dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount,
   WORKER_OVERFLOW_AT_DEFAULT,
   verifyScanRepoList, seenKeysFromRuns, dispatchVerificationEvents, VERIFY_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
@@ -124,51 +124,71 @@ test('ar ladder ROUTING: {repo, token} re-target the endpoint — the second rep
 });
 
 // ---------------------------------------------------------------------------
-// 2. the overflow decision + the occupancy base (PURE)
+// 2. the overflow decisions + the occupancy base (PURE) — T46/s21 C-2: the
+// occupancy arm is PRE-FLIGHT (overflowPreFlight, before any wire attempt);
+// workerOverflowDecision keeps ONLY the saturated-ladder fallback (after a
+// FAILED main attempt). A successful main attempt NEVER re-targets.
 // ---------------------------------------------------------------------------
 
-test('ar decision: unset WORKER_REPO_2 -> NO overflow for ANY input (the byte-identical contract)', () => {
+test('ar decision: unset WORKER_REPO_2 -> NO overflow for ANY input (the byte-identical contract) — BOTH arms', () => {
   for (const d of [{ ok: true }, { ok: false, status: 403, saturated: true }, { ok: false, status: 403, fatal: true }, null]) {
-    for (const inFlightNow of [0, 5, 6, 100]) {
-      assert.deepEqual(workerOverflowDecision({ d, inFlightNow, repo2: null, pat: 'PAT' }), { overflow: false }, `repo2 unset, d=${JSON.stringify(d)} inFlight=${inFlightNow}`);
-    }
+    assert.deepEqual(workerOverflowDecision({ d, repo2: null, pat: 'PAT' }), { overflow: false }, `repo2 unset, d=${JSON.stringify(d)}`);
+  }
+  for (const inFlightNow of [0, 5, 6, 100]) {
+    assert.deepEqual(overflowPreFlight({ inFlightNow, repo2: null, pat: 'PAT' }), { overflow: false }, `repo2 unset, inFlight=${inFlightNow}`);
   }
   // no PAT -> no lane either (cross-repo needs the PAT; a null PAT must not
-  // produce a doomed dispatch)
-  assert.deepEqual(workerOverflowDecision({ d: { ok: false, status: 403, saturated: true }, inFlightNow: 99, repo2: 'agentrunners/fsm-lab-workers', pat: null }), { overflow: false });
+  // produce a doomed dispatch) — both arms
+  assert.deepEqual(workerOverflowDecision({ d: { ok: false, status: 403, saturated: true }, repo2: 'agentrunners/fsm-lab-workers', pat: null }), { overflow: false });
+  assert.deepEqual(overflowPreFlight({ inFlightNow: 99, repo2: 'agentrunners/fsm-lab-workers', pat: null }), { overflow: false });
 });
 
-test('ar decision: saturation signal 1 — the ladder\'s 403-with-Retry-After exhaustion re-targets', () => {
-  const r = workerOverflowDecision({ d: { ok: false, status: 403, saturated: true }, inFlightNow: 0, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' });
+test('ar decision (the C-2 fallback arm): the ladder\'s 403-with-Retry-After exhaustion re-targets', () => {
+  const r = workerOverflowDecision({ d: { ok: false, status: 403, saturated: true }, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' });
   assert.deepEqual(r, { overflow: true, reason: 'ladder-saturated(HTTP 403)', to: 'agentrunners/fsm-lab-workers' });
 });
 
 test('ar decision: a bare-403 fatal (permission) does NOT overflow; a 5xx exhaustion does not either', () => {
-  assert.equal(workerOverflowDecision({ d: { ok: false, status: 403, fatal: true }, inFlightNow: 0, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, false);
-  assert.equal(workerOverflowDecision({ d: { ok: false, status: 502 }, inFlightNow: 0, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, false);
+  assert.equal(workerOverflowDecision({ d: { ok: false, status: 403, fatal: true }, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, false);
+  assert.equal(workerOverflowDecision({ d: { ok: false, status: 502 }, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, false);
 });
 
-test('ar decision: saturation signal 2 — in-flight >= 6 (the DEFAULT) re-targets; 5 does not; the boundary is >=, counting leases OUTSIDE the current dispatch', () => {
-  const base = { repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT', d: { ok: true } };
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 5 }).overflow, false, '5 in-flight: the main bucket still has room');
-  const at6 = workerOverflowDecision({ ...base, inFlightNow: 6 });
+test('C-2 (the double-dispatch guard): a SUCCESSFUL main attempt NEVER re-targets — workerOverflowDecision is dead to d.ok for ANY lane state', () => {
+  // the OLD bug shape: the occupancy arm fired after main had already 204'd,
+  // re-sending the same payload/lease to the second bucket. The fallback arm
+  // now consults ONLY the failed-saturated shape — a revert to any
+  // ok:true-sensitive arm fails here.
+  for (const d of [{ ok: true }, { ok: true, status: 204 }, null]) {
+    assert.deepEqual(workerOverflowDecision({ d, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }), { overflow: false }, `d=${JSON.stringify(d)}: no second dispatch after a successful one`);
+  }
+});
+
+test('C-2 pre-flight (the occupancy arm): in-flight >= 6 (the DEFAULT) re-targets; 5 does not; the boundary is >=, counting leases OUTSIDE the current dispatch', () => {
+  const base = { repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' };
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 5 }).overflow, false, '5 in-flight: the main bucket still has room');
+  const at6 = overflowPreFlight({ ...base, inFlightNow: 6 });
   assert.equal(at6.overflow, true);
   assert.deepEqual(at6, { overflow: true, reason: 'in-flight(6>=6)', to: 'agentrunners/fsm-lab-workers' });
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 7 }).overflow, true);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 7 }).overflow, true);
   // the default IS the exported constant
   assert.equal(WORKER_OVERFLOW_AT_DEFAULT, 6);
   // a custom threshold (the WORKER_OVERFLOW_AT repo variable) moves the boundary
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 3, overflowAt: 3 }).overflow, true);
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 2, overflowAt: 3 }).overflow, false);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 3, overflowAt: 3 }).overflow, true);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 2, overflowAt: 3 }).overflow, false);
   // a degenerate threshold falls back to the default (never 0/NaN -> always-overflow)
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 5, overflowAt: 0 }).overflow, false, 'overflowAt=0 -> the default 6 applies');
-  assert.equal(workerOverflowDecision({ ...base, inFlightNow: 5, overflowAt: NaN }).overflow, false, 'NaN -> the default 6 applies');
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 5, overflowAt: 0 }).overflow, false, 'overflowAt=0 -> the default 6 applies');
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 5, overflowAt: NaN }).overflow, false, 'NaN -> the default 6 applies');
+  // the LIVE var shape: WORKER_OVERFLOW_AT=1 -> the SECOND dispatch of any
+  // multi-assign tick goes pre-flight to repo2 (inFlight 1 >= 1)
+  assert.deepEqual(overflowPreFlight({ ...base, inFlightNow: 1, overflowAt: 1 }), { overflow: true, reason: 'in-flight(1>=1)', to: 'agentrunners/fsm-lab-workers' });
 });
 
-test('ar decision: saturation signal 1 WINS over the occupancy count (both pinned signals re-target; ladder first)', () => {
-  const r = workerOverflowDecision({ d: { ok: false, status: 429, saturated: true }, inFlightNow: 12, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' });
-  assert.equal(r.overflow, true);
-  assert.equal(r.reason, 'ladder-saturated(HTTP 429)');
+test('C-2 sequencing: the two arms are SEPARATE decisions — the occupancy arm fires with NO wire attempt yet; the ladder arm needs a FAILED saturated attempt', () => {
+  // pre-flight knows nothing about any ladder result (it runs first)
+  assert.equal(overflowPreFlight({ inFlightNow: 12, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, true);
+  // the fallback knows nothing about occupancy (the pre-flight already owned it)
+  assert.equal(workerOverflowDecision({ d: { ok: false, status: 429, saturated: true }, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).overflow, true);
+  assert.equal(workerOverflowDecision({ d: { ok: false, status: 429, saturated: true }, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' }).reason, 'ladder-saturated(HTTP 429)');
 });
 
 test('ar occupancy: priorInFlightCount = committed ACTIVE leases minus THIS tick\'s dispatch actions', () => {
@@ -195,10 +215,49 @@ test('ar occupancy: priorInFlightCount = committed ACTIVE leases minus THIS tick
 });
 
 // ---------------------------------------------------------------------------
-// 3. the composed routing fixture — what turn.mjs's dispatch site does:
-// same-repo ladder -> decision -> (overflow) second-repo ladder. The wiring
-// between these three calls is source-pinned below (section 4).
+// 3. the composed routing fixtures — what turn.mjs's dispatch site does
+// (T46/s21 C-2): PRE-FLIGHT decision -> (overflow) second-repo ladder,
+// ELSE same-repo ladder -> fallback decision -> (saturated) second-repo
+// ladder. The wiring between these calls is source-pinned below (section 4).
 // ---------------------------------------------------------------------------
+
+// the adapter's post-C-2 dispatch sequence, verbatim (the fixture's mirror
+// of turn.mjs's action loop; repo2/pat/overflowAt lane-shaped)
+async function adapterDispatch({ payload, api, repo2 = null, pat = 'PAT-ORG', overflowAt = 6, inFlightNow = 0, tries = 5 }) {
+  const pre = overflowPreFlight({ inFlightNow, repo2, pat, overflowAt });
+  let d;
+  if (pre.overflow) {
+    d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: pre.to, token: pat, tries, sleep: noSleep });
+  } else {
+    d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: 'claudecode-headless/fsm-lab', tries, sleep: noSleep });
+    const ov = workerOverflowDecision({ d, repo2, pat });
+    if (ov.overflow) d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: ov.to, token: pat, tries, sleep: noSleep });
+  }
+  return d;
+}
+
+test('C-2 COMPOSED (the missing behavioral pin): in-flight >= WORKER_OVERFLOW_AT -> EXACTLY ONE dispatch, straight to repo2 — the main repo is NEVER attempted (no duplicate)', async () => {
+  const payload = { task: 'A7', behavior: 'succeed', attempt: 1, lease: 'l-dd', expires: '2026-09-20T12:00:00.000Z' };
+  const calls = [];
+  const api = (path, method, body, token) => {
+    calls.push({ path, method, body, token });
+    return Promise.resolve({ status: 204, data: null, headers: {} });   // EVERY endpoint accepts
+  };
+  // the live WORKER_OVERFLOW_AT=1 shape: the 2nd dispatch of a multi-assign tick
+  const d = await adapterDispatch({ payload, api, repo2: 'agentrunners/fsm-lab-workers', overflowAt: 1, inFlightNow: 1 });
+  assert.equal(d.ok, true);
+  assert.equal(calls.length, 1, 'EXACTLY ONE wire attempt — the pre-flight owned the target (the old shape was 2: main 204 + the repo2 duplicate)');
+  assert.equal(calls[0].path, '/repos/agentrunners/fsm-lab-workers/dispatches', 'the one dispatch went STRAIGHT to the second bucket');
+  assert.equal(calls[0].token, 'PAT-ORG', 'the cross-repo call rides the PAT');
+  assert.deepEqual(calls[0].body.client_payload, payload, 'the envelope is unchanged (byte-equal client_payload)');
+  // and below the threshold: the main-only path (one dispatch, job token)
+  calls.length = 0;
+  const d2 = await adapterDispatch({ payload, api, repo2: 'agentrunners/fsm-lab-workers', overflowAt: 1, inFlightNow: 0 });
+  assert.equal(d2.ok, true);
+  assert.equal(calls.length, 1, 'below the threshold: exactly one dispatch too');
+  assert.equal(calls[0].path, '/repos/claudecode-headless/fsm-lab/dispatches', 'the main bucket stays the PRIMARY');
+  assert.equal(calls[0].token, undefined, 'the same-repo dispatch rides the job token (X1a)');
+});
 
 test('ar COMPOSED: saturation on the main repo -> the SAME envelope re-dispatched to the second repo -> ok (the X25 lane, PAT-routed)', async () => {
   const payload = { task: 'A9', behavior: 'infra-flaky', attempt: 2, lease: 'l-zz', expires: '2026-09-20T12:00:00.000Z' };
@@ -211,17 +270,14 @@ test('ar COMPOSED: saturation on the main repo -> the SAME envelope re-dispatche
       : { status: 403, data: { message: 'secondary rate limit' }, headers: RA };
     return Promise.resolve(r);
   };
-  // the adapter's exact sequence
-  let d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: 'claudecode-headless/fsm-lab', tries: 2, sleep: noSleep });
-  const ov = workerOverflowDecision({ d, inFlightNow: 1, repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT-ORG' });
-  assert.equal(ov.overflow, true, 'saturated ladder -> overflow decision fires');
-  if (ov.overflow) d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: ov.to, token: 'PAT-ORG', sleep: noSleep });
+  // the adapter's exact sequence (post-C-2: pre-flight below threshold, then the saturated fallback)
+  const d = await adapterDispatch({ payload, api, repo2: 'agentrunners/fsm-lab-workers', inFlightNow: 1, tries: 2 });
   assert.equal(d.ok, true, 'the second bucket accepted the dispatch');
   // the calls: 2 on main (the ladder's tries) + 1 on the second repo
   const main = calls.filter(c => c.path === '/repos/claudecode-headless/fsm-lab/dispatches');
   const second = calls.filter(c => c.path === '/repos/agentrunners/fsm-lab-workers/dispatches');
-  assert.equal(main.length, 2);
-  assert.equal(second.length, 1);
+  assert.equal(main.length, 2, 'the main ladder exhausted its tries (saturated)');
+  assert.equal(second.length, 1, 'the fallback re-target fired ONCE');
   assert.equal(second[0].token, 'PAT-ORG', 'the cross-repo call rides the PAT');
   assert.deepEqual(second[0].body.client_payload, payload, 'the SAME envelope reached the second bucket');
 });
@@ -233,10 +289,7 @@ test('ar COMPOSED: unset WORKER_REPO_2 + saturation -> exactly ONE ladder, no se
     calls.push({ path, method, body, token });
     return Promise.resolve({ status: 403, data: { message: 'secondary rate limit' }, headers: RA });
   };
-  let d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: 'claudecode-headless/fsm-lab', tries: 2, sleep: noSleep });
-  const ov = workerOverflowDecision({ d, inFlightNow: 99, repo2: null, pat: 'PAT-ORG' });
-  assert.equal(ov.overflow, false);
-  if (ov.overflow) d = await dispatchLadder({ eventType: 'fsm-task', clientPayload: payload, api, repo: ov.to, token: 'PAT-ORG', sleep: noSleep });
+  const d = await adapterDispatch({ payload, api, repo2: null, inFlightNow: 99, tries: 2 });
   assert.equal(d.ok, false, 'the failure surfaces exactly as today (dispatchFailures lane)');
   assert.equal(calls.length, 2, 'only the same-repo ladder ran');
   assert.ok(calls.every(c => c.path === '/repos/claudecode-headless/fsm-lab/dispatches'));
@@ -248,7 +301,7 @@ test('ar COMPOSED: unset WORKER_REPO_2 + saturation -> exactly ONE ladder, no se
 // self-executing I/O script, not importable in a test) + the YAML pins
 // ---------------------------------------------------------------------------
 
-test('ar wiring (source-pinned): turn.mjs parses WORKER_REPO_2/WORKER_OVERFLOW_AT, wires the decision + the second-repo re-dispatch', () => {
+test('ar wiring (source-pinned): turn.mjs parses WORKER_REPO_2/WORKER_OVERFLOW_AT, wires the PRE-FLIGHT + fallback decisions + the second-repo re-dispatch', () => {
   const src = readFileSync(new URL('../conductor/turn.mjs', import.meta.url), 'utf8');
   assert.ok(src.includes("const WORKER_REPO_2 = process.env.WORKER_REPO_2 || null;"), 'WORKER_REPO_2 env parse (unset -> null -> no lane)');
   assert.ok(src.includes('WORKER_OVERFLOW_AT_DEFAULT,'), 'the overflow threshold default comes from the core');
@@ -258,11 +311,16 @@ test('ar wiring (source-pinned): turn.mjs parses WORKER_REPO_2/WORKER_OVERFLOW_A
   assert.ok(!/for \(let i = 0; i < tries; i\+\+\)/.test(src), 'the ladder loop lives in the core now (one source)');
   // the occupancy base
   assert.ok(src.includes('const priorInFlight = priorInFlightCount(state, actionList);'), 'the occupancy base is computed from the committed state + this tick\'s actions');
-  // the decision + the re-dispatch, verbatim shapes
+  // C-2: the PRE-FLIGHT decision owns the occupancy arm, BEFORE any wire attempt
+  assert.ok(src.includes('const pre = overflowPreFlight({'), 'the pre-flight decision is wired');
   assert.ok(src.includes('inFlightNow: priorInFlight + dispatchIndex - 1'), 'the in-flight count excludes the CURRENT dispatch (prior + already-dispatched)');
-  assert.ok(src.includes("repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,"), 'the decision consumes the env-parsed lane config');
+  assert.ok(src.includes("repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,"), 'the pre-flight consumes the env-parsed lane config');
+  assert.ok(src.includes('if (pre.overflow) {'), 'the pre-flight verdict branches the dispatch target');
+  // the saturated fallback: AFTER the (failed) main attempt, no occupancy input
+  assert.ok(src.includes('const ov = workerOverflowDecision({ d, repo2: WORKER_REPO_2, pat: PAT });'), 'the fallback decision consumes the ladder result only (no occupancy arm — the double-dispatch is dead)');
   assert.ok(src.includes("d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });"), 'the SAME payload re-targets the second repo on the PAT');
-  assert.ok(src.includes('DISPATCH-OVERFLOW'), 'the overflow is LOUD (a log line per re-target)');
+  assert.ok(src.includes('DISPATCH-OVERFLOW-PREFLIGHT'), 'the pre-flight overflow is LOUD (a log line per re-target)');
+  assert.ok(src.includes('DISPATCH-OVERFLOW'), 'the fallback overflow is LOUD too');
 });
 
 test('ar wiring (source-pinned): the worker\'s report enqueue rides the CHECKOUT cwd (the routing property TARGET_REPO redirects)', () => {
