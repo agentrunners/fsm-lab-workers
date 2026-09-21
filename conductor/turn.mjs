@@ -34,8 +34,8 @@ import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
-  verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
-  dispatchLadder, workerOverflowDecision, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
+  verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
+  dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
   chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
@@ -49,8 +49,10 @@ const PAT = process.env.LAB_PAT;
 // variable, e.g. agentrunners/fsm-lab-workers; unset/empty = NO lane —
 // today's dispatch path bit-for-bit) + WORKER_OVERFLOW_AT (repo variable;
 // unset/bad = the core's default 6). The lane engages per-dispatch in the
-// action loop below (workerOverflowDecision); the PAT is REQUIRED — a
-// cross-repo dispatch cannot ride the ephemeral job token (X1a).
+// action loop below — T46/s21 C-2: PRE-FLIGHT (overflowPreFlight, the
+// occupancy arm, before any wire attempt) + the saturated-ladder fallback
+// (workerOverflowDecision, after a FAILED main attempt); the PAT is
+// REQUIRED — a cross-repo dispatch cannot ride the ephemeral job token (X1a).
 const WORKER_REPO_2 = process.env.WORKER_REPO_2 || null;
 const WORKER_OVERFLOW_AT = parseInt(process.env.WORKER_OVERFLOW_AT || '', 10) || WORKER_OVERFLOW_AT_DEFAULT;
 // X1a finding applied: same-repo dispatches ride the EPHEMERAL job token
@@ -254,6 +256,16 @@ async function main() {
   // id reuse suppressed the flip) and wrong under churn (a 21st newer run
   // pushed the in-window run off the old 20-run page and flipped a LIVE
   // task). See verifyScanRunsPath/seenKeysFromRuns in conductor-core.
+  // T46/s21 C-1 (audit a1, BLOCKING): the scan is a UNION — main's runs
+  // PLUS the overflow lane's second bucket (agentrunners stand-in), because
+  // a repo2-only dispatch has its ONLY run there and a main-only scan would
+  // flip it 'dispatch-unverified' at the 720s window while the mirror
+  // worker is still grinding. The second fetch rides the PAT (the job
+  // token is same-repo scoped, X1a; the PAT already performs the cross-repo
+  // dispatch). ANY per-repo fetch failure fails the WHOLE scan open
+  // (seenKeys stays null -> zero flips; the lease reaper backstops) —
+  // partial keys would flip every repo2-dispatched task, which is exactly
+  // the C-1 bug shape the union exists to kill.
   let seenDispatchKeys = null;
   let verifyNowMs = null;
   {
@@ -273,20 +285,29 @@ async function main() {
       }
     }
     if (needsScan) {
-      const rr = await api(verifyScanRunsPath(REPO, oldestIssuedMs));
-      if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
-        const runs = rr.data.workflow_runs;
+      const scanRepos = verifyScanRepoList(REPO, WORKER_REPO_2, PAT);
+      const runs = [];
+      let scanOk = true;
+      for (const sr of scanRepos) {
+        const rr = await api(verifyScanRunsPath(sr, oldestIssuedMs), 'GET', null, sr === REPO ? TOKEN : PAT);
+        if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
+          const repoRuns = rr.data.workflow_runs;
+          runs.push(...repoRuns);
+          if (repoRuns.length >= VERIFY_SCAN_PER_PAGE) {
+            // the observable signal of the un-paginated tail. NO pagination
+            // loop: the created floor keeps the in-window tail covered and a
+            // bounded tick matters more.
+            console.log(`VERIFY-SCAN-PAGE-FULL repo=${sr} runs=${repoRuns.length} per_page=${VERIFY_SCAN_PER_PAGE} — runs past this page are invisible to the scan (created floor covers the in-window tail; no pagination loop, the bounded tick wins)`);
+          }
+        } else {
+          scanOk = false;
+          console.log(`VERIFY-SCAN-SKIPPED repo=${sr} runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
+        }
+      }
+      if (scanOk) {
         seenDispatchKeys = seenKeysFromRuns(runs, (st && st.tasks) || {});
         verifyNowMs = Date.now();
-        console.log(`VERIFY-SCAN runs=${runs.length} keys=${seenDispatchKeys.size} created-floor=${Number.isFinite(oldestIssuedMs) ? new Date(oldestIssuedMs - VERIFY_SCAN_SLACK_MS).toISOString() : 'none'} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
-        if (runs.length >= VERIFY_SCAN_PER_PAGE) {
-          // the observable signal of the un-paginated tail. NO pagination
-          // loop: the created floor keeps the in-window tail covered and a
-          // bounded tick matters more.
-          console.log(`VERIFY-SCAN-PAGE-FULL runs=${runs.length} per_page=${VERIFY_SCAN_PER_PAGE} — runs past this page are invisible to the scan (created floor covers the in-window tail; no pagination loop, the bounded tick wins)`);
-        }
-      } else {
-        console.log(`VERIFY-SCAN-SKIPPED runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
+        console.log(`VERIFY-SCAN repos=${scanRepos.length} runs=${runs.length} keys=${seenDispatchKeys.size} created-floor=${Number.isFinite(oldestIssuedMs) ? new Date(oldestIssuedMs - VERIFY_SCAN_SLACK_MS).toISOString() : 'none'} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
       }
     }
   }
@@ -386,24 +407,36 @@ async function main() {
         briefMd,
         { nowMs: Date.now(), mode: epochMode },
       );
-      let d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
-      // T46/ar (20-e): the overflow lane — when the main-repo ladder
-      // saturates (403-with-Retry-After exhaustion) or the main bucket holds
-      // >= WORKER_OVERFLOW_AT in-flight leases, THIS dispatch re-targets
-      // WORKER_REPO_2 on the PAT lane. The ENVELOPE is unchanged: the second
-      // bucket's workers read client_payload identically — their worker.yml
-      // TARGET_REPO checks out the MAIN repo and the report CAS-append
-      // follows the CHECKOUT (worker/turn.mjs's Store rides the checkout's
-      // origin), so the report lands on the MAIN fsm-state. Unset
-      // WORKER_REPO_2 -> workerOverflowDecision returns false for any input
-      // (byte-identical today path).
-      const ov = workerOverflowDecision({
-        d, inFlightNow: priorInFlight + dispatchIndex - 1,
+      // T46/s21 C-2 (audit a1, MAJOR — the double-dispatch): the target is
+      // decided BEFORE any wire attempt. The occupancy arm (in-flight >=
+      // WORKER_OVERFLOW_AT) is PRE-FLIGHT: this dispatch goes STRAIGHT to
+      // WORKER_REPO_2 and the same-repo attempt is SKIPPED — the old shape
+      // ran the main ladder first (204) and then re-sent the SAME payload to
+      // the second bucket: two workers grinding one task, 2x paid-key burn,
+      // the second report an orphan. The saturated-ladder fallback (a FAILED
+      // main attempt in the 403/429-with-Retry-After class) stays post-
+      // attempt — that is the true bucket-pressure shape. The ENVELOPE is
+      // unchanged either way: the second bucket's workers read client_payload
+      // identically — their worker.yml TARGET_REPO checks out the MAIN repo
+      // and the report CAS-append follows the CHECKOUT (worker/turn.mjs's
+      // Store rides the checkout's origin), so the report lands on the MAIN
+      // fsm-state. Unset WORKER_REPO_2 -> both decisions return false for
+      // any input (byte-identical today path).
+      const pre = overflowPreFlight({
+        inFlightNow: priorInFlight + dispatchIndex - 1,
         repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,
       });
-      if (ov.overflow) {
-        console.log(`DISPATCH-OVERFLOW task=${a.task} ${ov.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; envelope unchanged — the bucket-2 worker checks out TARGET_REPO and reports to the MAIN fsm-state)`);
+      let d;
+      if (pre.overflow) {
+        console.log(`DISPATCH-OVERFLOW-PREFLIGHT task=${a.task} ${pre.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; the same-repo attempt is SKIPPED — exactly one dispatch, one bucket; envelope unchanged — the bucket-2 worker checks out TARGET_REPO and reports to the MAIN fsm-state)`);
         d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });
+      } else {
+        d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs });
+        const ov = workerOverflowDecision({ d, repo2: WORKER_REPO_2, pat: PAT });
+        if (ov.overflow) {
+          console.log(`DISPATCH-OVERFLOW task=${a.task} ${ov.reason} -> ${WORKER_REPO_2} (the LAB_PAT lane; the main attempt FAILED saturated — envelope unchanged, the bucket-2 worker reports to the MAIN fsm-state)`);
+          d = await dispatchRetry('fsm-task', payload, { budgetMs: workerBudgetMs, repo: WORKER_REPO_2, token: PAT });
+        }
       }
       if (!d.ok) {
         // X21 lesson: 4 dispatchFailures with ZERO logged detail (the 422
