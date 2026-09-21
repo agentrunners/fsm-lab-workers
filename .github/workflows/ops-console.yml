@@ -61,4 +61,9 @@ jobs:
           # default '1'. The scoping gate maps this into the console; unset
           # or wrong → the console is silent on every issue (fail-closed).
           OPS_ISSUE: ${{ vars.OPS_ISSUE || '1' }}
+          # s21/O-1 (audit a5): the SPEND CEILING as a repo VARIABLE — the
+          # status screen checks the epoch-cumulative cost against it
+          # (ok / APPROACHING / EXCEEDED). Default '8.0'; the console only
+          # READS it (the burn decision — pause/halt — stays the operator's).
+          CC_SPEND_CEILING_USD: ${{ vars.CC_SPEND_CEILING_USD || '8.0' }}
         run: node ops/console.mjs

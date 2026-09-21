@@ -41,7 +41,16 @@
 //   F-13 source pin      the workflow YAML: GH_TOKEN wired from github.token
 //                        ONLY, NO secrets.* anywhere, issue_comment[created]
 //                        ONLY, OWN concurrency group, the permission set;
-//                        m-8: OPS_ISSUE mapped from vars.OPS_ISSUE || '1'
+//                        m-8: OPS_ISSUE mapped from vars.OPS_ISSUE || '1';
+//                        s21/O-1: CC_SPEND_CEILING_USD mapped from
+//                        vars.CC_SPEND_CEILING_USD || '8.0' (same shape)
+//   s21/O-1 epoch        the EPOCH economics line: epochSpend's boundary
+//                        semantics (newest applied reset bounds the epoch;
+//                        pre-reset spend excluded; old-format turns counted
+//                        in the telemetry-on denominator), the render's three
+//                        ceiling states (ok / APPROACHING / EXCEEDED),
+//                        parseSpendCeilingUsd's env matrix, the read-only
+//                        discipline (readJournals is a READ), the screen shape
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -55,6 +64,7 @@ import { fileURLToPath } from 'node:url';
 import {
   parseConsoleCommand, consoleQueueRecord, statusSummary, runConsole,
   queuedReply, CONSOLE_COMMANDS,
+  parseSpendCeilingUsd, epochSpend, SPEND_CEILING_DEFAULT_USD,
 } from '../ops/console.mjs';
 import { conductorTick } from '../lib/conductor-core.mjs';
 import { genesis, apply, invariants } from '../lib/fsm.mjs';
@@ -102,8 +112,9 @@ function mkApi({ permission = 'write', permissionStatus = 200, commentStatus = 2
 
 // the store seam: a recording fake — `writes` must stay EMPTY on the status lane
 // (W-D review fold A4: readJournalTail joined the read set — the journal tail
-// is the LANE section's primary source)
-function mkStore({ state = null, control = [], intake = [], report = [], journalTail = [], enqueueResult = { ok: true } } = {}) {
+// is the LANE section's primary source; s21/O-1: readJournals joined too — the
+// full-journal read is the EPOCH economics line's source)
+function mkStore({ state = null, control = [], intake = [], report = [], journalTail = [], journalAll = null, enqueueResult = { ok: true } } = {}) {
   const reads = [];
   const writes = [];
   const store = {
@@ -116,6 +127,7 @@ function mkStore({ state = null, control = [], intake = [], report = [], journal
       reads.push(`readJournalTail(${n},${kind})`);
       return kind === 'REPORT' ? journalTail : journalTail;
     },
+    readJournals() { reads.push('readJournals'); return journalAll; },
     enqueueControl(rec) { writes.push({ method: 'enqueueControl', rec }); return enqueueResult; },
   };
   return { store, reads, writes };
@@ -473,6 +485,108 @@ test('status: unreadable state → an honest one-screen reply (never a silent re
   assert.match(body, /state\.json is UNREADABLE/);
 });
 
+// ---------------------------------------------------------------------------
+// s21/O-1 (audit a5, MAJOR) — the EPOCH economics line + the SPEND CEILING.
+// The console's only economics surface was the 64-REPORT window; the epoch
+// total (the spend-ceiling quantity) was invisible. Pins: the epoch scan's
+// boundary semantics (pure), the render's three ceiling states, the env read,
+// the read-only discipline (readJournals is a READ), and the screen shape.
+// ---------------------------------------------------------------------------
+
+const EPOCH_JOURNAL = [
+  // PRE-reset epoch — its spend must NOT count toward the current epoch
+  { id: 'e1', kind: 'REPORT', task: 'T1', lane_stats: { calls: 1, ok: 1, tokens: 100, cost: 0.05 } },
+  { id: 'e2', kind: 'TICK', seq: 3 },
+  { id: 'e3', kind: 'CONTROL', command: 'reset', applied: true, genesisSpec: { chainId: 'c-new' } },   // the epoch boundary
+  // the CURRENT epoch — 3 REPORTs, 2 with telemetry, one pre-W-D old-format
+  { id: 'e4', kind: 'REPORT', task: 'T2', lane_stats: { calls: 2, ok: 2, tokens: 40, cost: 0.01 } },
+  { id: 'e5', kind: 'REPORT', task: 'T3' },                                     // old-format: no lane_stats
+  { id: 'e6', kind: 'REJECTED', origKind: 'REPORT', reason: 'stale-lease' },    // not a REPORT — skipped
+  { id: 'e7', kind: 'REPORT', task: 'T4', lane_stats: { calls: 1, ok: 1, tokens: 10, cost: 0.02 } },
+];
+
+test('epochSpend (pure): the newest applied reset bounds the epoch — pre-reset spend excluded, old-format turns counted in the denominator', () => {
+  const sp = epochSpend(EPOCH_JOURNAL);
+  assert.equal(sp.cost, 0.03, 'only the CURRENT epoch\'s REPORT costs (0.01 + 0.02) — the pre-reset $0.05 is a different epoch');
+  assert.equal(sp.tokens, 50);
+  assert.equal(sp.turns, 3, 'every REPORT after the boundary counts (incl. the old-format one)');
+  assert.equal(sp.withTelemetry, 2, 'the pre-W-D record carries no telemetry — the honest-floor denominator');
+  // no boundary anywhere → the whole retained journal is the epoch (bootstrap shape)
+  const whole = epochSpend(EPOCH_JOURNAL.slice(0, 2));
+  assert.equal(whole.cost, 0.05);
+  assert.equal(whole.turns, 1);
+  // a REJECTED reset-duplicate is kind REJECTED — never a boundary; an
+  // UNAPPLIED reset record is not a boundary either (the boundary is the
+  // applied reset whose genesisSpec minted the live chain)
+  const notBounded = epochSpend([
+    { kind: 'REJECTED', origKind: 'CONTROL', command: 'reset', reason: 'reset-duplicate' },
+    { kind: 'CONTROL', command: 'reset', applied: false },
+    { kind: 'REPORT', task: 'T9', lane_stats: { cost: 0.07, tokens: 5 } },
+  ]);
+  assert.equal(notBounded.cost, 0.07);
+  assert.equal(notBounded.turns, 1);
+  // non-array input → the zero epoch (never a crash)
+  assert.deepEqual(epochSpend(null), { cost: 0, tokens: 0, turns: 0, withTelemetry: 0 });
+});
+
+test('status (s21/O-1): the EPOCH economics line renders from readJournals — read-only kept, the three ceiling states', async () => {
+  const mkBody = async (journalAll, ceilingEnv) => {
+    const { api, calls } = mkApi();
+    const { store, reads, writes } = mkStore({ state: STATUS_STATE, journalAll });
+    const env = { ...ENV, ...(ceilingEnv ? { CC_SPEND_CEILING_USD: ceilingEnv } : {}) };
+    const r = await runConsole({ event: commentEvent({ body: 'status' }), env, api, store, now: NOW });
+    assert.equal(r.outcome, 'status');
+    assert.equal(r.exitCode, 0);
+    assert.equal(writes.length, 0, 'readJournals is a READ — the status lane stays write-free');
+    assert.ok(reads.includes('readJournals'), 'the full-journal read fired (the epoch line\'s source)');
+    return calls.find(x => x.method === 'POST' && x.path.endsWith('/comments')).body.body;
+  };
+  // ok state: $0.03 of $8.00 (0%) — the default ceiling
+  const ok = await mkBody(EPOCH_JOURNAL, undefined);
+  assert.match(ok, /- epoch: cost \$0\.0300 · tokens 50 · telemetry on 2\/3 turns · ceiling \$8\.00 \(0%\)/);
+  assert.doesNotMatch(ok, /SPEND CEILING/);
+  // approaching: $6.50 of $8.00 = 81% (>= 80%)
+  const approaching = await mkBody([
+    { kind: 'REPORT', task: 'A', lane_stats: { cost: 6.5, tokens: 1000 } },
+  ], '8');
+  assert.match(approaching, /- epoch: cost \$6\.5000 · tokens 1000 · telemetry on 1\/1 turns — \*\*SPEND CEILING APPROACHING: \$6\.50 of \$8\.00 \(81%\)\*\*/);
+  // exceeded: $9.06 of $8.00 = 113% (the audit's live or-074 quantity)
+  const over = await mkBody([
+    { kind: 'REPORT', task: 'A', lane_stats: { cost: 9.06, tokens: 1000 } },
+  ], '8');
+  assert.match(over, /- epoch: cost \$9\.0600 · tokens 1000 · telemetry on 1\/1 turns — \*\*SPEND CEILING EXCEEDED: \$9\.06 of \$8\.00 \(113%\) — pause the chain or raise the ceiling \(repo var CC_SPEND_CEILING_USD\)\*\*/);
+  // a fresh epoch (no turns since the reset) still names the ceiling
+  const fresh = await mkBody([{ kind: 'CONTROL', command: 'reset', applied: true }], '5');
+  assert.match(fresh, /- epoch: no turns yet · ceiling \$5\.00/);
+  // the rest of the screen survives beside the new line
+  assert.match(ok, /- phase: executing/);
+  assert.match(ok, /- queues: report 0/);
+});
+
+test('parseSpendCeilingUsd (pure): the env read — valid, default on absent/garbage/non-positive', () => {
+  assert.equal(parseSpendCeilingUsd({}), SPEND_CEILING_DEFAULT_USD);
+  assert.equal(SPEND_CEILING_DEFAULT_USD, 8.0);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '2.5' }), 2.5);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: ' 4 ' }), 4);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: 'garbage' }), 8.0);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '' }), 8.0);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '-1' }), 8.0);
+  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '0' }), 8.0);
+});
+
+test('statusSummary (pure): the epoch line slots between queues and lanes — seven lines with journalAll, six without (legacy callers)', () => {
+  const s = structuredClone(STATUS_STATE);
+  const withAll = statusSummary({
+    state: s, depths: {}, nowMs: T0 + 60_000,
+    journalAll: [{ kind: 'REPORT', task: 'A', lane_stats: { cost: 0.01, tokens: 10 } }],
+    spendCeilingUsd: 8,
+  });
+  assert.equal(withAll.split('\n').length, 7, 'header + phase + tasks + holds + queues + EPOCH + lanes');
+  assert.match(withAll.split('\n')[5], /^- epoch: /, 'the epoch line sits between queues and the lane section');
+  const withoutAll = statusSummary({ state: s, depths: {}, nowMs: T0 + 60_000 });
+  assert.equal(withoutAll.split('\n').length, 6, 'no journalAll → no epoch line (legacy screens byte-identical)');
+});
+
 test('statusSummary: pure — the paused/halted + active-ids projections from arbitrary state', () => {
   let s = structuredClone(STATUS_STATE);
   s = apply(s, { kind: 'CONTROL', command: 'pause', event_id: 'ctl-p1', ts: iso(T0 + 1000) }, iso(T0 + 1000), NM).state;
@@ -640,8 +754,8 @@ test('F-13 source pin: the workflow is GITHUB_TOKEN ONLY — no secrets wiring a
   // the console source reads only GH_TOKEN as its credential env
   assert.match(CONSOLE_SRC, /TOKEN:\s*process\.env\.GH_TOKEN/);
   const envReads = [...CONSOLE_SRC.matchAll(/process\.env\.([A-Z_][A-Z0-9_]*)/g)].map(m => m[1]);
-  assert.deepEqual([...new Set(envReads)].sort(), ['EVENT', 'GH_TOKEN', 'GITHUB_REPOSITORY', 'OPS_ISSUE'],
-    'console.mjs touches EXACTLY the four wired envs — no other credential surface');
+  assert.deepEqual([...new Set(envReads)].sort(), ['CC_SPEND_CEILING_USD', 'EVENT', 'GH_TOKEN', 'GITHUB_REPOSITORY', 'OPS_ISSUE'],
+    'console.mjs touches EXACTLY the five wired envs — no other credential surface (CC_SPEND_CEILING_USD is the s21/O-1 repo var, mapped like OPS_ISSUE, not a credential)');
 });
 
 test('F-13 source pin: issue_comment[created] ONLY, OWN concurrency group (no conductor-chain contention)', () => {
@@ -659,6 +773,13 @@ test('F-13 source pin: issue_comment[created] ONLY, OWN concurrency group (no co
 test('F-13 source pin (m-8): OPS_ISSUE maps from the LOAD-BEARING repo variable with the documented default', () => {
   assert.match(YML, /OPS_ISSUE:\s*\$\{\{\s*vars\.OPS_ISSUE\s*\|\|\s*'1'\s*\}\}/, 'the var, default 1');
   assert.match(YML, /LOAD-BEARING/, 'documented as load-bearing in the workflow');
+});
+
+// s21/O-1: the spend ceiling rides the SAME var-mapping shape — vars.* with a
+// documented default, still NO secrets.* anywhere (the F-13 law holds).
+test('F-13 source pin (s21/O-1): CC_SPEND_CEILING_USD maps from the repo variable with the default 8.0', () => {
+  assert.match(YML, /CC_SPEND_CEILING_USD:\s*\$\{\{\s*vars\.CC_SPEND_CEILING_USD\s*\|\|\s*'8\.0'\s*\}\}/, 'the var, default 8.0');
+  assert.equal(/\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}/.test(YML), false, 'still zero secrets wiring');
 });
 
 test('F-13 source pin: the permission set — issues:write for replies + contents:write (the F-2a class: the queue CAS push + nudge dispatch need write)', () => {

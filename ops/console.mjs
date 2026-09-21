@@ -47,6 +47,57 @@ import { pathToFileURL } from 'node:url';
 const REPO_DEFAULT = 'claudecode-headless/fsm-lab';
 const OPS_ISSUE_DEFAULT = '1';   // m-8: the load-bearing default
 
+// s21/O-1 (audit a5): the SPEND CEILING — the repo variable
+// `CC_SPEND_CEILING_USD` (mapped through ops-console.yml exactly like
+// OPS_ISSUE; default 8.0). The console READS it and renders the epoch spend
+// against it (ok / APPROACHING / EXCEEDED) — the ceiling is an OPERATOR
+// surface here, not a control action: the console never writes, so the burn
+// decision (pause / halt / reset) stays the operator's. Read through the env
+// seam the same way CC_MODEL reaches the worker adapter.
+export const SPEND_CEILING_DEFAULT_USD = 8.0;
+const SPEND_CEILING_APPROACH_FRACTION = 0.8;
+
+// parseSpendCeilingUsd(env) — the pure env read (vars come through the
+// workflow's env mapping; absent / unparseable / non-positive → the default,
+// never a NaN that would break the render).
+export function parseSpendCeilingUsd(env = {}) {
+  const raw = env == null ? null : env.CC_SPEND_CEILING_USD;
+  const n = typeof raw === 'string' ? Number(raw.trim()) : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : SPEND_CEILING_DEFAULT_USD;
+}
+
+// epochSpend(journalRecords) — the s21/O-1 epoch-cumulative economics.
+// Walks the FULL journal (store.readJournals()'s order: oldest → newest) from
+// the END backward, summing every REPORT record's lane_stats cost + tokens,
+// and STOPS at the newest applied `CONTROL command:'reset'` record — the
+// epoch boundary (its genesisSpec mints the chain the live state renders;
+// everything AFTER the boundary is the current epoch's spend). No boundary →
+// the whole retained journal is the epoch (the bootstrap/first-epoch shape).
+// REPORT records WITHOUT lane_stats (pre-W-D turns) contribute nothing but
+// count in the denominator — the render prints `telemetry on X/Y turns` so
+// the operator sees the honest floor (the audit's live case: 7-of-52 turns
+// carried telemetry; pre-fold spend is unrecoverable and the line says so).
+// REJECTED-duplicate / reset-duplicate records are kind REJECTED — they never
+// bound the scan; an unapplied reset record is not a boundary either.
+export function epochSpend(journalRecords) {
+  const recs = Array.isArray(journalRecords) ? journalRecords : [];
+  let cost = 0, tokens = 0, turns = 0, withTelemetry = 0;
+  for (let i = recs.length - 1; i >= 0; i--) {
+    const r = recs[i];
+    if (!r || typeof r !== 'object') continue;
+    if (r.kind === 'CONTROL' && r.command === 'reset' && r.applied !== false) break;   // the epoch boundary
+    if (r.kind !== 'REPORT') continue;
+    turns += 1;
+    const ls = r.lane_stats;
+    if (ls && typeof ls === 'object' && !Array.isArray(ls)) {
+      withTelemetry += 1;
+      cost += Number(ls.cost) || 0;
+      tokens += Number(ls.tokens) || 0;
+    }
+  }
+  return { cost, tokens, turns, withTelemetry };
+}
+
 export const CONSOLE_COMMANDS = ['pause', 'resume', 'halt', 'unhalt', 'reset', 'status', 'configure'];
 const BARE_COMMANDS = new Set(['pause', 'resume', 'halt', 'unhalt']);
 const RESET_FLAGS = ['from_queue', 'drop_queue'];
@@ -168,12 +219,18 @@ export function queuedReply(cmd, queueId) {
 // the PURE half — the status screen (read-only, one screen)
 // ---------------------------------------------------------------------------
 
-// statusSummary({ state, depths, nowMs, journalReports }) — phase, milestone,
+// statusSummary({ state, depths, nowMs, journalReports, journalAll,
+//                  spendCeilingUsd }) — phase, milestone,
 // done/quarantined counts, chain id + age of last_tick, queue depths (report/
 // control/intake), paused/halted, active task ids. NEVER writes anything.
 // journalReports (optional, the W-D review fold A4): the journal-tail REPORT
 // records — the LANE section's PRIMARY source (see laneSection).
-export function statusSummary({ state, depths = {}, nowMs = null, journalReports = null }) {
+// journalAll (optional, s21/O-1): the FULL journal record list
+// (store.readJournals()) — the EPOCH economics line's source: epoch-cumulative
+// cost + tokens since the newest reset boundary, checked against the spend
+// ceiling. Absent (legacy callers / a failed journal read) → no epoch line —
+// the screen never goes red over economics telemetry.
+export function statusSummary({ state, depths = {}, nowMs = null, journalReports = null, journalAll = null, spendCeilingUsd = null }) {
   if (!state) {
     return '**[fsm-console]** status: state.json is UNREADABLE on the state branch (absent or corrupt — the conductor\'s git-history recovery owns it; the watchdog alerts if the chain is also stale).';
   }
@@ -199,14 +256,40 @@ export function statusSummary({ state, depths = {}, nowMs = null, journalReports
   // state projection is the cheaper read but the ~20-tick window). Absent
   // on every legacy/pre-W-D record → the single "no telemetry" line.
   const laneLines = laneSection(tasks, journalReports);
+  const epochLines = epochSection(journalAll, spendCeilingUsd);
   return [
     `**[fsm-console]** status — chain \`${chain.id ?? '?'}\` (last tick ${age})`,
     `- phase: ${proj.phase ?? '?'} · milestone ${proj.milestone ?? '?'}/${proj.milestones_total ?? '?'} · mode ${proj.mode ?? '?'}`,
     `- tasks: ${d(stats.done)}/${total} done · ${d(stats.quarantined)} quarantined · ${d(stats.failed)} failed · ${d(stats.cancelled)} cancelled · active [${active.join(', ')}]`,
     `- holds: paused=${chain.paused === true} · halted=${chain.halted === true}`,
     `- queues: report ${d(depths.report)} · control ${d(depths.control)} · intake ${d(depths.intake)}`,
+    ...epochLines,
     ...laneLines,
   ].join('\n');
+}
+
+// s21/O-1 (audit a5): the EPOCH economics section — the one line the
+// operator's spend-ceiling arithmetic lives on. Pure; returns [] when the
+// caller has no full-journal view (older fakes / failed read) so legacy
+// screens are byte-identical. Ceiling states: ok (< 80% of the ceiling),
+// APPROACHING (≥ 80%), EXCEEDED (≥ 100%) — the last two render LOUD
+// (bold caps) because they are the two states an operator must act on.
+function epochSection(journalAll, spendCeilingUsd) {
+  if (!Array.isArray(journalAll)) return [];
+  const sp = epochSpend(journalAll);
+  const ceiling = Number.isFinite(spendCeilingUsd) && spendCeilingUsd > 0 ? spendCeilingUsd : SPEND_CEILING_DEFAULT_USD;
+  const cap = `$${ceiling.toFixed(2)}`;
+  if (sp.turns === 0) return [`- epoch: no turns yet · ceiling ${cap}`];
+  const base = `- epoch: cost $${sp.cost.toFixed(4)} · tokens ${sp.tokens} · telemetry on ${sp.withTelemetry}/${sp.turns} turns`;
+  const frac = sp.cost / ceiling;
+  const pct = Math.round(frac * 100);
+  if (frac >= 1) {
+    return [`${base} — **SPEND CEILING EXCEEDED: $${sp.cost.toFixed(2)} of ${cap} (${pct}%) — pause the chain or raise the ceiling (repo var CC_SPEND_CEILING_USD)**`];
+  }
+  if (frac >= SPEND_CEILING_APPROACH_FRACTION) {
+    return [`${base} — **SPEND CEILING APPROACHING: $${sp.cost.toFixed(2)} of ${cap} (${pct}%)**`];
+  }
+  return [`${base} · ceiling ${cap} (${pct}%)`];
 }
 
 // T46/W-D lane B (§D4 console): the LANE section — the W-D review fold
@@ -372,7 +455,16 @@ export async function runConsole({ event, env = {}, api, store, now = () => new 
     if (typeof store.readJournalTail === 'function') {
       try { journalReports = store.readJournalTail(LANE_JOURNAL_WINDOW, 'REPORT'); } catch { journalReports = null; }
     }
-    const body = statusSummary({ state, depths, nowMs: Date.parse(now()), journalReports });
+    // s21/O-1 (audit a5): the FULL journal record list — the EPOCH economics
+    // line's source (readJournals is the rebuild-side full read, a READ; the
+    // status lane stays write-free). Guarded like the tail read: a seam
+    // without it (older fakes) or a failed read degrades to no epoch line —
+    // never a red status over telemetry.
+    let journalAll = null;
+    if (typeof store.readJournals === 'function') {
+      try { journalAll = store.readJournals(); } catch { journalAll = null; }
+    }
+    const body = statusSummary({ state, depths, nowMs: Date.parse(now()), journalReports, journalAll, spendCeilingUsd: parseSpendCeilingUsd(env) });
     const okc = await postComment(api, repo, issue.number, body);
     console.log(`CONSOLE-STATUS by @${author} — ${okc ? 'one-screen reply posted' : 'REPLY FAILED'}`);
     return { outcome: 'status', exitCode: okc ? 0 : 2 };
@@ -436,6 +528,10 @@ async function main() {
   const env = {
     REPO: process.env.GITHUB_REPOSITORY || REPO_DEFAULT,
     OPS_ISSUE: process.env.OPS_ISSUE || OPS_ISSUE_DEFAULT,
+    // s21/O-1: the spend ceiling rides the env seam (ops-console.yml maps the
+    // repo variable vars.CC_SPEND_CEILING_USD, default '8.0' — the same
+    // mapping shape m-8 uses for OPS_ISSUE)
+    CC_SPEND_CEILING_USD: process.env.CC_SPEND_CEILING_USD,
     TOKEN: process.env.GH_TOKEN,   // F-13: the JOB token — the console's ONLY credential
   };
   const event = JSON.parse(process.env.EVENT || '{}');
