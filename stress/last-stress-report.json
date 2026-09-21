@@ -1,123 +1,68 @@
 {
- "generatedAt": "2026-09-21T05:25:43.495Z",
+ "generatedAt": "2026-09-21T05:29:58.636Z",
  "mode": "quick",
  "seed": 20260922,
  "batteries": 1,
  "batteryPass": 1,
- "checks": "12/12",
+ "checks": "7/7",
  "batteryReports": [
   {
-   "battery": "burst12",
+   "battery": "quota-wall",
    "pass": true,
    "checks": [
     {
-     "name": "burst12: all 12 tasks complete under the live cap (phase done)",
+     "name": "qw4x2x12: the budget-pause FIRED at the wall",
      "pass": true,
-     "detail": "phase=done done=12"
+     "detail": "rounds=3 distinctTasks=4 backstop=false"
     },
     {
-     "name": "burst12: the conductor self-tick never starves > 2 consecutive windows under saturation",
+     "name": "qw4x2x12: ALERT-FIRST — the alert issue exists before the pause event applies",
      "pass": true,
-     "detail": "maxConsecutiveStarved=0"
+     "detail": "alert@2026-09-22T08:00:00.037Z pause@1790064000038"
     },
     {
-     "name": "burst12: dispatch pacing within the dispatchBudget (F-10)",
+     "name": "qw4x2x12: the pause fired at ≤ threshold+1 distinct tasks (immediate — no extra burn waiting)",
      "pass": true,
-     "detail": "maxAssignsPerTurn=3 budget=3"
+     "detail": "tasks in window=4 threshold=3 max_parallel=4"
     },
     {
-     "name": "burst12: every ASSIGN has its dispatch (no lost actions)",
+     "name": "qw4x2x12: ZERO work-ladder burn through the wall (attempts ≤ 1, the X21 12×3 burn is dead)",
      "pass": true,
-     "detail": "dispatches=12"
+     "detail": "maxAttempts=1 quarantined=0"
     },
     {
-     "name": "burst12: drain-time bounded — the baseline pin (ticks ≤ 24)",
+     "name": "qw4x2x12: zero post-pause assigns",
      "pass": true,
-     "detail": "ticks-to-drain=8"
+     "detail": "assigned 4 -> 4 across the held tick"
     },
     {
-     "name": "burst12/saturated: max_parallel=5 contends the cap for real (queue depth > 0)",
+     "name": "qw4x2x12: resume-on-fresh-quota drains the epoch clean",
      "pass": true,
-     "detail": "maxQueueDepth=2"
+     "detail": "phase=done done=12/12 quarantined=0 roundsPostResume=1"
     },
     {
-     "name": "burst12/saturated: the conductor still never starves > 2 windows at the 5-slot boundary",
+     "name": "qw4x2x12: the day-rollover reset fired (per-key counters reborn)",
      "pass": true,
-     "detail": "maxConsecutiveStarved=0"
-    },
-    {
-     "name": "burst12/saturated: all 12 tasks still complete",
-     "pass": true,
-     "detail": "done=12"
-    },
-    {
-     "name": "burst12/sabotage: the starvation counter DETECTS a starved conductor (> 2 windows)",
-     "pass": true,
-     "detail": "maxConsecutiveStarved=4 (the assert is honest, not vacuous)"
-    },
-    {
-     "name": "cas-storm: the assign tick committed (12 leases live)",
-     "pass": true,
-     "detail": "assigns=12"
-    },
-    {
-     "name": "cas-storm: ZERO CAS losses — every one of the 12 concurrent enqueues landed",
-     "pass": true,
-     "detail": "landed=12/12"
-    },
-    {
-     "name": "cas-storm: every report applied EXACTLY once (ledger diff)",
-     "pass": true,
-     "detail": "applied=12 dup=0 done=12"
+     "detail": "rollovers=1"
     }
    ],
    "metrics": {
-    "ticks_to_drain": 8,
-    "virtual_drain_ms": 1200008,
-    "max_queue_depth": 0,
-    "avg_queue_depth": 0,
-    "conductor_wait": {
-     "n": 0,
-     "p50": 0,
-     "p95": 0,
-     "max": 0
-    },
-    "worker_wait": {
-     "n": 0,
-     "p50": 0,
-     "p95": 0,
-     "max": 0
-    },
-    "watchdog_wait": {
-     "n": 0,
-     "p50": 0,
-     "p95": 0,
-     "max": 0
-    },
-    "starvation_max_consecutive_windows": 0,
-    "runs_total": 20,
-    "saturated_max_queue_depth": 2,
-    "saturated_conductor_wait": {
-     "n": 1,
-     "p50": 333667,
-     "p95": 333667,
-     "max": 333667
-    },
-    "saturated_worker_wait": {
-     "n": 1,
-     "p50": 3845,
-     "p95": 3845,
-     "max": 3845
-    },
-    "saturated_starvation_max_consecutive_windows": 0,
-    "sabotage_starvation_max_consecutive_windows": 4,
-    "cas_storm_wall_ms": 3379,
-    "cas_storm_landed": 12,
-    "cas_storm_applied": 12,
-    "cas_storm_duplicates": 0
+    "qw4x2x12_rotation_coverage": 4,
+    "qw4x2x12_keys_pool": 4,
+    "qw4x2x12_calls": 16,
+    "qw4x2x12_ok200": 8,
+    "qw4x2x12_err429": 8,
+    "qw4x2x12_first_429_at": "2026-09-22T08:00:00.000Z",
+    "qw4x2x12_rounds_to_pause": 3,
+    "qw4x2x12_attempts_at_wall": 1,
+    "qw4x2x12_done": 12,
+    "qw4x2x12_post_resume_rounds": 1,
+    "qw4x2x12_final_max_attempts": 1
    },
-   "notes": [],
-   "durationMs": 6846,
+   "notes": [
+    "qw4x2x12: hop-ladder reach = 2 keys/turn (hash, hash+1 mod 4) — rotation coverage across the fleet is 4/4 keys; stranded-capacity risk exists when demand ≈ capacity (the W1/W3 reachability family)"
+   ],
+   "durationMs": 14,
    "mode": "quick",
    "seed": 20260922
   }
