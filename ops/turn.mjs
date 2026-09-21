@@ -13,6 +13,7 @@
 import { Store } from '../lib/store.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
+const API = process.env.GITHUB_API_URL || 'https://api.github.com'; // T9 (s21) seam: GHA sets this env itself — unset -> the literal, byte-identical
 const TOKEN = process.env.GH_TOKEN;  // T44/F3: the job token (was undefined —
 // every ops-nudge 401'd since birth, live runs 34026953026/34028691734)
 const EVENT = JSON.parse(process.env.EVENT || '{}');
@@ -44,7 +45,7 @@ async function nudgeTick(reason) {
   // is hot, the nudge may be superseded (newest-wins) — the next self-tick
   // drains the queue anyway, so the command is never lost.
   const post = async () => {
-    const r = await fetch(`https://api.github.com/repos/${REPO}/dispatches`, {
+    const r = await fetch(`${API}/repos/${REPO}/dispatches`, {
       method: 'POST',
       headers: {
         Authorization: `token ${TOKEN}`,

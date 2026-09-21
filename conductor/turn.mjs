@@ -42,6 +42,7 @@ import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
+const API = process.env.GITHUB_API_URL || 'https://api.github.com'; // T9 (s21) seam: GHA sets this env itself — unset -> the literal, byte-identical
 const RUN_ID = process.env.GITHUB_RUN_ID || 'local';
 const PAT = process.env.LAB_PAT;
 // T46/ar (20-e): the SECOND-BUCKET overflow lane. WORKER_REPO_2 (repo
@@ -81,7 +82,7 @@ const now = () => new Date().toISOString();
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
 async function api(path, method = 'GET', body = null, token = TOKEN) {
-  const r = await fetch(`https://api.github.com${path}`, {
+  const r = await fetch(`${API}${path}`, {
     method,
     headers: {
       Authorization: `token ${token}`,

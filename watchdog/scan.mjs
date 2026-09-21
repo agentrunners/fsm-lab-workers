@@ -44,12 +44,13 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
+const API = process.env.GITHUB_API_URL || 'https://api.github.com'; // T9 (s21) seam: GHA sets this env itself — unset -> the literal, byte-identical
 const PAT = process.env.LAB_PAT;
 const TOKEN = process.env.GH_TOKEN || PAT; // X1a: job token first, PAT fallback
 const STALE_AFTER_MS = parseInt(process.env.STALE_AFTER_MIN || '4', 10) * 60_000;
 
 async function api(path, method = 'GET', body = null) {
-  const r = await fetch(`https://api.github.com${path}`, {
+  const r = await fetch(`${API}${path}`, {
     method,
     headers: {
       Authorization: `token ${TOKEN}`,

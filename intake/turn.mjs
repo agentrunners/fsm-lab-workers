@@ -22,11 +22,12 @@ import { Store } from '../lib/store.mjs';
 import { doorDecide, bodySha8 } from '../lib/intake.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
+const API = process.env.GITHUB_API_URL || 'https://api.github.com'; // T9 (s21) seam: GHA sets this env itself — unset -> the literal, byte-identical
 const TOKEN = process.env.GH_TOKEN;   // the JOB token — the door's ONLY credential
 const EVENT = JSON.parse(process.env.EVENT || '{}');
 
 async function api(path, method = 'GET', body = null) {
-  const r = await fetch(`https://api.github.com${path}`, {
+  const r = await fetch(`${API}${path}`, {
     method,
     headers: {
       Authorization: `token ${TOKEN}`,
@@ -53,7 +54,7 @@ async function nudgeTick() {
   // rollover fires on this nudge; an active epoch's tick parks harmlessly —
   // the nudge is one dispatch, GITHUB_TOKEN, the X1a same-repo exception)
   const post = async () => {
-    const r = await fetch(`https://api.github.com/repos/${REPO}/dispatches`, {
+    const r = await fetch(`${API}/repos/${REPO}/dispatches`, {
       method: 'POST',
       headers: {
         Authorization: `token ${TOKEN}`,
