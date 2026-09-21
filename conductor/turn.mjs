@@ -499,6 +499,20 @@ async function main() {
     if (j.kind === 'TIMEOUT' && j.to === 'quarantined') {
       await postIssueComment(`**[fsm-alert]** task ${j.task} QUARANTINED via lease timeout — journal ${j.id}`);
     }
+    // s21/O-4 (audit a5, MAJOR): the CONTROL-REJECTED arm — the false
+    // confirmation is dead. The console's ack says "next tick applies"; the
+    // drain can REJECT the control (bad-patch-key / bad-patch bounds /
+    // configure-noop / reset-duplicate / unparseable), and before this arm
+    // the operator learned NOTHING (a log line + the REJECTED journal record
+    // only) while believing the knob landed — the feedback loop broke at the
+    // drain, the exact class law-5 exists to prevent. ONE comment cites the
+    // journal id + the reason; the event_id (the console-minted
+    // ctl-<nodeId>-<cmd>-<clockMs>) joins the ack's audit trail. The
+    // 'duplicate' class is the F11 re-delivery artifact — never alerted, or
+    // a redelivered queue line would re-post the same rejection.
+    if (j.kind === 'REJECTED' && j.origKind === 'CONTROL' && j.reason !== 'duplicate') {
+      await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
+    }
     if (j.kind === 'BUDGET') {
       // F-10: the observable pacing signal — one log line per exhausted tick
       console.log(`DISPATCH-PACED budget=${j.budget} ready_remaining=${j.ready_remaining} — tasks stay ready, next tick re-assigns (journal ${j.id})`);

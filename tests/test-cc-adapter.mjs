@@ -26,9 +26,10 @@ import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
   ccExitJson, ccApiErrorStatus, ccChildEnv, ccNextLaneIndex, CC_ENV_DENYLIST,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
-  CC_KEY_CLASS_STATUSES,
+  CC_KEY_CLASS_STATUSES, artifactPushEscalation,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
+import { composeReportOutcome } from '../worker/turn.mjs';
 
 const KEY1 = 'cc-test-key-one';
 const KEY2 = 'cc-test-key-two';
@@ -255,7 +256,53 @@ test('ccTurn: no lane keys → infra_failed no-lane-keys, ZERO spawns (a routabl
   assert.match(result.detail, /no-lane-keys/);
   assert.deepEqual(result.lane_attempts_used, 0);
   assert.ok(!existsSync(roots.echoDir) || readdirSync(roots.echoDir).length === 0, 'nothing was spawned — no echo records');
+  // s21/O-3: the no-pool shape carries NO key fields (absent-means-absent —
+  // there is no slot to name when the pool itself is empty)
+  assert.equal('key_index' in result, false);
+  assert.equal('pool_size' in result, false);
   roots.cleanup();
+});
+
+// s21/O-3 (audit a5, MAJOR) — the CC lane's KEY PICK rides the outcome like
+// the real lane's: key_index = the 0-based index into the pool ARRAY of the
+// key that served the turn's LAST attempted lane, pool_size = the pool's
+// size. Before this the CC lane (the DEPLOYED mode) never produced key_index
+// — the live journal held ZERO records, so the console's key-spread line
+// would have been empty exactly where the W1/W3 key failure modes live.
+test('ccTurn (s21/O-3): the outcome carries the serving key pair (key_index 0-based + pool_size) — and it survives composeReportOutcome', async () => {
+  // the normal done: lane 1 rode key 1 (ordinal 1) → 0-based index 0, pool 2
+  const { result, roots } = await turn(fakeEnv());
+  assert.equal(classifyOutcome(result).status, 'done');
+  assert.equal(result.key_index, 0, 'the serving key is pool slot 0 (the 0-based journal contract — the real lane\'s D3 semantics)');
+  assert.equal(result.pool_size, 2);
+  // the composer (the worker's report payload allowlist) passes BOTH — the
+  // pair is what the drain journals beside lane_stats
+  const outcome = composeReportOutcome(classifyOutcome(result), result, 5);
+  assert.equal(outcome.key_index, 0);
+  assert.equal(outcome.pool_size, 2);
+  roots.cleanup();
+  // the W1 key-jump recovery: the LAST lane rode key 2 (ordinal 2) → index 1
+  const { result: jumped, roots: roots2 } = await turn(fakeEnv({ CC_MODEL: 'deepseek/deepseek-v4.1-flash' }), {
+    prompt: '[fixture:exit-api-402-if:cc-test-key-one] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(classifyOutcome(jumped).status, 'done');
+  assert.equal(jumped.key_index, 1, 'the turn\'s LAST lane (the answering one) was key 2 — the burned slot 0 is history, the SERVING key is what the report names');
+  assert.equal(jumped.pool_size, 2);
+  roots2.cleanup();
+  // a single-key pool: index 0, pool 1 (the degenerate-but-honest shape)
+  const { result: single, roots: roots3 } = await turn({ CC_FAKE_LLM: '1', OPENROUTER_API_KEY: KEY1 });
+  assert.equal(single.key_index, 0);
+  assert.equal(single.pool_size, 1);
+  roots3.cleanup();
+  // the escalation composers keep the pair (the artifact-push net-zero retry
+  // keeps its key provenance — a hole here would blank the console's spread
+  // line exactly on the retry path)
+  const esc = artifactPushEscalation('T9', 2, new Error('push rejected'), { ...single, key_index: single.key_index, pool_size: single.pool_size });
+  assert.equal(esc.key_index, 0);
+  assert.equal(esc.pool_size, 1);
+  const escNoKeys = artifactPushEscalation('T9', 2, new Error('push rejected'), { telemetry: {}, models: [], lane_attempts_used: 1, duration_ms: 1 });
+  assert.equal('key_index' in escNoKeys, false);
 });
 
 test('M-1: the merged child env carries NO credentials — the /proc/<pid>/environ leak is dead', async () => {
