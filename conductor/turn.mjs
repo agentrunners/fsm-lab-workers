@@ -34,7 +34,7 @@ import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
-  verifyScanRunsPath, seenKeysFromRuns, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
+  verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
   dispatchLadder, workerOverflowDecision, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
   chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
@@ -253,6 +253,16 @@ async function main() {
   // id reuse suppressed the flip) and wrong under churn (a 21st newer run
   // pushed the in-window run off the old 20-run page and flipped a LIVE
   // task). See verifyScanRunsPath/seenKeysFromRuns in conductor-core.
+  // T46/s21 C-1 (audit a1, BLOCKING): the scan is a UNION — main's runs
+  // PLUS the overflow lane's second bucket (agentrunners stand-in), because
+  // a repo2-only dispatch has its ONLY run there and a main-only scan would
+  // flip it 'dispatch-unverified' at the 720s window while the mirror
+  // worker is still grinding. The second fetch rides the PAT (the job
+  // token is same-repo scoped, X1a; the PAT already performs the cross-repo
+  // dispatch). ANY per-repo fetch failure fails the WHOLE scan open
+  // (seenKeys stays null -> zero flips; the lease reaper backstops) —
+  // partial keys would flip every repo2-dispatched task, which is exactly
+  // the C-1 bug shape the union exists to kill.
   let seenDispatchKeys = null;
   let verifyNowMs = null;
   {
@@ -272,20 +282,29 @@ async function main() {
       }
     }
     if (needsScan) {
-      const rr = await api(verifyScanRunsPath(REPO, oldestIssuedMs));
-      if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
-        const runs = rr.data.workflow_runs;
+      const scanRepos = verifyScanRepoList(REPO, WORKER_REPO_2, PAT);
+      const runs = [];
+      let scanOk = true;
+      for (const sr of scanRepos) {
+        const rr = await api(verifyScanRunsPath(sr, oldestIssuedMs), 'GET', null, sr === REPO ? TOKEN : PAT);
+        if (rr.status === 200 && Array.isArray(rr.data?.workflow_runs)) {
+          const repoRuns = rr.data.workflow_runs;
+          runs.push(...repoRuns);
+          if (repoRuns.length >= VERIFY_SCAN_PER_PAGE) {
+            // the observable signal of the un-paginated tail. NO pagination
+            // loop: the created floor keeps the in-window tail covered and a
+            // bounded tick matters more.
+            console.log(`VERIFY-SCAN-PAGE-FULL repo=${sr} runs=${repoRuns.length} per_page=${VERIFY_SCAN_PER_PAGE} — runs past this page are invisible to the scan (created floor covers the in-window tail; no pagination loop, the bounded tick wins)`);
+          }
+        } else {
+          scanOk = false;
+          console.log(`VERIFY-SCAN-SKIPPED repo=${sr} runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
+        }
+      }
+      if (scanOk) {
         seenDispatchKeys = seenKeysFromRuns(runs, (st && st.tasks) || {});
         verifyNowMs = Date.now();
-        console.log(`VERIFY-SCAN runs=${runs.length} keys=${seenDispatchKeys.size} created-floor=${Number.isFinite(oldestIssuedMs) ? new Date(oldestIssuedMs - VERIFY_SCAN_SLACK_MS).toISOString() : 'none'} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
-        if (runs.length >= VERIFY_SCAN_PER_PAGE) {
-          // the observable signal of the un-paginated tail. NO pagination
-          // loop: the created floor keeps the in-window tail covered and a
-          // bounded tick matters more.
-          console.log(`VERIFY-SCAN-PAGE-FULL runs=${runs.length} per_page=${VERIFY_SCAN_PER_PAGE} — runs past this page are invisible to the scan (created floor covers the in-window tail; no pagination loop, the bounded tick wins)`);
-        }
-      } else {
-        console.log(`VERIFY-SCAN-SKIPPED runs-fetch HTTP ${rr.status} (fail-open — the lease reaper backstops)`);
+        console.log(`VERIFY-SCAN repos=${scanRepos.length} runs=${runs.length} keys=${seenDispatchKeys.size} created-floor=${Number.isFinite(oldestIssuedMs) ? new Date(oldestIssuedMs - VERIFY_SCAN_SLACK_MS).toISOString() : 'none'} (tasks past the ${Math.round(preWindowMs / 1000)}s pre-window)`);
       }
     }
   }

@@ -33,6 +33,7 @@ import { tmpdir } from 'node:os';
 import {
   dispatchLadder, workerOverflowDecision, priorInFlightCount,
   WORKER_OVERFLOW_AT_DEFAULT,
+  verifyScanRepoList, seenKeysFromRuns, dispatchVerificationEvents, VERIFY_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
 import { Store } from '../lib/store.mjs';
 import { genesis } from '../lib/fsm.mjs';
@@ -365,4 +366,86 @@ test('ar report routing (real git): a seat checked out from the TARGET repo enqu
     const mirrorBranches = spawnSync('git', ['branch', '--list', 'fsm-state'], { cwd: lab.mirror, encoding: 'utf8' });
     assert.equal(mirrorBranches.stdout.trim(), '', 'the run repo never sees the report');
   } finally { lab.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// 6. T46/s21 C-1 (audit a1, BLOCKING) — the law-4 UNION scan. A repo2-only
+// dispatch (the saturated-ladder fallback above) has its ONLY run in
+// WORKER_REPO_2's worker.yml; the main-only scan flipped it
+// 'dispatch-unverified' at 720s -> infra churn -> quarantine of LIVE bucket-2
+// work. The adapter composes verifyScanRepoList -> per-repo
+// verifyScanRunsPath fetches -> ONE merged time-correlated seenKeysFromRuns;
+// these pins bite the planner, the composed flip decision, and the wiring.
+// ---------------------------------------------------------------------------
+
+const MAIN_REPO = 'claudecode-headless/fsm-lab';
+const REPO_2 = 'agentrunners/fsm-lab-workers';
+const C1_T0 = Date.parse('2026-09-20T10:00:00.000Z');
+
+function leasedFlippableState() {
+  const issuedMs = C1_T0 - VERIFY_WINDOW_MS - 60_000;   // aged past the window: the flip is DUE
+  const s = genesis({
+    config: { max_parallel: 4, lease_minutes: 15, max_attempts: 3 },
+    project: { tasks: [{ id: 'AR-C1', title: 'union-scan probe', behavior: 'succeed', work_ms: 1 }], milestones: 1 },
+    chainId: 'c-ar-c1', now: new Date(issuedMs).toISOString(),
+  });
+  const t = s.tasks['AR-C1'];
+  t.status = 'assigned';
+  t.attempts = 1;
+  t.lease = { token: 'l-c1', expires: new Date(C1_T0 + 900_000).toISOString(), issued_at: new Date(issuedMs).toISOString() };
+  return { state: s, issuedMs };
+}
+
+// the adapter's scan composition, exactly: the UNION plan -> per-repo runs
+// lists -> ONE merged time-correlated key set (repo2Runs are only consulted
+// when the plan actually includes repo2 — a PAT-less lane never fetches them)
+function unionSeenKeys(state, { repo2 = null, pat = null, mainRuns = [], repo2Runs = [] } = {}) {
+  const repos = verifyScanRepoList(MAIN_REPO, repo2, pat);
+  const runs = [];
+  for (const sr of repos) runs.push(...(sr === MAIN_REPO ? mainRuns : repo2Runs));
+  return seenKeysFromRuns(runs, state.tasks);
+}
+
+test('C-1 planner: verifyScanRepoList — [main] alone without the lane; [main, repo2] with lane+PAT; no PAT -> main-only (the job token cannot read cross-repo)', () => {
+  assert.deepEqual(verifyScanRepoList(MAIN_REPO, null, 'PAT-ORG'), [MAIN_REPO], 'unset lane -> the main-only scan (byte-identical)');
+  assert.deepEqual(verifyScanRepoList(MAIN_REPO, REPO_2, 'PAT-ORG'), [MAIN_REPO, REPO_2], 'lane + PAT -> the UNION');
+  assert.deepEqual(verifyScanRepoList(MAIN_REPO, REPO_2, null), [MAIN_REPO], 'lane without a PAT -> main-only (X1a: the job token is same-repo scoped)');
+  assert.deepEqual(verifyScanRepoList(MAIN_REPO, REPO_2, undefined), [MAIN_REPO], 'undefined PAT likewise');
+  assert.deepEqual(verifyScanRepoList(MAIN_REPO, null, null), [MAIN_REPO]);
+});
+
+test('C-1 COMPOSED: a repo2-ONLY run verifies the task — NO dispatch-unverified flip (the BLOCKING kill)', () => {
+  const { state, issuedMs } = leasedFlippableState();
+  const mirrorRun = { name: 'task-AR-C1 · succeed · a1', created_at: new Date(issuedMs + 60_000).toISOString() };
+  // the ONLY run for this lease lives in the second bucket (the saturated-ladder fallback's shape)
+  const keys = unionSeenKeys(state, { repo2: REPO_2, pat: 'PAT-ORG', mainRuns: [], repo2Runs: [mirrorRun] });
+  assert.ok(keys.has('AR-C1#a1'), 'the union saw the mirror run');
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: keys, nowMs: C1_T0 }).length, 0, 'NO flip — the repo2-only dispatch is verified');
+  // the PRE-fix shape on the SAME fixture (main-only scan): the C-1 bug, reproduced
+  const mainOnly = unionSeenKeys(state, { repo2: REPO_2, pat: 'PAT-ORG', mainRuns: [], repo2Runs: [] });
+  const preFix = dispatchVerificationEvents({ state, seenKeys: mainOnly, nowMs: C1_T0 });
+  assert.equal(preFix.length, 1, 'the main-only scan flips the LIVE bucket-2 task (the reproduced bug)');
+  assert.equal(preFix[0].outcome.error, 'dispatch-unverified');
+});
+
+test('C-1 COMPOSED: a run in EITHER bucket suppresses the flip; NO run anywhere still flips (the protection stays); the PAT-less lane degrades to main-only', () => {
+  const { state, issuedMs } = leasedFlippableState();
+  const run = { name: 'task-AR-C1 · succeed · a1', created_at: new Date(issuedMs + 60_000).toISOString() };
+  // a main-bucket run (the normal shape) is seen through the union too — the union only ADDS sight
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: unionSeenKeys(state, { repo2: REPO_2, pat: 'PAT-ORG', mainRuns: [run] }), nowMs: C1_T0 }).length, 0, 'main-bucket run: no flip');
+  // no run in EITHER bucket — the accepted-but-dropped class still flips
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: unionSeenKeys(state, { repo2: REPO_2, pat: 'PAT-ORG' }), nowMs: C1_T0 }).length, 1, 'the union is a superset — it never blinds the existing protection');
+  // no PAT: the plan is main-only, so the repo2-only run cannot verify (documented degradation — the union needs the same PAT the cross-repo dispatch already needs)
+  assert.equal(dispatchVerificationEvents({ state, seenKeys: unionSeenKeys(state, { repo2: REPO_2, pat: null, repo2Runs: [run] }), nowMs: C1_T0 }).length, 1, 'PAT-less lane: the scan cannot see the mirror');
+});
+
+test('C-1 wiring (source-pinned): the adapter\'s scan is the UNION — verifyScanRepoList drives a per-repo fetch loop, and any failure fails the WHOLE scan open', () => {
+  const src = readFileSync(new URL('../conductor/turn.mjs', import.meta.url), 'utf8');
+  assert.ok(src.includes('const scanRepos = verifyScanRepoList(REPO, WORKER_REPO_2, PAT);'), 'the scan plan consults the overflow lane + the PAT');
+  assert.ok(src.includes('for (const sr of scanRepos) {'), 'a per-repo fetch loop');
+  assert.ok(src.includes('sr === REPO ? TOKEN : PAT'), 'the second bucket\'s fetch rides the PAT (the cross-repo read)');
+  assert.ok(src.includes('seenKeysFromRuns(runs,'), 'ONE merged, time-correlated key set from every scanned repo');
+  assert.ok(src.includes('let scanOk = true;') && src.includes('if (scanOk) {'), 'any per-repo fetch failure voids the whole scan (fail-open — partial keys would flip every repo2-dispatched task)');
+  assert.ok(src.includes('VERIFY-SCAN-SKIPPED repo='), 'per-repo fetch failures are LOUD');
+  assert.ok(src.includes('VERIFY-SCAN repos='), 'the merged scan logs its repo count');
 });
