@@ -51,6 +51,17 @@
 //                        ceiling states (ok / APPROACHING / EXCEEDED),
 //                        parseSpendCeilingUsd's env matrix, the read-only
 //                        discipline (readJournals is a READ), the screen shape
+//   s21/O-2 + O-3        the honest latency line (p50-of-p50s + p95(max) of
+//                        the per-turn p95s — test-lane-telemetry.mjs) and the
+//                        KEY/HOP render (test-lane-telemetry.mjs); the CC
+//                        adapter's key-pick carry (test-cc-adapter.mjs)
+//   s21/O-4 + O-5        the rejected-configure feedback loop (the drain's
+//                        REJECTED CONTROL record names the command + minted
+//                        id, behavioral through conductorTick; the alert arm
+//                        source-pinned) and the permission GET's
+//                        transient/verdict split (5xx/network → one retry →
+//                        exit 4 RED, never a silent green; definitive
+//                        non-200s stay silent with ONE call)
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -91,13 +102,20 @@ const commentEvent = ({ issue = 1, nodeId = 'IC_node_123456', body = 'pause', au
   sender: { login: author },
 });
 
-// the REST seam: a recording fake — every call is asserted by shape
-function mkApi({ permission = 'write', permissionStatus = 200, commentStatus = 201, dispatchStatus = 204 } = {}) {
+// the REST seam: a recording fake — every call is asserted by shape.
+// s21/O-5: `permissionStatuses` (consumed one per permission call — the
+// transient/verdict sequences) and `permissionThrows` (network-level throws
+// on the first N permission calls) joined the knobs.
+function mkApi({ permission = 'write', permissionStatus = 200, permissionStatuses = null, permissionThrows = 0, commentStatus = 201, dispatchStatus = 204 } = {}) {
   const calls = [];
+  let permCall = 0;
   const api = async (path, method = 'GET', body = null) => {
     calls.push({ path, method, body });
     if (path.includes('/collaborators/') && path.endsWith('/permission')) {
-      return { status: permissionStatus, data: permissionStatus === 200 ? { permission } : null };
+      const n = permCall++;
+      if (n < permissionThrows) throw new Error('network down (injected)');
+      const st = permissionStatuses ? permissionStatuses[n] : permissionStatus;
+      return { status: st ?? permissionStatus, data: st === 200 ? { permission } : null };
     }
     if (path.endsWith('/comments') && method === 'POST') {
       return { status: commentStatus, data: { id: 555 } };
@@ -280,24 +298,72 @@ test('gate order: a non-command comment is zero work beyond the parse (no API, n
   assert.equal(writes.length, 0);
 });
 
-test('permission gate: fail-closed — stranger (non-200), read-class, and unverified all exit SILENTLY (no reply burned, nothing enqueued)', async () => {
+test('permission gate: fail-closed — stranger (404), definitive non-verdicts (403/422), read-class, and unverified all exit SILENTLY (no reply burned, nothing enqueued)', async () => {
   for (const { label, opts } of [
     { label: '404 stranger', opts: { permissionStatus: 404 } },
+    { label: '403 definitive', opts: { permissionStatus: 403 } },
+    { label: '422 definitive', opts: { permissionStatus: 422 } },
     { label: 'read-class', opts: { permission: 'read' } },
     { label: 'none-class', opts: { permission: 'none' } },
-    { label: 'non-JSON body', opts: { permissionStatus: 500 } },
   ]) {
     const { api, calls } = mkApi(opts);
     const { store, writes } = mkStore();
     const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
     assert.equal(r.outcome, 'silent-permission', label);
     assert.equal(r.exitCode, 0, label);
-    assert.equal(calls.length, 1, `${label}: exactly the ONE permission call fired`);
+    assert.equal(calls.length, 1, `${label}: exactly the ONE permission call fired (a definitive verdict never retries)`);
     assert.match(calls[0].path, /\/collaborators\/ops-writer\/permission$/, label);
     assert.equal(calls[0].method, 'GET', label);
     assert.equal(writes.length, 0, `${label}: nothing enqueued`);
     assert.equal(calls.filter(c => c.method === 'POST').length, 0, `${label}: no reply POST — a stranger's comment burns no comment`);
   }
+});
+
+// s21/O-5 (audit a5, MAJOR) — the transient/verdict split on the permission
+// GET. The old shape treated a 5xx exactly like a stranger's 404: exit 0,
+// green run, no ack, no trace — a transient failure at the exact moment an
+// operator sends `pause` during an incident silently swallowed a VALID
+// command. Now: ONE retry; still transient → exit 4 RED (visible, never a
+// false confirm, never a silent drop). Never a reply to an UNVERIFIED author
+// (the stranger-gate's own rationale holds).
+test('permission gate (s21/O-5): a transient 5xx retries ONCE — still failing → exit 4, nothing enqueued, no reply, TWO calls', async () => {
+  const { api, calls } = mkApi({ permissionStatuses: [500, 503] });
+  const { store, writes } = mkStore();
+  const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+  assert.equal(r.outcome, 'permission-check-failed');
+  assert.equal(r.exitCode, 4, 'the undecided check goes RED — the drop is visible, never a silent green');
+  assert.equal(writes.length, 0, 'fail-closed: an unverified author never gets a command enqueued');
+  assert.equal(calls.filter(c => c.method === 'POST').length, 0, 'no reply burned on an unverified author');
+  const permCalls = calls.filter(c => c.path.endsWith('/permission'));
+  assert.equal(permCalls.length, 2, 'exactly ONE retry (the nudge\'s single-retry pattern)');
+});
+
+test('permission gate (s21/O-5): a transient 5xx that RECOVERS on the retry → the command proceeds normally (the retry is not a penalty)', async () => {
+  const { api, calls } = mkApi({ permissionStatuses: [500, 200] });
+  const { store, writes } = mkStore();
+  const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+  assert.equal(r.outcome, 'queued');
+  assert.equal(r.exitCode, 0);
+  assert.equal(writes.length, 1, 'the command rode the recovered check');
+  assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 2);
+});
+
+test('permission gate (s21/O-5): a network-level THROW retries once — still down → exit 4 (the throw is not a verdict either)', async () => {
+  const { api, calls } = mkApi({ permissionThrows: 2 });
+  const { store, writes } = mkStore();
+  const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+  assert.equal(r.outcome, 'permission-check-failed');
+  assert.equal(r.exitCode, 4);
+  assert.equal(writes.length, 0);
+  assert.equal(calls.filter(c => c.method === 'POST').length, 0);
+  assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 2);
+  // throw-then-200: the retry recovers through the throw class too
+  const { api: api2, calls: calls2 } = mkApi({ permissionThrows: 1, permissionStatuses: [null, 200] });
+  const { store: store2, writes: writes2 } = mkStore();
+  const r2 = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api: api2, store: store2, now: NOW });
+  assert.equal(r2.outcome, 'queued');
+  assert.equal(writes2.length, 1);
+  assert.equal(calls2.filter(c => c.path.endsWith('/permission')).length, 2);
 });
 
 test('permission gate: write and admin both proceed', async () => {
@@ -655,6 +721,41 @@ test('F-12 round-trip: a re-delivered twin → a REJECTED journal record carryin
   assert.equal(dup.event_id, minted, 'the REJECTED record answers the MINTED id — the two layers join by the node id');
   // and the pause did not double-apply (idempotent consume)
   assert.equal(second.state.stats.rejected_events >= 1, true);
+});
+
+// s21/O-4 (audit a5, MAJOR) — the rejected-configure feedback loop. The
+// console acks "next tick applies"; the drain can REJECT the patch
+// (bad-patch-key/bounds/noop) and the operator used to learn NOTHING. Two
+// halves pinned here: (1) the drain's REJECTED CONTROL record names the
+// COMMAND + the minted event id (the alert arm's raw material — behavioral,
+// through the REAL conductorTick); (2) the conductor's alert arm exists with
+// the duplicate filter + the journal-id citation (source-pinned — the I/O
+// half is a self-executing script, the test-w2-conductor discipline).
+test('s21/O-4: a rejected configure → a REJECTED CONTROL record carrying command + the minted event id; the conductor alerts on it (source pin)', () => {
+  const s = bootOne();
+  // a configure with an UNKNOWN KNOB — valid JSON at the door, rejected at
+  // the drain (the exact false-confirmation shape: the ack said "next tick
+  // applies" and the knob never landed)
+  const rec = consoleQueueRecord({ command: 'configure', patch: { max_paralell: 8 }, author: OPS_USER, nodeId: 'IC_node_881', nowIso: iso(T0 + 60_000) });
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [], controlQueue: [rec],
+    ev: tickEv('n3'), now: () => iso(T0 + 61_000), nextMilestone: ONE_NM, recover: noRecover,
+    makeGenesis: () => ({ state: bootOne(), spec: {} }),
+  });
+  const rej = out.journal.find(j => j.kind === 'REJECTED' && j.origKind === 'CONTROL');
+  assert.ok(rej, 'the rejected configure is journaled');
+  assert.equal(rej.command, 'configure', 'the REJECTED record names WHICH command failed (s21/O-4 — the alert can say it)');
+  assert.equal(rej.reason, 'bad-patch-key(max_paralell)');
+  assert.equal(rej.event_id, `ctl-IC_node_881-configure-${T0 + 60_000}`, 'the minted id rides the record — the alert joins the ack\'s audit trail');
+  assert.equal(out.state.config.max_parallel, 4, 'the knob did NOT land (the rejection was real)');
+  // (2) the conductor's CONTROL-REJECTED arm — source pin (conductor/turn.mjs
+  // is a self-executing I/O script; same discipline as test-w2-conductor's
+  // adapter-wiring pins)
+  const src = readFileSync(join(ROOT, 'conductor/turn.mjs'), 'utf8');
+  assert.ok(src.includes("j.kind === 'REJECTED' && j.origKind === 'CONTROL'"), 'the alert scan has the CONTROL-REJECTED arm');
+  assert.ok(src.includes("j.reason !== 'duplicate'"), 'the F11 re-delivery duplicate class never alerts (a redelivered line would double-post)');
+  assert.match(src, /control REJECTED — \$\{j\.command \|\| 'control'\}: \$\{j\.reason\} \(journal \$\{j\.id\}/, 'the alert cites the command, the reason, and the journal id');
+  assert.ok(src.includes('j.event_id'), 'the alert carries the minted event id when present');
 });
 
 test('F-12 baseline pin: node_id-less records keep event_id = c.id — the mint NEVER fires for pre-console records', () => {

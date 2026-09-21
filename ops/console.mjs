@@ -40,6 +40,11 @@
 //       part of the job; the queue line itself holds)
 //   3 — the nudge dispatch failed (degraded, not lost: the next tick /
 //       backstop / pinger still drains the queue)
+//   4 — the permission check could not DECIDE (5xx/network after ONE retry;
+//       s21/O-5, audit a5: nothing enqueued, nothing replied, the run goes
+//       RED so the drop is VISIBLE — a transient failure during an incident,
+//       the exact moment an operator sends `pause`, must never swallow the
+//       command on a silently green run; re-send it)
 
 import { Store } from '../lib/store.mjs';
 import { pathToFileURL } from 'node:url';
@@ -484,10 +489,20 @@ export async function runConsole({ event, env = {}, api, store, now = () => new 
     return { outcome: 'silent-noncommand', exitCode: 0 };
   }
 
-  // gate 4 — the author permission gate (fail-closed): non-200 or below
-  // write → exit 0 SILENTLY. A stranger's command on the (public) ops issue
-  // must not burn a reply.
-  const pr = await api(`/repos/${repo}/collaborators/${encodeURIComponent(author)}/permission`);
+  // gate 4 — the author permission gate (fail-closed), s21/O-5 (audit a5):
+  //   200 + below write, or a DEFINITIVE non-200 (403/404/422 — the API
+  //   answered "not a collaborator" / "malformed") → exit 0 SILENTLY (a
+  //   stranger's command on the (public) ops issue must not burn a reply).
+  //   A TRANSIENT failure (5xx / a network throw) is NOT a verdict: ONE
+  //   retry, then exit 4 RED — the command is neither enqueued (fail-closed:
+  //   an unverified author never gets a command queued) nor silently dropped
+  //   (the old shape treated a 5xx exactly like a stranger's 404 — green run,
+  //   no ack, no trace; asymmetric with the reply-POST failure path's exit 2).
+  const pr = await permissionCheck(api, repo, author);
+  if (pr.undecided) {
+    console.error(`CONSOLE-PERMISSION-CHECK-FAILED @${author} — transient (5xx/network) after one retry, HTTP=${pr.status}; the command was NOT enqueued and NOT silently dropped: this run is RED by design (exit 4) — re-send the command`);
+    return { outcome: 'permission-check-failed', exitCode: 4 };
+  }
   const perm = pr.status === 200 && pr.data && typeof pr.data.permission === 'string' ? pr.data.permission : null;
   if (perm !== 'write' && perm !== 'admin') {
     console.log(`CONSOLE-SILENT: @${author} permission=${perm ?? 'unverified'} HTTP=${pr.status} (fail-closed — below write or unverified; no reply burned)`);
@@ -572,6 +587,23 @@ export async function runConsole({ event, env = {}, api, store, now = () => new 
 async function postComment(api, repo, issueNumber, body) {
   const r = await api(`/repos/${repo}/issues/${issueNumber}/comments`, 'POST', { body });
   return r.status === 201;
+}
+
+// s21/O-5 (audit a5): the permission GET with the transient/verdict split.
+// ONE retry on a 5xx or a network throw (the nudge's single-retry pattern);
+// a still-transient second attempt returns { undecided: true } — the caller
+// exits 4 (red), never a silent green. Definitive verdicts (200, 403/404/422)
+// return on the FIRST attempt — no retry delay on the stranger path.
+async function permissionCheck(api, repo, author) {
+  const path = `/repos/${repo}/collaborators/${encodeURIComponent(author)}/permission`;
+  const isTransient = (r) => !r || typeof r.status !== 'number' || (r.status >= 500 && r.status < 600);
+  let r = null;
+  try { r = await api(path); } catch { r = null; }   // network-level throw: DNS / socket / AbortSignal timeout
+  if (!isTransient(r)) return r;
+  await new Promise(res => setTimeout(res, 1000));
+  try { r = await api(path); } catch { r = null; }
+  if (!isTransient(r)) return r;
+  return { status: r ? r.status : 0, data: null, undecided: true };
 }
 
 async function nudgeTick(api, repo) {
