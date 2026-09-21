@@ -11,7 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { breakerDecision, alertDedup, LATCH_REPRIMES, DEDUP_WINDOW_MS } from '../lib/watchdog-core.mjs';
+import { breakerDecision, alertDedup, alertCommentsPath, ALERT_COMMENTS_PER_PAGE, LATCH_REPRIMES, DEDUP_WINDOW_MS } from '../lib/watchdog-core.mjs';
 
 const NOW = Date.parse('2026-09-13T12:00:00Z');
 const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
@@ -165,7 +165,8 @@ test('T45/F-D: the watchdog\'s own Bot marker <24h -> skip', () => {
 test('T45/F-D: operator reply newest + trusted marker 10min old IN the set -> skip (the per_page=1 regression)', () => {
   // OLD: per_page=1 + find() missed the marker behind the operator's reply ->
   // one extra marker comment per scan (~12/day while a human keeps replying).
-  // NEW: per_page=20 + newest-by-created_at among the fetched set.
+  // NEW: window-recent comments fetched WHOLE (s21/A-2) + newest-by-created_at
+  // among the set.
   const comments = [
     cm(3, { assoc: 'OWNER', login: 'xfnwpho1', body: 'investigating now' }),      // newest, NOT a marker
     cm(10, { assoc: 'COLLABORATOR', login: 'zikomolapoutl' }),                     // the marker, 10 min old
@@ -177,13 +178,72 @@ test('T45/F-D: operator reply newest + trusted marker 10min old IN the set -> sk
 });
 
 test('T45/F-D: trusted marker OUTSIDE the fetched set -> NO skip (fail-NOISY, never the suppress direction)', () => {
-  // 25 comments on the issue; the fetch (per_page=20) carries only replies —
-  // the newest marker fell out of the window. The decision can only see the
-  // fetched set: no marker -> post (an extra alert comment — bounded noise).
+  // 25 comments on the issue; the fetch carries only replies — the newest
+  // marker fell out of the window (the >100-updated-in-24h burst residual,
+  // s21/A-2). The decision can only see the fetched set: no marker -> post
+  // (an extra alert comment — bounded noise).
   const replies = Array.from({ length: 25 }, (_, i) => cm(i + 1, { assoc: 'CONTRIBUTOR', login: `r${i}`, body: 'looks bad' }));
   const d = alertDedup({ comments: replies, nowMs: NOW });
   assert.equal(d.skip, false);
   assert.equal(d.reason, 'no-marker');
+});
+
+test('s21/A-2: a >20-comments alert issue does NOT re-alert within the dedup window (the pagination seam is dead)', () => {
+  // THE latch-use-case pin: a sustained alert with the issue's comment count
+  // past 20. Law-20: sort/direction are IGNORED server-side — the OLD
+  // per_page=20&direction=desc fetch could return the OLDEST page (here the
+  // adversarial oldest-first order puts the fresh trusted marker LAST), the
+  // newest marker fell out of the fetched set, and the skip NEVER fired
+  // again: ~12 duplicate alert comments/day for the incident's duration —
+  // the T44 rate-limit class re-entering through pagination. The new fetch
+  // (alertCommentsPath: per_page=100 + since=<window floor>) returns every
+  // window-recent comment regardless of ordering.
+  const replies = Array.from({ length: 29 }, (_, i) => cm(i + 2, { assoc: 'CONTRIBUTOR', login: `r${i}`, body: 'looks bad' }));
+  const freshMarker = cm(10, { assoc: 'COLLABORATOR', login: 'zikomolapoutl' });
+  const worstOrder = [...replies, freshMarker];   // 30 comments, marker LAST (oldest-page-first)
+  // characterization: the OLD 20-slice was blind to the marker -> no skip
+  // (the duplicate-alert shape the fix kills)
+  assert.equal(alertDedup({ comments: worstOrder.slice(0, 20), nowMs: NOW }).skip, false,
+    'characterization: the pre-fix per_page=20 slice misses the marker (the A-2 seam)');
+  // the NEW fetch covers the whole window set -> the skip fires
+  const d = alertDedup({ comments: worstOrder, nowMs: NOW });
+  assert.equal(d.skip, true, 'the >20-comments issue dedups once the window-recent set is fetched whole');
+  assert.equal(d.markerAgeMin, 10);
+  assert.equal(d.markerBy, 'zikomolapoutl');
+  // order-independence holds at the larger page too (law-20 both orders)
+  const d2 = alertDedup({ comments: [...worstOrder].reverse(), nowMs: NOW });
+  assert.equal(d2.skip, true);
+  assert.equal(d2.markerAgeMin, 10);
+});
+
+test('s21/A-2: alertCommentsPath — per_page=100 + the since=<now-window> floor (the law-4 scan pattern on the comments endpoint)', () => {
+  assert.equal(ALERT_COMMENTS_PER_PAGE, 100, 'the page bound is 100 — a >20-comment issue fits on one page');
+  const p = alertCommentsPath('claudecode-headless/fsm-lab', 7, NOW);
+  assert.equal(p, `/repos/claudecode-headless/fsm-lab/issues/7/comments?per_page=100&since=${encodeURIComponent(new Date(NOW - DEDUP_WINDOW_MS).toISOString())}`);
+  // NO sort/direction params: law-20 says the server ignores them — the
+  // core is order-independent by created_at arithmetic, so ordering params
+  // would only imply a guarantee the API does not honor
+  assert.ok(!p.includes('sort='), 'no sort param (law-20: ignored server-side)');
+  assert.ok(!p.includes('direction='), 'no direction param');
+  // the floor tracks the window override (the dedup window IS the fetch window)
+  const p2 = alertCommentsPath('r/x', 9, NOW, { windowMs: 3600_000 });
+  assert.ok(p2.includes(encodeURIComponent(new Date(NOW - 3600_000).toISOString())), 'the since floor follows windowMs');
+  // a degenerate non-finite now -> the path still builds (no since floor —
+  // fetch the first page rather than throw; the caller owns the clock)
+  assert.doesNotThrow(() => alertCommentsPath('r/x', 9, NaN));
+  assert.equal(alertCommentsPath('r/x', 9, NaN), '/repos/r/x/issues/9/comments?per_page=100');
+});
+
+test('s21/A-2 (adapter seam): scan.mjs routes the alert-dedup fetch through alertCommentsPath — the blind inline URL is gone', async () => {
+  // scan.mjs is the un-importable adapter (main() runs at module load — the
+  // house conformance split); the seam pin is source-shape, mirroring the
+  // charter pins in test-gc.mjs: the fetch MUST go through the pure,
+  // behaviorally-pinned path builder, never back to an inline
+  // per_page=20&sort=... URL (law-20 makes those params decorative and the
+  // 20-bound structurally blind past 20 comments).
+  const src = await import('node:fs').then(fs => fs.readFileSync(new URL('../watchdog/scan.mjs', import.meta.url), 'utf8'));
+  assert.ok(src.includes('alertCommentsPath(REPO,'), 'the alert-dedup comments fetch goes through the pure path builder');
+  assert.ok(!src.includes('per_page=20&sort=created'), 'the pre-A-2 blind inline URL is dead in the adapter');
 });
 
 test('T45/F-D: law-20 order-independence — ascending vs descending server responses give IDENTICAL verdicts', () => {

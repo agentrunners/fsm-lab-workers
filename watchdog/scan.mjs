@@ -21,9 +21,11 @@
 //      fsm-tick dispatch, already printed in every alert body; derived state,
 //      nothing persisted). NOT latched -> re-prime.
 //   6. alert comments are 24h-deduped by the newest TRUSTED marker
-//      (lib/watchdog-core.mjs alertDedup — T45/F-D: per_page=20&desc fetch,
-//      newest-marker-by-created_at, author gate {MEMBER,COLLABORATOR,OWNER} ∪
-//      Bot — strangers cannot suppress a live alert).
+//      (lib/watchdog-core.mjs alertDedup — T45/F-D + s21/A-2: the comments
+//      fetch is per_page=100 + since=<now-24h>, so a >20-comment alert issue
+//      still dedups; newest-marker-by-created_at, author gate
+//      {MEMBER,COLLABORATOR,OWNER} ∪ Bot — strangers cannot suppress a live
+//      alert).
 //   7. if state.json is corrupt -> alert issue (the conductor self-heals on
 //      its next tick via findLastGoodState; if the chain is dead, the
 //      re-prime dispatch triggers that recovery path)
@@ -33,7 +35,7 @@
 
 import { Store } from '../lib/store.mjs';
 import {
-  breakerDecision, alertDedup, LATCH_REPRIMES,
+  breakerDecision, alertDedup, alertCommentsPath, LATCH_REPRIMES,
   gcDaysFromEnv, gcPlan, gcParseTouchLog, gcCommitMessage,
   GC_TREE_LIMIT, GC_DAY_MS,
 } from '../lib/watchdog-core.mjs';
@@ -78,13 +80,17 @@ async function openAlertIssue(body) {
     // T44 rate-limit: comment only if the last marker comment is older than
     // 24h — a corrupt-state chain firing every ~2h scan was commenting the
     // same alert 12x/day (the alert issue itself is already deduped to ONE).
-    // T45/F-D hardening: fetch per_page=20 (an operator reply being newest no
-    // longer hides the marker) + the dedup decision lives in
-    // lib/watchdog-core.mjs alertDedup — newest TRUSTED marker by created_at
-    // (order-independent; W2-b law-20: sort/direction are ignored server-side)
-    // + the author gate {MEMBER,COLLABORATOR,OWNER} ∪ Bot (strangers cannot
-    // suppress a live alert; the watchdog's own posts pass via type Bot).
-    const r = await api(`/repos/${REPO}/issues/${existing.number}/comments?per_page=20&sort=created&direction=desc`, 'GET');
+    // T45/F-D hardening: the dedup decision lives in lib/watchdog-core.mjs
+    // alertDedup — newest TRUSTED marker by created_at (order-independent;
+    // W2-b law-20: sort/direction are ignored server-side) + the author gate
+    // {MEMBER,COLLABORATOR,OWNER} ∪ Bot (strangers cannot suppress a live
+    // alert; the watchdog's own posts pass via type Bot).
+    // s21/A-2: the fetch is per_page=100 + since=<now-24h> (alertCommentsPath)
+    // — the old per_page=20 page could return the OLDEST comments once the
+    // issue passed 20 (the latch's own use case), the newest marker fell out
+    // of the fetched set, and the skip never fired again: ~12 dup
+    // alerts/day for the incident's duration.
+    const r = await api(alertCommentsPath(REPO, existing.number, Date.now()), 'GET');
     const dedup = alertDedup({ comments: r.data || [], nowMs: Date.now() });
     if (dedup.skip) {
       console.log(`WATCHDOG-ALERT-SKIP (recent trusted marker <24h on issue #${existing.number}: age=${dedup.markerAgeMin}min by=${dedup.markerBy})`);
