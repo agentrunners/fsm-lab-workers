@@ -247,3 +247,65 @@ test('laneSection (s21/O-2): p50-of-p50s and max-of-p95s render distinctly — t
   assert.match(noP95[0], /p95\(max\) \?ms/);
   assert.match(noP95[0], /p50 500ms/);
 });
+
+// ---------------------------------------------------------------------------
+// 10. s21/O-3 (audit a5, MAJOR) — the KEY line + the HOP rows. key_index/
+//     pool_size/hop_telemetry ride the REPORT records (the drain's
+//     laneOutcomeFields) but rendered NOWHERE before; the CC lane (the
+//     deployed mode) never even produced key_index — so the blind spot behind
+//     the live key failure modes (one key serving everything / a dead key)
+//     was undetectable from the operator's one screen.
+test('laneSection (s21/O-3): CC-lane-shaped REPORT records render the KEY spread (distinct indexes + pool size)', () => {
+  // the deployed CC shape after the carry: lane_stats + key_index/pool_size
+  // (0-based), NO hop_telemetry (real-lane-only producer)
+  const ccRecords = [
+    { kind: 'REPORT', task: 'A1', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0.001, p50_ms: 700, p95_ms: 900, models: {}, rate_classes: {} }, key_index: 0, pool_size: 2 },
+    { kind: 'REPORT', task: 'A2', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0.001, p50_ms: 800, p95_ms: 950, models: {}, rate_classes: {} }, key_index: 0, pool_size: 2 },
+    { kind: 'REPORT', task: 'A3', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0.001, p50_ms: 600, p95_ms: 880, models: {}, rate_classes: {} }, key_index: 0, pool_size: 2 },
+  ];
+  const one = laneSection([], ccRecords);
+  assert.equal(one[0], '- lanes: 3 calls (3 ok · 0×429 · 0×5xx) · p50 700ms · p95(max) 950ms · tokens 30 · cost $0.0030 · 3 turns (journal tail)');
+  // THE live blind-spot line: one key serving EVERY turn reads 1/2 — the
+  // W1/W3 failure-class signal an operator could not see before
+  assert.equal(one[1], '- lane keys: 1/2 distinct served (k0:3)');
+  // a spread across both keys (the W1 key-jump recovery shape)
+  const spread = laneSection([], [...ccRecords, { kind: 'REPORT', task: 'A4', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 5, cost: 0.001, p50_ms: 500, p95_ms: 700, models: {}, rate_classes: {} }, key_index: 1, pool_size: 2 }]);
+  assert.equal(spread[1], '- lane keys: 2/2 distinct served (k0:3 k1:1)');
+  // records WITHOUT pool_size → the distinct count alone (the base is honest)
+  const noPool = laneSection([], [{ kind: 'REPORT', task: 'B1', lane_stats: { calls: 1, ok: 1, tokens: 1, cost: 0, p50_ms: 5, p95_ms: 5, models: {}, rate_classes: {} }, key_index: 2 }]);
+  assert.equal(noPool[1], '- lane keys: 1 distinct served (k2:1)');
+  // old-format records (no key_index anywhere) → NO keys line, no crash
+  const legacy = laneSection([], [{ kind: 'REPORT', task: 'C1', lane_stats: { calls: 1, ok: 1, tokens: 1, cost: 0, p50_ms: 5, p95_ms: 5, models: {}, rate_classes: {} } }]);
+  assert.equal(legacy.length, 1, 'no key telemetry carried → the lanes line only (graceful)');
+});
+
+test('laneSection (s21/O-3): real-lane-shaped REPORT records render the HOP rows (model/ms/status, last N)', () => {
+  const realRecords = [
+    { kind: 'REPORT', task: 'D1', lane_stats: { calls: 2, ok: 1, err429: 1, err5xx: 0, tokens: 20, cost: 0, p50_ms: 100, p95_ms: 200, models: {}, rate_classes: {} }, key_index: 1, pool_size: 3, hop_telemetry: [
+      { model: 'nvidia/nemotron-3.5-lightning:free', ms: 100, status: 429 },
+      { model: 'z-ai/glm-5.3-flash', ms: 250, status: 200 },
+    ] },
+    { kind: 'REPORT', task: 'D2', lane_stats: { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0, p50_ms: 60, p95_ms: 60, models: {}, rate_classes: {} }, key_index: 2, pool_size: 3, hop_telemetry: [
+      { model: 'z-ai/glm-5.3-flash', ms: 60, status: 200 },
+    ] },
+  ];
+  const lines = laneSection([], realRecords);
+  assert.equal(lines[0], '- lanes: 3 calls (2 ok · 1×429 · 0×5xx) · p50 100ms · p95(max) 200ms · tokens 30 · cost $0.0000 · 2 turns (journal tail)');
+  assert.equal(lines[1], '- lane keys: 2/3 distinct served (k1:1 k2:1)');
+  // the hops render in journal order, newest last: the 429 hop is VISIBLE
+  assert.equal(lines[2], '- lane hops (last 3): nemotron-3.5-lightning:free 100ms 429 · glm-5.3-flash 250ms 200 · glm-5.3-flash 60ms 200');
+  // the window bound: only the LAST LANE_HOP_WINDOW hops render
+  const many = [];
+  for (let i = 0; i < 9; i++) {
+    many.push({ kind: 'REPORT', task: `E${i}`, lane_stats: { calls: 1, ok: 1, tokens: 1, cost: 0, p50_ms: 1, p95_ms: 1, models: {}, rate_classes: {} }, hop_telemetry: [{ model: `m${i}`, ms: i * 10, status: 200 }] });
+  }
+  const bounded = laneSection([], many);
+  assert.match(bounded[1], /^- lane hops \(last 6\): m3 30ms 200 · m4 40ms 200 · m5 50ms 200 · m6 60ms 200 · m7 70ms 200 · m8 80ms 200$/);
+  // the 'transport' status (never reached the model) renders verbatim
+  const transport = laneSection([], [{ kind: 'REPORT', task: 'F1', lane_stats: { calls: 1, ok: 0, err429: 0, err5xx: 0, tokens: 0, cost: 0, p50_ms: null, p95_ms: null, models: {}, rate_classes: {} }, hop_telemetry: [{ model: 'x/y', ms: 12, status: 'transport' }] }]);
+  assert.match(transport[1], /- lane hops \(last 1\): y 12ms transport/);
+  // the state-window fallback carries the SAME fields (last_result's spread)
+  const fallback = laneSection([{ id: 'G1', last_result: { status: 'done', lane_stats: { calls: 1, ok: 1, tokens: 2, cost: 0, p50_ms: 9, p95_ms: 9, models: {}, rate_classes: {} }, key_index: 0, pool_size: 2, hop_telemetry: [{ model: 'a/b', ms: 9, status: 200 }] } }]);
+  assert.equal(fallback[1], '- lane keys: 1/2 distinct served (k0:1)');
+  assert.match(fallback[2], /^- lane hops \(last 1\): b 9ms 200$/);
+});

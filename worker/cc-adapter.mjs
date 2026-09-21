@@ -644,6 +644,10 @@ export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
 // work-class result — the escalation would mask the diagnosis).
 // T46/W-D lane B: lane_stats rides the escalation too — the retry's console
 // view must see WHY the first attempt burned (the 429 class et al).
+// s21/O-3 (audit a5): key_index/pool_size ride EXACTLY like lane_stats —
+// the escalation is a reportable outcome shape; dropping the serving-key
+// carry here would punch a hole in the console's key-spread line exactly on
+// the artifact-push retry path.
 export function artifactPushEscalation(taskId, attempt, err, result) {
   return {
     status: 'infra_failed',
@@ -653,6 +657,8 @@ export function artifactPushEscalation(taskId, attempt, err, result) {
     telemetry: result.telemetry, models: result.models,
     lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
     ...(result.lane_stats ? { lane_stats: result.lane_stats } : {}),
+    ...(Number.isFinite(result.key_index) ? { key_index: result.key_index } : {}),
+    ...(Number.isFinite(result.pool_size) ? { pool_size: result.pool_size } : {}),
   };
 }
 
@@ -738,6 +744,10 @@ export async function ccTurn(envelope, opts = {}) {
   // bites first (the ABSOLUTE deadline still gates — F-G(a) arithmetic)
   const wallDeadlineMs = Math.min(envelope.deadline_ms, t0 + budget.wall_ms);
   const lanes = ccLanes(env);
+  // s21/O-3 (audit a5): the POOL SIZE — distinct keys in the product (the
+  // key-major flatten repeats each keyIndex once per model). This is the
+  // modulo-base half of the serving-key pair the outcome now carries.
+  const poolSize = new Set(lanes.map(l => l.keyIndex)).size;
   // the lane bound: budget.lane_attempts, clamped to the product's size
   const maxLanes = Math.min(lanes.length, Math.max(1, Math.min(8, budget.lane_attempts)));
 
@@ -980,6 +990,21 @@ export async function ccTurn(envelope, opts = {}) {
       // failures) attaches NOTHING — lane_stats is an optional field the
       // whole drain treats as absent-means-absent.
       const laneStats = collectLaneStats(laneLogPath);
+      // s21/O-3 (audit a5, MAJOR) — the CC lane's KEY PICK rides the outcome
+      // like the real lane's (worker/turn.mjs D3): `key_index` = the 0-based
+      // index into the pool ARRAY of the key that served the turn's LAST
+      // attempted lane (the laneLog's last entry — the answering lane on a
+      // done, the burned slot on exhaustion), `pool_size` = the pool's size.
+      // 0-based matches the journaled field's documented semantics ("an index
+      // into the pool ARRAY" — fsm.mjs's laneOutcomeFields comment; the
+      // laneLog/telemetry.lanes key_index stays the adapter's OWN 1-based
+      // display space, unchanged). Before this the CC lane's key pick NEVER
+      // rode the report — the live journal held ZERO key_index records, so
+      // even a rendered histogram would have been empty in the deployed mode.
+      const lastLane = laneLog.length ? laneLog[laneLog.length - 1] : null;
+      const laneKeyFields = lastLane && Number.isFinite(lastLane.key_index) && poolSize > 0
+        ? { key_index: lastLane.key_index - 1, pool_size: poolSize }
+        : {};
       // the write-back claim surface: the workdir scan — ONLY for lanes that
       // ran to rc 0 and answered (the raw-extraction path sets scan:true);
       // every failure shape carries [] like the shim's failure rows
@@ -988,6 +1013,7 @@ export async function ccTurn(envelope, opts = {}) {
         ...partial,
         artifact_refs: refs,
         ...(laneStats ? { lane_stats: laneStats } : {}),
+        ...laneKeyFields,
         telemetry: {
           turns: extra.turns ?? 0,
           wall_ms: now() - t0,
@@ -1057,6 +1083,7 @@ export async function ccTurn(envelope, opts = {}) {
             telemetry: result.telemetry, models: result.models,
             lane_attempts_used: result.lane_attempts_used, duration_ms: result.duration_ms,
             ...(result.lane_stats ? { lane_stats: result.lane_stats } : {}),
+            ...laneKeyFields,
           };
         }
         log(`CC-TRANSCRIPT-MISSED (best-effort for a ${internalCls.status} turn): ${String(e?.message ?? e).slice(0, 160)}`);

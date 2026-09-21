@@ -302,11 +302,18 @@ function epochSection(journalAll, spendCeilingUsd) {
 // / pre-fold) are skipped gracefully — absent everywhere → the single
 // "no telemetry" line. Pure + exported for the pins.
 export const LANE_JOURNAL_WINDOW = 64;
+// s21/O-3: how many hop rows render (the last N — the tail is the diagnosis)
+export const LANE_HOP_WINDOW = 6;
 
 const laneStatsGuard = (s) => s && typeof s === 'object' && !Array.isArray(s);
 
-// the shared accumulator: one lane_stats-shaped object per entry
-function accumulateLaneStats(statsList) {
+// the shared accumulator — one LANE RECORD per entry: an object carrying
+// .lane_stats plus the OPTIONAL sibling telemetry the drain journals beside it
+// (.key_index/.pool_size — D3/A4, and .hop_telemetry — the real lane's per-hop
+// rows). The journal path feeds the REPORT records themselves; the state
+// fallback feeds the tasks' last_result (the same field family — the drain's
+// laneOutcomeFields spreads into BOTH).
+function accumulateLaneStats(recs) {
   let calls = 0, ok = 0, err429 = 0, err5xx = 0, tokens = 0, cost = 0;
   // s21/O-2 (audit a5): BOTH latency arrays are collected — the per-record
   // p50_ms (the per-turn medians) AND the per-record p95_ms (the per-turn
@@ -316,7 +323,14 @@ function accumulateLaneStats(statsList) {
   const lat95 = [];
   const models = {};
   const classes = {};
-  for (const s of statsList) {
+  // s21/O-3 (audit a5): the KEY/POOL + HOP telemetry the drain journals but
+  // the console never rendered — the blind spot behind the live key failure
+  // modes (one key serving everything / a dead key undetectable from here).
+  const keys = {};      // key_index -> turns served (the window's spread)
+  let poolSize = null;  // the max pool_size seen (the pick's modulo base)
+  const hops = [];      // hop_telemetry rows, journal order
+  for (const r of recs) {
+    const s = r.lane_stats;
     calls += Number(s.calls) || 0;
     ok += Number(s.ok) || 0;
     err429 += Number(s.err429) || 0;
@@ -331,10 +345,17 @@ function accumulateLaneStats(statsList) {
     const p95v = fin(s.p95_ms);
     if (p50v !== null) lat50.push(p50v);
     if (p95v !== null) lat95.push(p95v);
+    if (Number.isFinite(r.key_index)) keys[r.key_index] = (keys[r.key_index] || 0) + 1;
+    if (Number.isFinite(r.pool_size) && (poolSize === null || r.pool_size > poolSize)) poolSize = r.pool_size;
+    if (Array.isArray(r.hop_telemetry)) {
+      for (const h of r.hop_telemetry) {
+        if (h && typeof h === 'object') hops.push({ model: h.model ?? null, ms: fin(h.ms), status: h.status ?? null });
+      }
+    }
     for (const [m, mm] of Object.entries(s.models || {})) models[m] = (models[m] || 0) + (Number(mm.calls) || 0);
     for (const [k, v] of Object.entries(s.rate_classes || {})) classes[k] = (classes[k] || 0) + (Number(v) || 0);
   }
-  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes };
+  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes, keys, poolSize, hops };
 }
 
 function renderLaneLines(acc, sourceLabel) {
@@ -358,6 +379,26 @@ function renderLaneLines(acc, sourceLabel) {
   const lines = [
     `- lanes: ${acc.calls} calls (${acc.ok} ok · ${acc.err429}×429 · ${acc.err5xx}×5xx) · p50 ${p50 ?? '?'}ms · p95(max) ${p95max ?? '?'}ms · tokens ${acc.tokens} · cost $${acc.cost.toFixed(4)} · ${sourceLabel}`,
   ];
+  // s21/O-3 (audit a5, MAJOR): the KEY line — distinct key_indexes served in
+  // the window + the pool size (the pick's modulo base, max seen). §D4's
+  // promised "key-pool spread": one key serving every turn (the live CC
+  // shape) reads as `1/2 distinct (k0:7)` — the W1/W3 failure-class signal.
+  // Rendered only when the records carry key_index (old-format/pre-carry
+  // records degrade to no line, never a crash).
+  const keyIdx = Object.keys(acc.keys);
+  if (keyIdx.length) {
+    const spread = keyIdx.sort((a, b) => Number(a) - Number(b)).map(k => `k${k}:${acc.keys[k]}`).join(' ');
+    lines.push(`- lane keys: ${keyIdx.length}${acc.poolSize != null ? `/${acc.poolSize}` : ''} distinct served (${spread})`);
+  }
+  // s21/O-3: the HOP rows — the real lane's per-hop {model, ms, status}
+  // telemetry, journaled since W-D lane B and rendered NOWHERE before. The
+  // last 6 hops (newest last, journal order); 'transport' statuses are the
+  // never-reached-the-model class.
+  if (acc.hops.length) {
+    const last = acc.hops.slice(-LANE_HOP_WINDOW);
+    const rows = last.map(h => `${h.model != null ? String(h.model).split('/').pop() : '?'} ${h.ms != null ? h.ms : '?'}ms ${h.status ?? '?'}`).join(' · ');
+    lines.push(`- lane hops (last ${last.length}): ${rows}`);
+  }
   if (top) lines.push(`- lane models: ${top}${cls ? ` · limits: ${cls}` : ''}`);
   return lines;
 }
@@ -365,13 +406,14 @@ function renderLaneLines(acc, sourceLabel) {
 export function laneSection(tasks, journalReports = null) {
   // PRIMARY: the journal tail's REPORT records (the caller read them via
   // store.readJournalTail(LANE_JOURNAL_WINDOW, 'REPORT')). Old-format
-  // records without lane_stats are skipped, never crash the screen.
+  // records without lane_stats are skipped, never crash the screen. The
+  // records feed the accumulator WHOLE — their key_index/pool_size/
+  // hop_telemetry siblings ride the same spread the drain journaled (s21/O-3).
   if (Array.isArray(journalReports) && journalReports.length) {
-    const statsList = journalReports
-      .filter(r => r && r.kind === 'REPORT' && laneStatsGuard(r.lane_stats))
-      .map(r => r.lane_stats);
-    if (statsList.length) {
-      return renderLaneLines(accumulateLaneStats(statsList), `${statsList.length} turns (journal tail)`);
+    const laneRecords = journalReports
+      .filter(r => r && r.kind === 'REPORT' && laneStatsGuard(r.lane_stats));
+    if (laneRecords.length) {
+      return renderLaneLines(accumulateLaneStats(laneRecords), `${laneRecords.length} turns (journal tail)`);
     }
   }
   // FALLBACK: the state-side view (last_result — the fast pre-terminal
@@ -379,7 +421,7 @@ export function laneSection(tasks, journalReports = null) {
   const withStats = (tasks || []).filter(t => t?.last_result && laneStatsGuard(t.last_result.lane_stats));
   if (!withStats.length) return ['- lanes: no telemetry yet (pre-W-D records or no turns since the fold)'];
   return renderLaneLines(
-    accumulateLaneStats(withStats.map(t => t.last_result.lane_stats)),
+    accumulateLaneStats(withStats.map(t => t.last_result)),
     `${withStats.length} tasks (state window)`,
   );
 }
