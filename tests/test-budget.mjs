@@ -22,7 +22,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { genesis, apply, rebuild, invariants } from '../lib/fsm.mjs';
 import {
-  conductorTick, isQuotaDetail, specToTask, DISPATCH_COST_MS, dispatchBudgetFromWall,
+  conductorTick, isQuotaDetail, specToTask, specLeaseMinutes, DISPATCH_COST_MS, dispatchBudgetFromWall,
   dispatchVerificationEvents, VERIFY_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
@@ -543,4 +543,20 @@ test('s21/C-3: a straggler\'s terminal infra-exhausted quarantine does NOT arm t
   assert.ok(r.state.tasks[id].history.some(h => h.why === 'infra-exhausted' || h.status === 'quarantined'), 'the quarantine is journaled');
   assert.ok(!r.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'the backstay/backstop did NOT arm from the straggler (stale pre-clear lane state)');
   assert.ok((r.state.budget_window || []).every(e => e.straggler), 'the terminal entry is straggler-marked');
+});
+
+// ---------------------------------------------------------------------------
+// s21/A4-F1 — the lease_minutes carry (the door-validated knob actually
+// lands in the genesis config — was silently dropped; the d2 agent's code,
+// the orchestrator's pins)
+// ---------------------------------------------------------------------------
+
+test('s21/A4-F1: specLeaseMinutes — the door-bounds parse ([1,120], the YAML string case)', () => {
+  assert.equal(specLeaseMinutes({ lease_minutes: '45' }), 45, 'the string form (the door keeps YAML scalars as strings)');
+  assert.equal(specLeaseMinutes({ lease_minutes: 60 }), 60, 'the int form');
+  assert.equal(specLeaseMinutes({ lease_minutes: 0 }), null, 'below bounds');
+  assert.equal(specLeaseMinutes({ lease_minutes: 121 }), null, 'above bounds');
+  assert.equal(specLeaseMinutes({ lease_minutes: 'garbage' }), null, 'NaN-safe');
+  assert.equal(specLeaseMinutes({}), null, 'absent -> null (the chain config stands)');
+  assert.equal(specLeaseMinutes(null), null, 'null-spec safe');
 });
