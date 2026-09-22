@@ -518,7 +518,13 @@ async function main() {
     // advice). The twin journals REJECTED + the log line; that is the whole
     // visible trace it needs.
     if (j.kind === 'REJECTED' && j.origKind === 'CONTROL' && j.reason !== 'duplicate' && j.reason !== 'reset-duplicate') {
-      await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
+      // s22/m-4: the O-4 alert POST is CHECKED — a non-201 logs LOUDLY (the
+      // same law-5 shape every other alert lane carries). The operator's
+      // broken-knob feedback loop breaks TWICE if the rejection alert itself
+      // dies silently: the console ack said queued, the drain rejected, and
+      // the tell-the-operator comment vanished — the knob looks landed.
+      const okRejected = await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
+      if (!okRejected) console.log(`CONTROL-REJECTED-ALERT-FAILED journal=${j.id} command=${j.command || 'control'} (law 5: visible, non-fatal — the REJECTED record is the durable signal; the next rejected control re-attempts the comment)`);
     }
     if (j.kind === 'BUDGET') {
       // F-10: the observable pacing signal — one log line per exhausted tick
