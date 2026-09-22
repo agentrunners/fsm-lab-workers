@@ -134,7 +134,14 @@ test('validate: artifacts bind to the MINTED id (m-4) + the .. traversal fold', 
 
 test('validate: lease_minutes + milestone bounds; mode vocabulary', () => {
   assert.ok(validateSpec({ ...VALID, lease_minutes: 45, milestone: 2, mode: 'cc' }, { issue: 1 }).ok);
-  for (const lm of [0, 121, -1, 'x']) assert.ok(!validateSpec({ ...VALID, lease_minutes: lm }, { issue: 1 }).ok, `lease_minutes ${lm} rejected`);
+  // s22/B-1: the floor moved 1 -> 3 (the advertised bounds and the enforcement
+  // together): 3 is the minimum legal lease; 1-2 are the work-destroying trap
+  // (envelope deadline = min(lease,48) - 120s <= 0 at assign) and now REJECTED
+  // at the door — the carry (specLeaseMinutes) clamps any pre-floor queue line
+  assert.ok(validateSpec({ ...VALID, lease_minutes: 3 }, { issue: 1 }).ok, 'the floor 3 is legal');
+  for (const lm of [0, 1, 2, 121, -1, 'x']) assert.ok(!validateSpec({ ...VALID, lease_minutes: lm }, { issue: 1 }).ok, `lease_minutes ${lm} rejected`);
+  const v2 = validateSpec({ ...VALID, lease_minutes: 2 }, { issue: 1 });
+  assert.ok(v2.errors.some(e => e.includes('lease_minutes 2 is outside [3, 120]')), 'the rejection names the NEW bounds (the how-to text and the error agree)');
   for (const ms of [0, 10]) assert.ok(!validateSpec({ ...VALID, milestone: ms }, { issue: 1 }).ok, `milestone ${ms} rejected`);
   assert.ok(!validateSpec({ ...VALID, mode: 'docker' }, { issue: 1 }).ok, 'unknown mode');
 });

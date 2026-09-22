@@ -548,15 +548,72 @@ test('s21/C-3: a straggler\'s terminal infra-exhausted quarantine does NOT arm t
 // ---------------------------------------------------------------------------
 // s21/A4-F1 — the lease_minutes carry (the door-validated knob actually
 // lands in the genesis config — was silently dropped; the d2 agent's code,
-// the orchestrator's pins)
+// the orchestrator's pins). s22/B-1 adds the FLOOR: the carried value is
+// bounded to [LEASE_FLOOR_MINUTES(3), 120] (the envelope deadline =
+// min(lease,48) − 120s must be > 0 at assign — a carried 1-2 is the
+// work-destroying trap lens-1 verified live in the e2e recovery drill).
 // ---------------------------------------------------------------------------
 
-test('s21/A4-F1: specLeaseMinutes — the door-bounds parse ([1,120], the YAML string case)', () => {
+test('s21/A4-F1 + s22/B-1: specLeaseMinutes — the door-bounds parse ([1,120] in, FLOOR 3 out; the YAML string case)', () => {
   assert.equal(specLeaseMinutes({ lease_minutes: '45' }), 45, 'the string form (the door keeps YAML scalars as strings)');
   assert.equal(specLeaseMinutes({ lease_minutes: 60 }), 60, 'the int form');
-  assert.equal(specLeaseMinutes({ lease_minutes: 0 }), null, 'below bounds');
+  assert.equal(specLeaseMinutes({ lease_minutes: 3 }), 3, 'the floor itself passes through');
+  // THE s22/B-1 CLAMP: 1-2 are in the parse window but OUT of the safe
+  // window — the carry floors them (a pre-floor queue line still lands a
+  // sane lease; the door now REJECTS these at intake)
+  assert.equal(specLeaseMinutes({ lease_minutes: 2 }), 3, 'the trap value 2 clamps UP to the floor 3');
+  assert.equal(specLeaseMinutes({ lease_minutes: '1' }), 3, 'the trap value 1 (string form) clamps to 3');
+  assert.equal(specLeaseMinutes({ lease_minutes: 0 }), null, 'below the parse window -> null (the chain config stands)');
   assert.equal(specLeaseMinutes({ lease_minutes: 121 }), null, 'above bounds');
   assert.equal(specLeaseMinutes({ lease_minutes: 'garbage' }), null, 'NaN-safe');
   assert.equal(specLeaseMinutes({}), null, 'absent -> null (the chain config stands)');
   assert.equal(specLeaseMinutes(null), null, 'null-spec safe');
+});
+
+// s22/B-1 + R2-4a: the CARRY pins — the floor is load-bearing at BOTH carry
+// sites (the rollover and the reset from_queue). A spec with lease_minutes=45
+// must land state.config.lease_minutes === 45; a pre-floor spec (2) must land
+// the FLOOR 3 (the deadline = min(lease,48) − 120s must be > 0 at assign).
+// Inverts cleanly: floor the clamp away and the =3 pins fail (mutation check).
+test('s22/B-1 + R2-4a: the carry lands lease_minutes in the genesis config — the rollover lane AND the reset from_queue lane', () => {
+  const carry = (spec, { lane = 'rollover', patch = {} } = {}) => {
+    // a DONE+HALTED epoch (the rollover shape) + one queued spec line
+    const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+    let s = genesis({ config: CFG, project: { tasks: ONE.m1, milestones: 1 }, chainId: `c-b1-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:00.000Z' });
+    s = apply(s, { kind: 'TICK', event_id: 'tk-b1', ts: '2026-09-06T10:00:00.000Z', actor: 'chain' }, '2026-09-06T10:00:00.000Z', nextMilestoneFactory(ONE)).state;
+    s = apply(s, { kind: 'REPORT', event_id: 'rep-b1', task: 'X', lease: s.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, '2026-09-06T10:00:01.000Z', nextMilestoneFactory(ONE)).state;
+    assert.equal(s.project.phase, 'done');
+    const qline = { issue: 51, body_sha8: 'b1abcd12', spec: { title: 'carry pin', accept: 'x', ...spec }, enqueued_at: '2026-09-06T10:00:02.000Z', author: 'op' };
+    const ctl = lane === 'direct-reset'
+      ? [{ cmd: 'reset', id: 'ctl-b1-rq', ts: '2026-09-06T10:00:03.000Z', sender: 'op', note: 'carry pin', patch: { from_queue: true } }]
+      : [];
+    const out = conductorTick({
+      cur: structuredClone(s), queue: [], controlQueue: ctl, queueBad: [], ctlBad: [],
+      intakeQueue: [qline], intakeBad: [],
+      ev: lane === 'direct-reset' ? { kind: 'CONTROL', command: 'reset', event_id: 'ctl-b1-direct', ts: '2026-09-06T10:00:03.000Z', patch: { from_queue: true } } : { kind: 'TICK', event_id: 'tk-b1b', ts: '2026-09-06T10:00:04.000Z', actor: 'chain' },
+      now: () => '2026-09-06T10:00:05.000Z', nextMilestone: nextMilestoneFactory(ONE), recover: () => null,
+      makeGenesis: ({ config, spec, issue }) => {
+        const g = genesis({
+          config, project: { tasks: [{ id: spec?.id || `task-i${issue}`, title: spec?.title || `intake ${issue}`, behavior: spec?.behavior || 'real', work_ms: 4000, deps: [], spec: { accept: spec?.accept, issue } }], milestones: 1 },
+          chainId: `c-b1-g-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:05.000Z', issue: issue ?? null,
+        });
+        return { state: g, spec: { tasks: [], milestones: 1, chainId: 'c-b1-g', mode: 'mock' } };
+      },
+    });
+    return out;
+  };
+  // the rollover lane: 45 rides verbatim; 2 lands the floor
+  const r45 = carry({ lease_minutes: 45 });
+  assert.equal(r45.state.config.lease_minutes, 45, 'ROLLOVER: the spec 45 rides the genesis config verbatim');
+  assert.equal(r45.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset')?.genesisSpec?.config?.lease_minutes, 45, 'the journal genesisSpec carries 45 (rebuild replays the same lease)');
+  const r2 = carry({ lease_minutes: 2 });
+  assert.equal(r2.state.config.lease_minutes, 3, 'ROLLOVER: a pre-floor spec 2 lands the FLOOR 3 (the deadline stays > 0 at assign)');
+  // the reset from_queue lane (direct dispatch): same two pins
+  const d45 = carry({ lease_minutes: 45 }, { lane: 'direct-reset' });
+  assert.equal(d45.state.config.lease_minutes, 45, 'RESET from_queue: the spec 45 rides the genesis config');
+  const d2 = carry({ lease_minutes: 2 }, { lane: 'direct-reset' });
+  assert.equal(d2.state.config.lease_minutes, 3, 'RESET from_queue: a pre-floor spec 2 lands the FLOOR 3');
+  // absent lease -> the chain's current config stands (the A4-F1 null path)
+  const rNone = carry({});
+  assert.equal(rNone.state.config.lease_minutes, CFG.lease_minutes, 'absent lease_minutes: the chain config stands (15)');
 });
