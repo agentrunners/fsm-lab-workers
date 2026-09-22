@@ -40,7 +40,7 @@ const BATTERIES = {
   'burst12': { load: () => import('./batteries/burst12.mjs'), quick: '12 tasks, cap(5) live, 2×9-min grinds, 12-child CAS storm', full: 'same + 3-seed sweep of the drain baseline' },
   'quota-wall': { load: () => import('./batteries/quota-wall.mjs'), quick: 'PoolLane 8 keys × quota 2 × 12 tasks (the X23 arc)', full: 'parameterized sweep: (keys × quota × tasks × pre-exhaust) matrix' },
   'dead-key-storm': { load: () => import('./batteries/dead-key-storm.mjs'), quick: '2-key CC lane + 4-key free pool, 50% dead', full: 'storm matrix: 50% / 100% dead × CC-lane / free-lane' },
-  'journal-flood': { load: () => import('./batteries/journal-flood.mjs'), quick: '2k events / 4 rotations + 100-report dup storm + pagination model', full: '10k events / 20+ rotations + 30d marker noise + pagination model' },
+  'journal-flood': { load: () => import('./batteries/journal-flood.mjs'), quick: '~2.9k events / 5+ rotations, dedup_window=16 eviction lane, 675 markers (7d) vs the 64-window, 24-scan pagination model', full: '~10k events / 20+ rotations, 2880 markers (30d), 60-scan sustained-latch pagination (5 virtual days) + the LATCHED-body divergence' },
   'soak30d': { load: () => import('./batteries/soak30d.mjs'), quick: '30 virtual days, duty scan every 60min', full: '30 days + duty-cadence sensitivity (30/60/120min) + dead-pinger lane' },
   'chaos': { load: () => import('./batteries/chaos.mjs'), quick: '~12 seeded SIGKILLs across the boundaries, 12 tasks', full: '50 seeded SIGKILLs, 18 tasks' },
 };
