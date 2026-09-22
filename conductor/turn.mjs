@@ -33,7 +33,7 @@ import { genesis, apply } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
+  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specEpoch, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
   dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
   chainContinuationDecision,
@@ -200,18 +200,26 @@ async function main() {
     const cfg = config || DEFAULT_CFG();
     const chainId = `c-${Date.now()}`;
     if (spec) {
-      // specToTask (conductor-core) is the CANONICAL mapper — the door's
-      // pure half parity-pins the same shape at integration.
+      // specEpoch (conductor-core) is the CANONICAL mapper — the door's
+      // pure half parity-pins the same shape at integration. s22/B-1: a
+      // spec carrying a `tasks` array (the door's multi-task form) maps
+      // EVERY entry through specToTask; a plain spec maps its single task —
+      // ONE mapper for both lanes.
       // T46/W-C1-R (lens-1 BLOCKING-1 adapter half): spec epochs carry
       // milestones_total=1 — the task IS the project; the clock's
       // milestones_total bound (fsm.mjs pass 5) then NEVER consults the
       // mock drill's generator for an intake epoch (the live sprout bug:
       // every intake epoch ran the mock M2+M3 — ~10 phantom dispatches —
-      // before the rollover could fire). The spec's `milestone` key stays
-      // door-validated metadata for W-D's multi-task epochs (inert here).
-      const task = specToTask(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
-      const g = genesis({ config: cfg, project: { tasks: [task], milestones: 1 }, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
-      return { state: g, spec: { tasks: [task], milestones: 1, chainId, mode: g.project.mode } };
+      // before the rollover could fire). s22/B-1 keeps milestones_total=1
+      // for the MULTI-task form too ("the task SET is the project") —
+      // B-1's `milestones_total = tasks.length` formula would fire the
+      // generator at milestone 1 < N and re-sprout the exact bug the
+      // bound killed (see specEpoch's comment + the no-sprout pin). The
+      // spec's (and each entry's) `milestone` key stays door-validated
+      // metadata for W-D's milestone-aware epochs (inert here).
+      const ep = specEpoch(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
+      const g = genesis({ config: cfg, project: ep, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
+      return { state: g, spec: { tasks: ep.tasks, milestones: ep.milestones, chainId, mode: g.project.mode } };
     }
     const mp = mockProject();
     const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now(), mode: EPOCH_MODE });
