@@ -437,3 +437,25 @@ reports drain, or accept the double-resume as operator routine.
 - The m-8 fail-closed console gate live: a command on the wrong issue is silently ignored (no queue burn, no false epoch).
 
 **The residual recorded honestly:** the write-invitation acceptance was a one-time operator action; the LAB_PAT identity now holds write on both buckets (its blast radius grew — noted for the PAT-scope-audit duty). The mirror's OWN conductor/consumer duties woke on my two probe dispatches and quiesced harmlessly (its own fsm-state is a halted chain — no cross-talk).
+
+## W1 — the key-jump live verification + THE SINGLE-FUNDED-KEY FINDING (2026-09-22, session 22)
+
+**The setup:** main @ the s22 fold merge (CI green #6), the chain halted+quiescent (the X26 close), the CC lane deployed [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2]. The drill: swap the primary to the dead-401 or-027, run single-task mode:cc epochs (T-W1 via intake issue #16, T-W2 via #17 — the rollover consumed each on the halt), watch the lane ladder.
+
+**The arc (three worker runs, all live):**
+1. Lane 1 (k1 = or-027, dead): the CC CLI's bridge calls 401 ("User not found") ×12 retries → `CC-LANE-EXIT rc=1 api_error_status=401`.
+2. **THE KEY-JUMP FIRED** (the s21/W1 fix's first live proof): lane 2 = k2 — NOT k1's next model. The pre-fix key-major flatten would have burned every lane on the dead key (the designed-but-unreachable failover); the observed ladder rotated the KEY exactly as designed.
+3. Lane 2 (k2 = or-075, the deployed KEY_2): **402** ("This request requires more credits... You requested up to 32000 tokens") — THE FINDING: the landing key was DRAINED (~$0.002 left). Lane 3 (k2 + glm-5.3-flash): 402 again (the ladder's second model is ALSO paid).
+4. `WORKER-DONE outcome=infra_failed` — the lane-exhaustion class, NET-ZERO (attempts stayed 1 through three runs: the infra-retry ladder re-dispatched twice, then the infra-exhaustion QUARANTINE landed with the distinct audit detail `lane-exhausted(3/6 lanes, last lane-402)`). The task never burned a work attempt; the chain never stopped.
+5. **The telemetry**: every report carries `key_index: 1, pool_size: 2` — the O-3 carry renders the SERVING key's index; the jump is VISIBLE on the console's LANE line without reading run logs.
+
+**The remediation live (mid-drill):** KEY_2 or-075 → or-082 (probe-verified 200 on deepseek) — but T-W2 (the complete-arc attempt, fired after the swap) STILL 402'd: **OpenRouter's pre-flight is max_tokens-proportional** — the CC CLI requests max_tokens=32000 (~$0.019 max cost at deepseek completion pricing); or-082's account holds ~$0.01 (passes at max_tokens=16, 402s at 4000). The probe matrix: or-074 32000→200 (the ONLY funded key, ~$8.8); or-082 32000→402, 4000→402, 16→200; or-075 hard-402.
+
+**What W1 proves:**
+- The KEY-JUMP mechanism END-TO-END: 401 on lane 1 → the key rotation → lane 2 on the SECOND key (the report's key_index=1). The W1 fix is live-green.
+- The infra-failure machinery: net-zero retries (attempts 1 through 3 runs), the infra-exhaustion quarantine with the distinct audit detail — zero work-attempt burn, the chain never halted mid-drill.
+- The O-3 key/pool telemetry renders the failover from the journal alone.
+
+**THE OPERATOR FINDING (the drill's real catch):** the fleet has exactly ONE funded paid key (or-074, ~$8.8 — the CC lane's only servable lane). The 2-key failover is mechanically real but economically SINGLE-POINT: or-075 (~$0.002) and or-082 (~$0.01) both fail the 32000-token pre-flight. The redundancy needs a FUNDED second key (a top-up — the operator's action, recorded in OPERATOR-ACTIONS). Candidate code improvement noted in PLAN: the CC ladder's free-model tail (a last-resort lane ANY key can serve — the pre-flight is $0 at free models).
+
+**The residual recorded honestly:** the drills ran with the primary swapped dead for ~50 minutes (14:49-15:45Z); the swap + restore are both 204-verified; the T-W1/T-W2 epochs are quarantined-terminal on the chain (the failure-machinery's own design); the EPOCH_MODE var stayed `mock` (the envelope's per-task mode:cc drove the CC lane — the per-spec mode precedence working as designed).
