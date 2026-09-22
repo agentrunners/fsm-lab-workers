@@ -136,3 +136,4 @@
 {"id":"e136","ts":"2026-09-18T05:46:19.611Z","applied":true,"kind":"PRUNE","task":"T-207","from_status":"quarantined"}
 {"id":"e137","ts":"2026-09-18T05:46:53.873Z","applied":true,"kind":"REPORT","task":"T-302","lease":"l-1ead5beec3ba","to":"done","run_id":"35312120122","from":"assigned"}
 {"id":"e138","ts":"2026-09-18T05:46:53.873Z","applied":true,"kind":"PHASE","from":"executing","to":"done","stats":{"done":14,"failed":0,"quarantined":4,"cancelled":0,"retries":10,"orphaned_reports":0,"rejected_events":3,"timeouts":9,"dispatched":28,"infra_retries":0,"taskCount":18},"taskIds":["T-101","T-102","T-103","T-104","T-105","T-106","T-107","T-108","T-201","T-202","T-203","T-204","T-205","T-206","T-207","T-208","T-301","T-302"]}
+{"id":"e139","ts":"2026-09-22T20:09:34.652Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1790107774652","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
