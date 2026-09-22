@@ -33,9 +33,10 @@
 //                 -> exactly ONE dispatch per task (the C-2 pin) -> the
 //                 mirror run in bucket 2 -> the union verify scan sees it
 //                 (the C-1 pin).
-//   recovery      corrupt tip -> watchdog alert -> law-20 >20-comments
-//                 pagination break characterized (the a3/A2 duplicate alert)
-//                 -> history-walk heal -> healthy scan.
+//   recovery      corrupt tip -> watchdog alert -> the A-2 law-20 residual
+//                 characterized at its >100-in-window boundary (bounded
+//                 one-extra-alert; the <=100 zone protected — s22/M-2) ->
+//                 history-walk heal -> healthy scan.
 //
 // The DRILL-REPORT: per-phase PASS/FAIL + per-hop latencies (dispatch->run
 // start, run wall) + scheduler capacity metrics (criterion 4's cadence
@@ -87,6 +88,11 @@ const { createWorld } = await import('./lib/world.mjs');
 const { createScheduler } = await import('./lib/scheduler.mjs');
 const { genesis } = await import('../lib/fsm.mjs');
 const { Store } = await import('../lib/store.mjs');
+// s22/M-2: the watchdog's REAL comments-fetch path — the LAW20-PAGINATION
+// phase fetches through the EXACT path the live scan builds (per_page=100 +
+// since=<window floor>), imported from the module under test, never a
+// re-derived twin.
+const { alertCommentsPath } = await import('../lib/watchdog-core.mjs');
 
 const log = (msg) => console.log(`[drill] ${msg}`);
 
@@ -264,13 +270,6 @@ async function watchdogScan() {
   const run = sched.runWatchdogScan();
   await until(() => run.status === 'completed', { timeoutMs: 30_000, label: `watchdog run ${run.id}` });
   return sched.runLogText(run.id);
-}
-
-async function fetchCommentsPage(issueN) {
-  const r = await fetch(`${apiBase}/repos/local/fsm-lab/issues/${issueN}/comments?per_page=20&sort=created&direction=desc`, {
-    headers: { Authorization: 'token drill-job-token', Accept: 'application/vnd.github+json' },
-  });
-  return r.status === 200 ? await r.json() : [];
 }
 
 // =====================================================================================
@@ -604,8 +603,12 @@ async function runOverflow() {
   // (done); OV-B runs 'hang' (silent by design — its lease stays outstanding
   // so the law-4 UNION scan has a live subject).
   sched.setVars({ WORKER_REPO_2: world.repo2, WORKER_OVERFLOW_AT: 1 });
+  // (s22/B-1 consequence — the seed's lease: 1 was THE trap value: the
+  // envelope deadline = min(1min,48) − 120s is −60s at mint, every worker
+  // start-gate rejects 'late-start', the epoch loops re-dispatch — the exact
+  // live verification lens-1 cited. The drill seeds a SANE chain: floor 3.)
   const g = genesis({
-    config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 2, lease_minutes: 3, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
     project: { tasks: [
       { id: 'OV-A', title: 'main-lane task', behavior: 'fast', work_ms: 100, deps: [] },
       { id: 'OV-B', title: 'bucket-2 task', behavior: 'hang', work_ms: 100, deps: [] },
@@ -628,20 +631,30 @@ async function runOverflow() {
     const dispatchLedger = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && (e.req || '').includes('"fsm-task"'));
     t.ok(dispatchLedger.length === 2, 'exactly TWO worker dispatches (one per task)', `n=${dispatchLedger.length}`);
     // C-2: EXACTLY ONE dispatch per task — the same-payload double fire is dead
+    // (s22 assert-tune: the repo regex must match the TWO-SEGMENT slug —
+    // [^/]+ truncated 'local/fsm-lab' to 'local' and both lane asserts failed;
+    // the same class the orchestrator fixed in the stand-in's routes)
     const perTask = {};
     for (const d of dispatchLedger) {
       const task = /"task":"([^"]+)"/.exec(d.req || '')?.[1];
-      const repo = /\/repos\/([^/]+)\/dispatches/.exec(d.path)?.[1];
+      const repo = /\/repos\/([^/]+\/+[^/]+)\/dispatches/.exec(d.path)?.[1];
       perTask[task] = [...(perTask[task] || []), repo];
     }
     t.ok(Object.keys(perTask).length === 2 && Object.values(perTask).every((v) => v.length === 1),
       'C-2 PIN: exactly ONE dispatch per task (the double-dispatch is dead)', JSON.stringify(perTask));
     t.ok(perTask['OV-A']?.[0] === 'local/fsm-lab', 'OV-A dispatched on the MAIN lane');
     t.ok(perTask['OV-B']?.[0] === world.repo2, `OV-B dispatched PRE-FLIGHT to the SECOND bucket (${world.repo2})`);
-    const cRuns = sched.runs.filter((r) => r.workflow === 'conductor');
-    const lastLog = sched.runLogText(cRuns[cRuns.length - 1].id);
-    t.ok(/DISPATCH-OVERFLOW-PREFLIGHT task=OV-B/.test(lastLog), 'the pre-flight overflow decision logged');
-    t.ok(!/DISPATCH-OVERFLOW task=OV-B /.test(lastLog), 'NOT the saturated-ladder fallback (the pre-flight arm decided)');
+    // (s22 assert-tune: the decision line lives in the MANUAL tick's log — a
+    // one-shot read of the LAST conductor run races both the log's pipe
+    // delivery and the self-tick chain replacing "last"; poll ALL conductor
+    // logs for the line, and assert the saturated-ladder fallback appears in
+    // NONE of them)
+    const preflightLogged = await until(() => sched.runs.filter((r) => r.workflow === 'conductor')
+      .some((r) => /DISPATCH-OVERFLOW-PREFLIGHT task=OV-B/.test(sched.runLogText(r.id))), { timeoutMs: 30_000, label: 'the pre-flight decision log' });
+    t.ok(preflightLogged, 'the pre-flight overflow decision logged (DISPATCH-OVERFLOW-PREFLIGHT task=OV-B)');
+    const ladderFallback = sched.runs.filter((r) => r.workflow === 'conductor')
+      .some((r) => /DISPATCH-OVERFLOW task=OV-B /.test(sched.runLogText(r.id)));
+    t.ok(!ladderFallback, 'NOT the saturated-ladder fallback (the pre-flight arm decided)');
   });
 
   await phase('MIRROR-RUN', async (t) => {
@@ -727,6 +740,19 @@ async function runRecovery() {
 
   let alertIssueN = null;
   await phase('LAW20-PAGINATION', async (t) => {
+    // s22/M-2: the phase now points at the A-2 RESIDUAL, not the fixed bug.
+    // The watchdog's marker fetch is per_page=100 + since=<now-24h>
+    // (alertCommentsPath — the s21/A-2 fix): the OLD phase flooded 21
+    // comments and asserted the duplicate alert the OLD per_page=20 fetch
+    // produced — asserting the PRE-fix bug against POST-fix machinery (the
+    // scan now SKIPS and the phase failed). The honest residual (documented
+    // at lib/watchdog-core.mjs alertCommentsPath): a >100-comments-updated-
+    // in-24h burst can still page the marker out of the single newest-100
+    // page — the fail direction is ONE extra alert comment, bounded and
+    // loud. The phase pins BOTH sides of that boundary on the watchdog's
+    // EXACT fetch path (alertCommentsPath imported from the real module —
+    // never a re-derived twin): <=100 in-window -> no dup; >100 -> exactly
+    // ONE extra alert; the next scan re-latches (bounded, no loop).
     alertIssueN = ghapi.issues('local/fsm-lab').find((it) => (it.labels || []).some((l) => l.name === 'fsm-watchdog-alert'))?.number;
     // scan #2: no marker exists yet -> this scan POSTS the marker comment (the
     // watchdog's own trusted marker)
@@ -735,21 +761,44 @@ async function runRecovery() {
     t.ok(/WATCHDOG-DONE mode=corrupt-state/.test(wlog2), 'scan #2 still sees the corrupt state');
     const after2 = ghapi.comments('local/fsm-lab', alertIssueN).length;
     t.ok(after2 === before + 1, 'scan #2 posted the marker comment (the first trusted marker)');
-    // the flood: 21 stranger comments AFTER the marker — law-20's page-1
-    // window (per_page=20, newest first) now HIDES the marker
-    for (let i = 1; i <= 21; i++) {
+    // the watchdog's OWN fetch path: per_page=100 + since=<now-24h>
+    const wdPage = async () => {
+      const r = await fetch(`${apiBase}${alertCommentsPath('local/fsm-lab', alertIssueN, Date.now())}`, {
+        headers: { Authorization: 'token drill-job-token', Accept: 'application/vnd.github+json' },
+      });
+      return r.status === 200 ? await r.json() : [];
+    };
+    // ---- the PROTECTED side of the boundary: 100 in-window (marker + 99) ----
+    // flood to JUST under the page size: the marker stays inside the newest-100
+    for (let i = 1; i <= 99; i++) {
       ghapi.addComment('local/fsm-lab', alertIssueN, { body: `+1 seeing this too (#${i})`, token: ghapi.addStrangerToken(`stranger-${i}`) });
     }
-    const page1 = await fetchCommentsPage(alertIssueN);
-    t.ok(page1.length === 20 && page1.every((c) => c.user.login.startsWith('stranger-')),
-      'law-20 REPRODUCED: the newest 20 hide the marker (single-page fetch, no Link walk)');
-    // scan #3: the dedup CANNOT see the trusted marker -> the characterized
-    // duplicate alert (a3/A2 — pinned-as-accepted at test-watchdog-core.mjs:179;
-    // this drill is its e2e regression pin)
+    const pageAt100 = await wdPage();
+    t.ok(pageAt100.length === 100 && pageAt100.some((c) => (c.body || '').includes('[fsm-watchdog]')),
+      'A-2 PROTECTED: at exactly 100 in-window comments the trusted marker is STILL on the fetched page (since= filters nothing fresh; per_page=100 holds it)');
+    const wlog25 = await watchdogScan();
+    t.ok(/WATCHDOG-ALERT-SKIP/.test(wlog25), 'scan #2.5 SKIPS: no duplicate alert at <=100 in-window comments (the fixed law-20 break)');
+    t.ok(ghapi.comments('local/fsm-lab', alertIssueN).length === 100, 'the skip posted NOTHING (the comment count holds at 100)');
+    // ---- the RESIDUAL side: >100 in-window pages the OLDEST (the marker) out ----
+    for (let i = 100; i <= 101; i++) {
+      ghapi.addComment('local/fsm-lab', alertIssueN, { body: `+1 seeing this too (#${i})`, token: ghapi.addStrangerToken(`stranger-${i}`) });
+    }
+    const pageAt102 = await wdPage();
+    t.ok(pageAt102.length === 100 && pageAt102.every((c) => !((c.body || '').includes('[fsm-watchdog]'))),
+      'A-2 RESIDUAL REPRODUCED: at 102 in-window comments the newest-100 page EXCLUDES the marker (single-page fetch, no Link walk)');
+    // scan #3: the dedup CANNOT see the trusted marker -> the documented
+    // ONE-extra-alert (fail-noisy, bounded; pinned-as-accepted at
+    // lib/watchdog-core.mjs alertCommentsPath's comment — this drill is its
+    // e2e regression pin)
     const wlog3 = await watchdogScan();
-    t.ok(!/WATCHDOG-ALERT-SKIP/.test(wlog3), 'scan #3 did NOT skip (the marker is past page 1 — the law-20 break)');
+    t.ok(!/WATCHDOG-ALERT-SKIP/.test(wlog3), 'scan #3 did NOT skip (the marker is past the newest-100 page — the >100 residual)');
     const after3 = ghapi.comments('local/fsm-lab', alertIssueN).length;
-    t.ok(after3 === 23, 'the DUPLICATE alert comment landed (the characterized bug, now drillable)', `comments=${after3}`);
+    t.ok(after3 === 103, 'the ONE extra alert comment landed (102 + 1 — the bounded residual, not a loop)', `comments=${after3}`);
+    // ---- BOUNDEDNESS: the fresh scan-3 marker is the NEWEST comment -> the
+    // next scan re-latches; the residual costs ONE alert, not one per scan
+    const wlog4 = await watchdogScan();
+    t.ok(/WATCHDOG-ALERT-SKIP/.test(wlog4), 'scan #4 SKIPS again (the new marker is fresh + on-page — the residual is BOUNDED)');
+    t.ok(ghapi.comments('local/fsm-lab', alertIssueN).length === 103, 'the count HOLDS at 103 (no second extra alert)');
   });
 
   await phase('HEAL', async (t) => {
@@ -811,7 +860,7 @@ const NOT_MODELED = [
   'the paid LLM lane (the cc lane runs the real adapter + bridge + spawn boundary against the deterministic fake CLI; no OpenRouter bytes move)',
   'law-4\'s 360s pre-window is backdated by a drill fixture commit in the overflow scenario (a 6-minute real wait is priced out of CI; the scan path, the union fetch and the key match are fully real)',
   'the budget-pause post-resume tail (round-3 infra exhaustion -> degraded halt or backstop re-pause) is timing-dependent across ticks; the drill\'s gates end at the C-3 characterization — that tail is pinned deterministically by sim4/test-budget',
-  'pagination beyond law-20\'s single newest-20 page (no Link headers; the adapters never walk them either — that IS the characterized bug)',
+  'pagination beyond the A-2 fetch contract: the stand-in implements since= (server semantics) but serves ONE newest-per_page page, no Link headers — a >100-comments-updated-in-24h burst pages the trusted marker out and costs ONE extra alert comment (bounded, fail-noisy; the recovery drill pins both sides of the boundary)',
   'issue/PR webhooks, check-runs, artifacts API, merge/close flows (the pull stand-in opens and stamps; nobody merges)',
 ];
 

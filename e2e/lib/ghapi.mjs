@@ -240,11 +240,28 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
     }
 
     // GET /repos/:repo/issues/:n/comments — LAW-20: one page, newest first
+    // s22/M-2(a): `since` is IMPLEMENTED (the A-2 server semantics): when the
+    // query param is present, comments with updated_at < since are filtered
+    // OUT server-side BEFORE the newest-per_page slice — exactly what the
+    // watchdog's alertCommentsPath (per_page=100 + since=<now-24h>) relies
+    // on. The stand-in's comments are never edited, so updated_at ===
+    // created_at (commentJson renders both); the filter reads the internal
+    // created_at.
     m = /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/.exec(path);
     if (m && req.method === 'GET') {
       const st = repoState(decodeURIComponent(m[1]));
       const n = parseInt(m[2], 10);
-      const all = st.comments.get(n) || [];
+      let all = st.comments.get(n) || [];
+      const sinceRaw = q.get('since');
+      if (sinceRaw) {
+        const sinceMs = Date.parse(sinceRaw);
+        if (Number.isFinite(sinceMs)) {
+          all = all.filter((c) => {
+            const upd = Date.parse(c.updated_at ?? c.created_at);
+            return !Number.isFinite(upd) || upd >= sinceMs;   // unparseable stays (fail-open, the seenKeys convention)
+          });
+        }
+      }
       const perPage = Math.max(1, parseInt(q.get('per_page') || '30', 10) || 30);
       // sort=created&direction=desc: GitHub serves the NEWEST per_page first;
       // anything older is past page 1 — the pagination the adapters never walk.
