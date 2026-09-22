@@ -22,12 +22,20 @@
 // count, soak30d's PINGER_STALE_AFTER_MIN=45 false-alarm count) — those
 // numbers drive the Wave-4 fixes; pass/fail is the floor, not the point.
 
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+// s22/m-9: the registry is the PLAN (6 batteries); the tree is what LANDED
+// (s21-c2 delivered 3 — burst12/quota-wall/dead-key-storm; journal-flood,
+// soak30d, chaos are the not-landed remainder). The runner now guards each
+// entry with existsSync and emits an honest SKIP note instead of crashing
+// the battery (the old shape: `--battery all` = 3 BATTERY-FAILs + exit 1 —
+// the gate read red on MISSING files, the least informative red there is).
+// A skip is NOT a pass and NOT a fail: zero checks, explicit note, excluded
+// from the ran/pass counts, never fails the exit code.
 const BATTERIES = {
   'burst12': { load: () => import('./batteries/burst12.mjs'), quick: '12 tasks, cap(5) live, 2×9-min grinds, 12-child CAS storm', full: 'same + 3-seed sweep of the drain baseline' },
   'quota-wall': { load: () => import('./batteries/quota-wall.mjs'), quick: 'PoolLane 8 keys × quota 2 × 12 tasks (the X23 arc)', full: 'parameterized sweep: (keys × quota × tasks × pre-exhaust) matrix' },
@@ -66,28 +74,43 @@ for (const n of names) {
 
 // batteries may be async (chaos spawns children); failures are RECORDED as a
 // failed battery, never a hung or swallowed run (the gate fails loudly).
+// s22/m-9: a registry entry whose battery FILE has not landed yet is an
+// honest SKIP (existsSync guard — the note says so in the report + stdout).
 const reports = [];
 for (const name of names) {
   console.log(`\n=== battery ${name}${args.quick ? ' (quick)' : ' (full)'} — seed ${args.seed} ===`);
   const t = Date.now();
   let rep;
-  try {
-    const mod = await BATTERIES[name].load();
-    const rec = await mod.run({ quick: args.quick, seed: args.seed });
-    rep = rec.report();
-  } catch (e) {
-    console.log(`  FAIL ${name} crashed: ${e?.stack || e}`);
-    rep = { battery: name, pass: false, checks: [{ name: 'battery-crashed', pass: false, detail: String(e?.stack || e).slice(0, 800) }], metrics: {}, notes: [], durationMs: Date.now() - t };
+  const batteryPath = join(HERE, 'batteries', `${name}.mjs`);
+  if (!existsSync(batteryPath)) {
+    console.log(`  SKIP ${name}: battery file not landed yet (stress/batteries/${name}.mjs absent — the s21-c2 remainder) — honest skip, not a fail`);
+    rep = {
+      battery: name, skipped: true, pass: true, checks: [], metrics: {},
+      notes: [`not landed yet — stress/batteries/${name}.mjs absent (the s21-c2 remainder); skipped honestly, not failed`],
+      durationMs: Date.now() - t,
+    };
+  } else {
+    try {
+      const mod = await BATTERIES[name].load();
+      const rec = await mod.run({ quick: args.quick, seed: args.seed });
+      rep = rec.report();
+    } catch (e) {
+      console.log(`  FAIL ${name} crashed: ${e?.stack || e}`);
+      rep = { battery: name, pass: false, checks: [{ name: 'battery-crashed', pass: false, detail: String(e?.stack || e).slice(0, 800) }], metrics: {}, notes: [], durationMs: Date.now() - t };
+    }
   }
   rep.mode = args.quick ? 'quick' : 'full';
   rep.seed = args.seed;
   reports.push(rep);
-  console.log(`  ${rep.pass ? 'BATTERY-PASS' : 'BATTERY-FAIL'} ${name}: ${rep.checks.filter(c => c.pass).length}/${rep.checks.length} checks in ${rep.durationMs}ms`);
+  console.log(`  ${rep.skipped ? 'BATTERY-SKIP' : rep.pass ? 'BATTERY-PASS' : 'BATTERY-FAIL'} ${name}: ${rep.skipped ? 'not landed (0 checks)' : `${rep.checks.filter(c => c.pass).length}/${rep.checks.length} checks`} in ${rep.durationMs}ms`);
 }
 
-const total = reports.reduce((n, r) => n + r.checks.length, 0);
-const passed = reports.reduce((n, r) => n + r.checks.filter(c => c.pass).length, 0);
-const batteryPass = reports.filter(r => r.pass).length;
+const ran = reports.filter(r => !r.skipped);
+const skipped = reports.filter(r => r.skipped);
+const total = ran.reduce((n, r) => n + r.checks.length, 0);
+const passed = ran.reduce((n, r) => n + r.checks.filter(c => c.pass).length, 0);
+const batteryPass = ran.filter(r => r.pass).length;
+const failedBatteries = ran.filter(r => !r.pass).length;
 
 // the durable report — always written (the numbers are the deliverable): the
 // FULL per-battery reports ride inside (checks + metrics + notes), not just
@@ -98,6 +121,8 @@ writeFileSync(reportPath, JSON.stringify({
   mode: args.quick ? 'quick' : 'full',
   seed: args.seed,
   batteries: reports.length,
+  batteriesRan: ran.length,
+  batteriesSkipped: skipped.length,
   batteryPass,
   checks: `${passed}/${total}`,
   batteryReports: reports,
@@ -108,6 +133,7 @@ if (args.json) {
   for (const rep of reports) writeFileSync(join(dir, `stress-${rep.battery}.json`), JSON.stringify(rep, null, 1));
 }
 
-console.log(`\nSTRESS-RESULT ${passed}/${total} checks, ${batteryPass}/${reports.length} batteries (${args.quick ? 'quick' : 'full'}, seed ${args.seed})`);
+console.log(`\nSTRESS-RESULT ${passed}/${total} checks, ${batteryPass}/${ran.length} batteries ran${skipped.length ? `, ${skipped.length} SKIPPED (not landed: ${skipped.map(r => r.battery).join(', ')})` : ''} (${args.quick ? 'quick' : 'full'}, seed ${args.seed})`);
 console.log(`report: ${reportPath}${args.json ? ` + per-battery JSON in ${resolve(process.cwd(), args.json)}` : ''}`);
-process.exit(passed === total ? 0 : 1);
+// a skip never fails the gate (m-9); a real check failure or crashed battery does
+process.exit(passed === total && failedBatteries === 0 ? 0 : 1);
