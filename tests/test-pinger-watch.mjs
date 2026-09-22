@@ -526,16 +526,23 @@ test('s21/A-3 deadman: the journal scan predicate — watchdog markers out of th
 
 test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) is STALE; the healthy heartbeat is fresh', () => {
   const NOW = Date.parse('2026-09-21T09:35:00.000Z');
-  // THE deadman pin: the newest marker is 3h old (06:35 -> 09:35) — exactly
-  // the default window -> STALE. A stalled watchdog (runs stopped ~3h ago,
-  // 3 missed hourly heartbeats) yields the alarm.
-  const stalled = watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW });
-  assert.equal(stalled.verdict, 'stale', 'a 3h-old marker is stale at the 180min window (the boundary convention)');
-  assert.equal(stalled.ageMin, 180);
+  // THE deadman pin (s22/R2-1 recalibrated): the newest marker is 5h old
+  // (04:35 -> 09:35) — exactly the 300min window -> STALE. A stalled
+  // watchdog (runs stopped ~5h ago, 5 missed hourly heartbeats) yields the
+  // alarm. THE R2-1 PIN alongside it: a 3h-old marker (the s21 boundary —
+  // inside the MEASURED 2h-4h07 sibling-gap band) is FRESH at 300 — the
+  // 180min default false-alarmed exactly this shape.
+  const stalled = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:35:00.000Z' }, nowMs: NOW });
+  assert.equal(stalled.verdict, 'stale', 'a 5h-old marker is stale at the 300min window (the boundary convention)');
+  assert.equal(stalled.ageMin, 300);
   assert.equal(stalled.reason, 'marker-at-or-older-than-window');
+  // THE R2-1 pin: the measured-band gap (3h) reads FRESH — the 180min
+  // false-alarm shape is pinned dead
+  const measuredBand = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T06:35:00.000Z' }, nowMs: NOW });
+  assert.equal(measuredBand.verdict, 'fresh', 'age 180 < window 300 -> fresh (the s21 180min boundary sat INSIDE the measured 2h-4h07 band — R2-1 kills the false alarm)');
   // one minute inside is fresh
-  const fresh = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T06:36:00.000Z' }, nowMs: NOW });
-  assert.equal(fresh.verdict, 'fresh', 'age 179 < window -> fresh');
+  const fresh = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:36:00.000Z' }, nowMs: NOW });
+  assert.equal(fresh.verdict, 'fresh', 'age 299 < window -> fresh');
   // NO markers at all -> stale (the watchdog is expected to run)
   const none = watchdogDeadmanVerdict({ nowMs: NOW });
   assert.equal(none.verdict, 'stale');
@@ -545,10 +552,10 @@ test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) 
   const bad = watchdogDeadmanVerdict({ journalNote: { ts: 'garbage' }, nowMs: NOW });
   assert.equal(bad.verdict, 'stale');
   assert.equal(bad.reason, 'marker-unparseable');
-  // the default window is 180 (hourly heartbeat, ~3 missed)
-  assert.equal(WATCHDOG_STALE_AFTER_MIN, 180);
+  // the default window is 300 (s22/R2-1: the measured-cadence recalibration)
+  assert.equal(WATCHDOG_STALE_AFTER_MIN, 300);
   // window override + guards
-  assert.equal(watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T06:35:00.000Z' }, nowMs: NOW, staleAfterMin: 240 }).verdict, 'fresh', '180 < 240 with the override');
+  assert.equal(watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:35:00.000Z' }, nowMs: NOW, staleAfterMin: 360 }).verdict, 'fresh', '300 < 360 with the override');
   assert.throws(() => watchdogDeadmanVerdict({ nowMs: NaN }), /nowMs/);
   assert.throws(() => watchdogDeadmanVerdict({ nowMs: NOW, staleAfterMin: 0 }), /staleAfterMin/);
   // a future marker clamps age to 0 (clock skew — never a false stale)
@@ -558,14 +565,14 @@ test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) 
 test('s21/A-3 deadman: the alert note — watchdogDeadmanComment (the stalled-watchdog alarm body)', () => {
   // THE brief's pin: a stalled watchdog yields the alert note
   const NOW = Date.parse('2026-09-21T09:35:00.000Z');
-  const v = watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW });
+  const v = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:35:00.000Z' }, nowMs: NOW });
   assert.equal(v.verdict, 'stale');
-  const c = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab', staleAfterMin: 180, note: v.note, ageMin: v.ageMin });
+  const c = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab', staleAfterMin: 300, note: v.note, ageMin: v.ageMin });
   // the dedup marker prefix — DISTINCT from the pinger-watch marker (the two
   // watches never collide on one issue thread)
   assert.ok(c.startsWith('**[fsm-watchdog-deadman]**'), 'the body starts with the deadman dedup marker');
   const lines = c.split('\n');
-  assert.equal(lines[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on claudecode-headless/fsm-lab in 180min (newest: 2026-09-21T06:35:00.000Z (age 180min)).');
+  assert.equal(lines[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on claudecode-headless/fsm-lab in 300min (newest: 2026-09-21T04:35:00.000Z (age 300min)).');
   assert.equal(lines[1], '');
   assert.equal(lines.length, 3);
   // the load-bearing semantics
@@ -575,21 +582,21 @@ test('s21/A-3 deadman: the alert note — watchdogDeadmanComment (the stalled-wa
   assert.ok(lines[2].includes('cron 3,13,…,53'), 'the watchdog cadence');
   assert.ok(lines[2].includes('throttled to ~1/hour'), 'the heartbeat contract');
   assert.ok(lines[2].includes('24h-deduped marker'), 'the dedup contract');
-  // the no-marker variant (the default window renders as 180)
+  // the no-marker variant (the default window renders as 300)
   const c2 = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab' });
   assert.ok(c2.includes('newest: none found'), 'the none-found line');
   assert.ok(c2.includes('no watchdog-scan journal markers'), 'the absent signal named');
-  assert.equal(watchdogDeadmanComment({ repo: 'x', note: null }).split('\n')[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on x in 180min (newest: none found (no watchdog-scan journal markers in the scan window)).');
+  assert.equal(watchdogDeadmanComment({ repo: 'x', note: null }).split('\n')[0], '**[fsm-watchdog-deadman]** watchdog SILENT — no watchdog-scan marker on x in 300min (newest: none found (no watchdog-scan journal markers in the scan window)).');
   assert.throws(() => watchdogDeadmanComment({}), /repo/);
 });
 
 test('s21/A-3 deadman: watchdogStaleAfterMin(env) — the WATCHDOG_STALE_AFTER_MIN override with the guarded fallback', () => {
-  assert.equal(watchdogStaleAfterMin({}), 180);
-  assert.equal(watchdogStaleAfterMin(), 180);
+  assert.equal(watchdogStaleAfterMin({}), 300);
+  assert.equal(watchdogStaleAfterMin(), 300);
   assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '60' }), 60);
   assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '720' }), 720);
   for (const bad of ['garbage', '0', '-5', '', 'min60', 'NaN']) {
-    assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: bad }), 180, `bad env ${JSON.stringify(bad)} falls back to the default`);
+    assert.equal(watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: bad }), 300, `bad env ${JSON.stringify(bad)} falls back to the default`);
   }
   // the override threads into the verdict (the duty-host wiring)
   const NOW = Date.parse('2026-09-21T07:35:00.000Z');
