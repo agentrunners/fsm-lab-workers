@@ -96,7 +96,7 @@ async function openAlertIssue(body) {
     // alerts/day for the incident's duration.
     // s22/FLIP-ME (journal-flood's mutation-verified characterization pin):
     // replace the path below with the OLD shape —
-    //   api(`/repos/${REPO}/issues/${existing.number}/comments?` + 'per_page=20&sort=created&direction=desc', 'GET')
+    //   api(`/repos/${REPO}/issues/${existing.number}/comments?` + 'per_page=20' + '&sort=created&direction=desc', 'GET')
     // (the string is split so the source-shape pin below stays green — the
     // pin greps for the literal blind URL, and a mutation INSTRUCTION is
     // not the mutation itself; join the two halves when flipping)
