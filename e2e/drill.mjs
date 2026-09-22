@@ -175,8 +175,14 @@ const parseJsonl = (raw) => {
   }
   return out;
 };
-const queueLines = async () => parseJsonl(await showProbe('state/reports-queue.jsonl'));
-const intakeLines = async () => parseJsonl(await showProbe('state/intake-queue.jsonl'));
+// s22/M-3 (the harness's REAL fix, lens-1): the queue readers FETCH FIRST —
+// like readState/journalTail. They used to read the probe clone's
+// REMOTE-TRACKING ref directly, which only moves on a fetch: every queue
+// assert read whatever the LAST readState() poll left behind (the INTAKE
+// phase read the BOOT-time snapshot — the queue read as empty before the
+// door ever ran; the WORK phase could read the pre-report state).
+const queueLines = async () => { await fetchProbe(); return parseJsonl(await showProbe('state/reports-queue.jsonl')); };
+const intakeLines = async () => { await fetchProbe(); return parseJsonl(await showProbe('state/intake-queue.jsonl')); };
 const journalTail = async (n = 60) => {
   await fetchProbe();
   const ls = await agit(['-C', world.probeClone, 'ls-tree', '--name-only', 'refs/remotes/origin/fsm-state', 'state/']);
@@ -326,23 +332,37 @@ async function runX22() {
     await until(() => run.status === 'completed', { timeoutMs: 30_000, label: 'intake run' });
     const runLog = sched.runLogText(run.id);
     t.ok(/INTAKE-ENQUEUED/.test(runLog), 'the intake run fired + enqueued (INTAKE-ENQUEUED log)');
+    // s22 (the assert-tuning residual): this read races the conductor's
+    // rollover drain — the door's nudge starts a conductor run ~1.6s later
+    // (compressed dispatch latency) and its rollover CONSUMES the head. The
+    // machinery works either way; the TRANSIENT (1 line parked) and the
+    // DRAINED (0 lines) states are BOTH healthy here — the EPOCH phase pins
+    // the durable drained state. What must NEVER hold: 2+ lines (the
+    // stranger's spec queued) or a parked line that is not the operator's.
     const lines = await intakeLines();
-    t.ok(lines.length === 1, 'state/intake-queue.jsonl carries exactly ONE line', `lines=${JSON.stringify(lines.map((l) => l.issue))}`);
-    t.ok(String(lines[0]?.issue) === String(issue.number) && lines[0]?.spec?.id === TASK, 'the queue line is the operator spec (issue + spec.id)');
-    t.ok(typeof lines[0]?.body_sha8 === 'string' && lines[0]?.body_sha8.length === 8, 'the queue line carries the byte-exact body_sha8');
+    t.ok(lines.length <= 1, 'the intake queue holds AT MOST the operator line (1 = parked transient, 0 = rollover already drained; the stranger never queues)', `lines=${JSON.stringify(lines.map((l) => l.issue))}`);
+    if (lines.length === 1) {
+      t.ok(String(lines[0]?.issue) === String(issue.number) && lines[0]?.spec?.id === TASK, 'the parked queue line is the operator spec (issue + spec.id)');
+      t.ok(typeof lines[0]?.body_sha8 === 'string' && lines[0]?.body_sha8.length === 8, 'the queue line carries the byte-exact body_sha8');
+    }
     const nudges = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && (e.req || '').includes('"fsm-tick"') && (e.req || '').includes('"reason":"intake"'));
     t.ok(nudges.length === 1, 'the door NUDGED the conductor (one fsm-tick dispatch, reason intake)');
   });
 
   await phase('EPOCH', async (t) => {
     // the nudge's conductor run performs the ROLLOVER: halted + queue -> genesis
-    await until(() => {
-      const s = readState();
+    // (s22/M-3: the predicate AWAITS readState() — the old sync read held the
+    // PROMISE, permanently falsy, a guaranteed 60s timeout masking working
+    // machinery)
+    await until(async () => {
+      const s = await readState();
       return s.state && s.state.project?.issue === 2 && s.state.tasks?.[TASK]?.status === 'assigned';
     }, { timeoutMs: 60_000, label: 'rollover + assign' });
     const s = (await readState()).state;
     t.ok(s.project.mode === 'cc', "the epoch is LIVE in cc mode (the spec's mode)");
-    t.ok(s.project.milestones_total === 1 && s.project.milestones === 1, 'spec epochs carry milestones_total=1 (the task IS the project)');
+    // (s22 assert-tune: the project field is `milestone` (the CURRENT one) —
+    // the never-validated draft read `milestones` (undefined) and always failed)
+    t.ok(s.project.milestones_total === 1 && s.project.milestone === 1, 'spec epochs carry milestones_total=1 (the task IS the project)');
     const jr = await journalTail(20);
     const roll = jr.find((j) => j.kind === 'CONTROL' && j.command === 'reset' && String(j.note || '').startsWith('intake-rollover'));
     t.ok(!!roll, 'journal: the rollover record (CONTROL reset, note intake-rollover)');
@@ -352,8 +372,15 @@ async function runX22() {
     t.ok(comments2.some((c) => /Epoch started for this task/.test(c.body)), 'the epoch-started comment landed on the intake issue (m-3)');
     const dispatches = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && (e.req || '').includes('"fsm-task"'));
     t.ok(dispatches.length === 1, 'EXACTLY ONE worker dispatch (one task, one bucket)', `n=${dispatches.length}`);
+    // (s22 assert-tune: the ox envelope is a JSON STRING nested INSIDE
+    // client_payload — the old regex-grab fed the ESCAPED source text straight
+    // to JSON.parse (always threw -> null on every assert). Parse the ledgered
+    // body, then the ox string — the SLICE bump keeps both whole.)
     let ox = null;
-    try { ox = JSON.parse(/"ox":"((?:[^"\\]|\\.)*)"/.exec(dispatches[0]?.req || '')?.[1] || 'null'); } catch { ox = null; }
+    try {
+      const dbody = JSON.parse(dispatches[0]?.req || 'null');
+      ox = dbody?.client_payload?.ox ? JSON.parse(dbody.client_payload.ox) : null;
+    } catch { ox = null; }
     t.ok(ox && ox.task_ref?.id === TASK, 'the dispatch envelope (ox) names the task', JSON.stringify(ox?.task_ref));
     t.ok(ox && ox.mode === 'cc' && typeof ox.deadline_ms === 'number' && ox.deadline_ms > Date.now() - 1000, 'the envelope deadline is sane (absolute, future at mint)');
     t.ok(Array.isArray(ox?.artifacts) && ox.artifacts[0] === artifactPath, 'the DECLARED artifacts ride the envelope');
@@ -384,10 +411,15 @@ async function runX22() {
     // the conductor's self-tick (paced at the intake epoch's 25s cadence —
     // the REAL tick-cadence cost, measured in this phase's wall time) drains
     // the report and halts.
-    await until(() => {
-      const s = readState();
+    await until(async () => {
+      const s = await readState();
       return s.state && s.state.chain?.halted === true && s.state.tasks?.[TASK]?.status === 'done';
     }, { timeoutMs: 120_000, label: 'drain -> done -> halt' });
+    // (s22 assert-tune: the PR flow's STAMP is a SECOND commit, seconds after
+    // the halt commit — the adapter's post-tick prFlow lane opens the PR then
+    // stamps task.pr; the read below raced that commit and saw pr=undefined
+    // while the journal (read a beat later) already carried the pointer record)
+    await until(async () => !!(await readState()).state?.tasks?.[TASK]?.pr, { timeoutMs: 30_000, label: 'the PR stamp commit' });
     const s = (await readState()).state;
     t.ok(s.tasks[TASK]?.pr, `the task is PR-stamped (task.pr=${s.tasks[TASK].pr})`);
     t.ok(s.project.phase === 'done' && s.chain.halted === true, 'phase done + chain HALTED');
@@ -412,6 +444,12 @@ async function runX22() {
     // the schedule-backstop wake -> QUIESCED (no commit, no self-dispatch)
     const before = ghapi.ledger().length;
     await postDispatch('fsm-tick', { reason: 'schedule-backstop' });
+    // m-8: the drill's OWN wake POST is the one dispatch entry between the
+    // snapshot and the conductor's actions — pin its ledger index and exclude
+    // it (the assert counts CONDUCTOR dispatches, not the drill's control
+    // traffic; the conductor run has not started yet — dispatch latency)
+    const selfWake = ghapi.ledger().find((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && e.i > before);
+    const selfWakeIdx = selfWake ? selfWake.i : before;
     await until(() => {
       const r = sched.runs.filter((x) => x.workflow === 'conductor');
       return r.length && r[r.length - 1].status === 'completed';
@@ -420,8 +458,8 @@ async function runX22() {
     const qlog = sched.runLogText(sched.runs.filter((x) => x.workflow === 'conductor').slice(-1)[0].id);
     t.ok(/QUIESCED/.test(qlog), 'the backstop wake QUIESCED (no commit, no self-dispatch)');
     t.ok((await tip()) === frozen, 'the tip is still frozen after the wake');
-    const postWakeDispatches = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && e.i > before);
-    t.ok(postWakeDispatches.length === 0, 'ZERO dispatches after the quiesced wake (STOP_CHAIN filtered from the actions)');
+    const postWakeDispatches = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && e.i > selfWakeIdx);
+    t.ok(postWakeDispatches.length === 0, 'ZERO dispatches after the quiesced wake (STOP_CHAIN filtered from the actions; the drill\'s own wake POST excluded)');
     // the watchdog: halted + the GC pass ran (F-15a placement)
     const wlog = await watchdogScan();
     t.ok(/WATCHDOG-DONE mode=halted/.test(wlog), 'the watchdog scan is green on the halted chain');
@@ -469,7 +507,7 @@ async function runBudgetPause() {
 
   await phase('STORM', async (t) => {
     await postDispatch('fsm-tick', { reason: 'manual' });
-    await until(() => queueLines().filter((r) => TASKS.includes(r.task)).length >= 3, { timeoutMs: 60_000, label: '3 quota reports enqueued' });
+    await until(async () => (await queueLines()).filter((r) => TASKS.includes(r.task)).length >= 3, { timeoutMs: 60_000, label: '3 quota reports enqueued' });
     const reps = (await queueLines()).filter((r) => TASKS.includes(r.task));
     t.ok(reps.length >= 3 && reps.every((r) => r.outcome?.status === 'infra_failed' && /lane-429/.test(String(r.outcome?.error || ''))),
       'the infra quota reports (lane-429) are on the queue', `n=${reps.length}`);
@@ -483,7 +521,7 @@ async function runBudgetPause() {
   await phase('ALERT-FIRST-PAUSE', async (t) => {
     // the chain's self-tick drains them -> BUDGET_PAUSE_ALERT -> the alert
     // issue FIRST -> the pause commit SECOND (the two-commit protocol).
-    await until(() => readState().state?.chain?.paused === true, { timeoutMs: 90_000, label: 'pause applied' });
+    await until(async () => (await readState()).state?.chain?.paused === true, { timeoutMs: 90_000, label: 'pause applied' });
     const s = (await readState()).state;
     pauseTip = await tip();
     t.ok(s.chain.paused === true, 'the chain is PAUSED (HOLD)');
@@ -509,7 +547,7 @@ async function runBudgetPause() {
     // already-dispatched workers burn once under the pause (their leases are
     // the pre-pause cohort — the stragglers of the next phase); ZERO further
     // assigns/dispatches land after the alert+pause.
-    await until(() => queueLines().length >= 3, { timeoutMs: 60_000, label: 'the residual (straggler-cohort) reports land' });
+    await until(async () => (await queueLines()).length >= 3, { timeoutMs: 60_000, label: 'the residual (straggler-cohort) reports land' });
     await sleep(800);
     const jr = await journalTail(80);
     const pauseIdx = jr.findIndex((j) => j.kind === 'CONTROL' && j.command === 'pause');
@@ -529,12 +567,12 @@ async function runBudgetPause() {
     // the fan-out the scheduler models).
     const rc = await postDispatch('fsm-control', { command: 'resume', note: 'quota reset (drill)' });
     t.ok(rc === 204, 'the resume control dispatched (fsm-control, 204)');
-    await until(() => readState().state?.chain?.paused === false, { timeoutMs: 60_000, label: 'resume applied' });
+    await until(async () => (await readState()).state?.chain?.paused === false, { timeoutMs: 60_000, label: 'resume applied' });
     const s = (await readState()).state;
     t.ok(s.chain.paused === false, 'the chain RESUMED');
     t.ok(!!s.budget_window_cleared_at, 'resume stamped budget_window_cleared_at (the C-3 gate)');
     // the straggler reports drained: journaled infra-retries, window entries straggler-marked
-    await until(() => queueLines().length === 0, { timeoutMs: 60_000, label: 'the straggler reports drained' });
+    await until(async () => (await queueLines()).length === 0, { timeoutMs: 60_000, label: 'the straggler reports drained' });
     const jr = await journalTail(60);
     const stragglerReports = jr.filter((j) => j.kind === 'REPORT' && j.reason === 'infra-retry');
     t.ok(stragglerReports.length >= 3, `the straggler quota reports drained as infra-retries (net-zero, ${stragglerReports.length} records)`);
@@ -608,7 +646,7 @@ async function runOverflow() {
 
   await phase('MIRROR-RUN', async (t) => {
     // both workers ran; OV-A reports done; OV-B (hang) stays silent
-    await until(() => readState().state?.tasks?.['OV-A']?.status === 'done', { timeoutMs: 60_000, label: 'OV-A done' });
+    await until(async () => (await readState()).state?.tasks?.['OV-A']?.status === 'done', { timeoutMs: 60_000, label: 'OV-A done' });
     const bRun = sched.runs.find((r) => r.workflow === 'worker' && r.name.startsWith('task-OV-B'));
     t.ok(!!bRun && bRun.repo === world.repo2, "OV-B's run lives in the SECOND bucket's ledger (the mirror run)");
     const aRun = sched.runs.find((r) => r.workflow === 'worker' && r.name.startsWith('task-OV-A'));
@@ -729,12 +767,12 @@ async function runRecovery() {
     const rec = jr.find((j) => j.kind === 'RECOVERY');
     t.ok(rec?.reason === 'history-walk' && !!rec?.snapshotSha, 'the RECOVERY(history-walk) journal record carries the snapshot sha');
     // the chain CONTINUES from the healed state: RC-1 gets dispatched
-    await until(() => ['assigned', 'in_progress', 'done'].includes(readState().state?.tasks?.['RC-1']?.status), { timeoutMs: 60_000, label: 'RC-1 dispatched post-heal' });
+    await until(async () => ['assigned', 'in_progress', 'done'].includes((await readState()).state?.tasks?.['RC-1']?.status), { timeoutMs: 60_000, label: 'RC-1 dispatched post-heal' });
     t.ok(true, 'the healed chain continues (RC-1 assigned)');
   });
 
   await phase('HEALTHY-SCAN', async (t) => {
-    await until(() => readState().state?.chain?.halted === true, { timeoutMs: 90_000, label: 'epoch completes' });
+    await until(async () => (await readState()).state?.chain?.halted === true, { timeoutMs: 90_000, label: 'epoch completes' });
     const wlog = await watchdogScan();
     t.ok(/WATCHDOG-DONE mode=halted/.test(wlog) && !/UNREADABLE/.test(wlog), 'the final scan is clean (halted, state healthy)');
     t.ok(/GC-TRANSCRIPTS/.test(wlog), 'the GC pass ran');

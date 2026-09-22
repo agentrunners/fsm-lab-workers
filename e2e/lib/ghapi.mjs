@@ -48,7 +48,13 @@ import { createServer } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-const SLICE = 4096;
+// The ledger slice: 32KB (was 4KB — s22/M-3 surfaced it: the fsm-task
+// dispatch body embeds the ox envelope (prompt ≤ 16KB + JSON escaping), so a
+// 4KB slice CUT the ox string mid-flight and the drill's envelope asserts
+// parsed null on every dispatch. The ledger is drill-local scratch telemetry
+// — full-fidelity request bodies are the assertion food; 32KB covers the
+// prompt cap + envelope overhead with room to spare.)
+const SLICE = 32_768;
 
 export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 'write', log = () => {} } = {}) {
   const ACTORS = new Map(Object.entries({

@@ -11,3 +11,11 @@ bridge-lane.jsonl
 node_modules/
 *.log
 e2e/out/
+
+# s22/m-10 (the tracked-artifact dirt class): the gates' OWN output reports are
+# RUN ARTIFACTS, not source — every drill/stress run rewrites them, so the
+# tracked copies made each gate run a dirty worktree (the exact residue class
+# bridge-lane.jsonl was). Un-tracked (git rm --cached) in the same fold; the
+# durable evidence copies live in the worklog/EVIDENCE discipline, not git.
+e2e/last-drill-report.json
+stress/last-stress-report.json
