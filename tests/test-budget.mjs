@@ -617,3 +617,64 @@ test('s22/B-1 + R2-4a: the carry lands lease_minutes in the genesis config — t
   const rNone = carry({});
   assert.equal(rNone.state.config.lease_minutes, CFG.lease_minutes, 'absent lease_minutes: the chain config stands (15)');
 });
+
+// ---------------------------------------------------------------------------
+// s22/B-1 commit 3 (the s22/Q1 adjudication): the CAPACITY-KNOB CARRY —
+// the exact A4-F1 pattern, second knob pair. The spec's door-validated
+// max_parallel/overflow_at land in the genesis config at BOTH carry sites
+// (the rollover and the reset from_queue); absent/garbage -> the knob is
+// absent -> the chain's standing config governs. Inverts cleanly: remove
+// the carry and the =16/=1 pins fail (mutation check).
+// ---------------------------------------------------------------------------
+
+test('s22/B-1 commit 3: the capacity carry — max_parallel:16 + overflow_at:1 land in the genesis config at the ROLLOVER and the RESET from_queue', () => {
+  const carry = (spec, { lane = 'rollover' } = {}) => {
+    // a DONE+HALTED epoch (the rollover shape) + one queued spec line
+    const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+    let s = genesis({ config: CFG, project: { tasks: ONE.m1, milestones: 1 }, chainId: `c-cap-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:00.000Z' });
+    s = apply(s, { kind: 'TICK', event_id: 'tk-cap', ts: '2026-09-06T10:00:00.000Z', actor: 'chain' }, '2026-09-06T10:00:00.000Z', nextMilestoneFactory(ONE)).state;
+    s = apply(s, { kind: 'REPORT', event_id: 'rep-cap', task: 'X', lease: s.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, '2026-09-06T10:00:01.000Z', nextMilestoneFactory(ONE)).state;
+    assert.equal(s.project.phase, 'done');
+    const qline = { issue: 61, body_sha8: 'capabcd12', spec: { title: 'capacity carry pin', accept: 'x', ...spec }, enqueued_at: '2026-09-06T10:00:02.000Z', author: 'op' };
+    const ctl = lane === 'direct-reset'
+      ? [{ cmd: 'reset', id: 'ctl-cap-rq', ts: '2026-09-06T10:00:03.000Z', sender: 'op', note: 'capacity carry pin', patch: { from_queue: true } }]
+      : [];
+    const out = conductorTick({
+      cur: structuredClone(s), queue: [], controlQueue: ctl, queueBad: [], ctlBad: [],
+      intakeQueue: [qline], intakeBad: [],
+      ev: lane === 'direct-reset' ? { kind: 'CONTROL', command: 'reset', event_id: 'ctl-cap-direct', ts: '2026-09-06T10:00:03.000Z', patch: { from_queue: true } } : { kind: 'TICK', event_id: 'tk-cap2', ts: '2026-09-06T10:00:04.000Z', actor: 'chain' },
+      now: () => '2026-09-06T10:00:05.000Z', nextMilestone: nextMilestoneFactory(ONE), recover: () => null,
+      makeGenesis: ({ config, spec, issue }) => {
+        const g = genesis({
+          config, project: { tasks: [{ id: spec?.id || `task-i${issue}`, title: spec?.title || `intake ${issue}`, behavior: spec?.behavior || 'real', work_ms: 4000, deps: [], spec: { accept: spec?.accept, issue } }], milestones: 1 },
+          chainId: `c-cap-g-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:05.000Z', issue: issue ?? null,
+        });
+        return { state: g, spec: { tasks: [], milestones: 1, chainId: 'c-cap-g', mode: 'mock' } };
+      },
+    });
+    return out;
+  };
+  // the rollover lane: BOTH knobs ride the genesis config
+  const r = carry({ max_parallel: '16', overflow_at: '1' });
+  assert.equal(r.state.config.max_parallel, 16, 'ROLLOVER: the spec max_parallel 16 rides the genesis config');
+  assert.equal(r.state.config.overflow_at, 1, 'ROLLOVER: the spec overflow_at 1 rides the genesis config (a NEW config member — the pre-flight consumes it via the state.config precedence)');
+  const rj = r.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset');
+  assert.equal(rj?.genesisSpec?.config?.max_parallel, 16, 'the journal genesisSpec carries 16 (rebuild replays the same posture)');
+  assert.equal(rj?.genesisSpec?.config?.overflow_at, 1, 'the journal genesisSpec carries the overflow posture too');
+  // the reset from_queue lane: the SAME two pins
+  const d = carry({ max_parallel: '16', overflow_at: '1' }, { lane: 'direct-reset' });
+  assert.equal(d.state.config.max_parallel, 16, 'RESET from_queue: the spec max_parallel 16 rides the genesis config');
+  assert.equal(d.state.config.overflow_at, 1, 'RESET from_queue: the spec overflow_at 1 rides the genesis config');
+  // absent knobs -> the chain's standing config governs (the null path)
+  const none = carry({});
+  assert.equal(none.state.config.max_parallel, CFG.max_parallel, 'absent max_parallel: the chain config stands (4)');
+  assert.equal(none.state.config.overflow_at, undefined, 'absent overflow_at: the env lane stands (no config member minted)');
+  // garbage (a pre-door queue line) -> null -> the standing posture, never a wide epoch
+  const garbage = carry({ max_parallel: 'garbage', overflow_at: '99' });
+  assert.equal(garbage.state.config.max_parallel, CFG.max_parallel, 'garbage max_parallel: the chain config stands');
+  assert.equal(garbage.state.config.overflow_at, undefined, 'out-of-bounds overflow_at (99): no config member — the env lane stands');
+  // ONE knob alone carries (the independent pair)
+  const onlyMp = carry({ max_parallel: '2' });
+  assert.equal(onlyMp.state.config.max_parallel, 2, 'max_parallel alone carries');
+  assert.equal(onlyMp.state.config.overflow_at, undefined, 'overflow_at stays absent');
+});

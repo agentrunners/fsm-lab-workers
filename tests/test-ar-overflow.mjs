@@ -32,7 +32,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount,
-  WORKER_OVERFLOW_AT_DEFAULT,
+  WORKER_OVERFLOW_AT_DEFAULT, overflowThreshold, specCapacity,
   verifyScanRepoList, seenKeysFromRuns, dispatchVerificationEvents, VERIFY_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
 import { Store } from '../lib/store.mjs';
@@ -314,7 +314,13 @@ test('ar wiring (source-pinned): turn.mjs parses WORKER_REPO_2/WORKER_OVERFLOW_A
   // C-2: the PRE-FLIGHT decision owns the occupancy arm, BEFORE any wire attempt
   assert.ok(src.includes('const pre = overflowPreFlight({'), 'the pre-flight decision is wired');
   assert.ok(src.includes('inFlightNow: priorInFlight + dispatchIndex - 1'), 'the in-flight count excludes the CURRENT dispatch (prior + already-dispatched)');
-  assert.ok(src.includes("repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,"), 'the pre-flight consumes the env-parsed lane config');
+  // s22/B-1 (the s22/Q1 adjudication): the threshold rides the PRECEDENCE —
+  // the STATE view (config.overflow_at, the spec's door-validated knob
+  // carried at the rollover / reset from_queue) wins over the env-parsed
+  // lane value; absent in the config -> the env lane stands (byte-identical
+  // to the pre-B-1 wiring)
+  assert.ok(src.includes('overflowAt: overflowThreshold(state.config, WORKER_OVERFLOW_AT)'), 'the pre-flight threshold carries the state.config precedence (config wins; env stands when absent)');
+  assert.ok(src.includes('overflowThreshold,'), 'the precedence helper is imported from the core (the pinnable seam)');
   assert.ok(src.includes('if (pre.overflow) {'), 'the pre-flight verdict branches the dispatch target');
   // the saturated fallback: AFTER the (failed) main attempt, no occupancy input
   assert.ok(src.includes('const ov = workerOverflowDecision({ d, repo2: WORKER_REPO_2, pat: PAT });'), 'the fallback decision consumes the ladder result only (no occupancy arm — the double-dispatch is dead)');
@@ -506,4 +512,55 @@ test('C-1 wiring (source-pinned): the adapter\'s scan is the UNION — verifySca
   assert.ok(src.includes('let scanOk = true;') && src.includes('if (scanOk) {'), 'any per-repo fetch failure voids the whole scan (fail-open — partial keys would flip every repo2-dispatched task)');
   assert.ok(src.includes('VERIFY-SCAN-SKIPPED repo='), 'per-repo fetch failures are LOUD');
   assert.ok(src.includes('VERIFY-SCAN repos='), 'the merged scan logs its repo count');
+});
+
+// ---------------------------------------------------------------------------
+// s22/B-1 (the s22/Q1 adjudication): the threshold's PRECEDENCE + the
+// spec-level capacity knobs. The staged design's Q1: with the repo var at
+// its production posture (12–15) a max_parallel:4 drill never overflows
+// (the pre-flight arm needs in-flight >= the threshold) — the knob pair is
+// therefore SPEC-level, carried into the genesis config (specCapacity, the
+// A4-F1 pattern), and consumed by the pre-flight through overflowThreshold:
+//   state.config.overflow_at ?? env.WORKER_OVERFLOW_AT ?? DEFAULT
+// The state view wins — a drill epoch runs its own posture while the repo
+// var stays production.
+// ---------------------------------------------------------------------------
+
+test('s22/B-1: overflowThreshold — the precedence chain (config wins; absent/null -> the env lane stands; both absent -> the core default)', () => {
+  assert.equal(overflowThreshold({ overflow_at: 1 }, 13), 1, 'the STATE view wins (a spec-carried posture overrides the repo var)');
+  assert.equal(overflowThreshold({}, 13), 13, 'absent in the config -> the env lane stands');
+  assert.equal(overflowThreshold({ overflow_at: null }, 13), 13, 'a null config value (the garbage-carry shape) -> the env lane stands');
+  assert.equal(overflowThreshold(undefined, 13), 13, 'no state at all -> the env lane stands');
+  assert.equal(overflowThreshold({}, undefined), WORKER_OVERFLOW_AT_DEFAULT, 'nothing anywhere -> the core default (the env parse folds the same default)');
+  assert.equal(overflowThreshold({ overflow_at: 7 }), 7, 'one-arg form: the config wins over the core default');
+});
+
+test('s22/B-1: THE PRECEDENCE PIN (composed, real code) — config 1 + env 13 -> the pre-flight fires at in-flight 1; config absent -> the env threshold governs', () => {
+  const base = { repo2: 'agentrunners/fsm-lab-workers', pat: 'PAT' };
+  // config 1 + env 13: the STATE view wins — the pre-flight fires at in-flight 1
+  const withCfg = overflowThreshold({ overflow_at: 1 }, 13);
+  assert.equal(withCfg, 1);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 1, overflowAt: withCfg }).overflow, true, 'the pre-flight FIRES at in-flight 1 (the spec posture, not the repo var)');
+  assert.deepEqual(overflowPreFlight({ ...base, inFlightNow: 1, overflowAt: withCfg }).reason, 'in-flight(1>=1)');
+  // config absent + env 13: the env lane governs — in-flight 1 does NOT fire
+  const envOnly = overflowThreshold({}, 13);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 1, overflowAt: envOnly }).overflow, false, 'no spec knob: in-flight 1 stays on the main bucket (the env threshold 13 governs)');
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 12, overflowAt: envOnly }).overflow, false);
+  assert.equal(overflowPreFlight({ ...base, inFlightNow: 13, overflowAt: envOnly }).overflow, true, 'the env threshold boundary holds');
+});
+
+test('s22/B-1: specCapacity — the pure-helper bounds (the door\'s [1,32] window; the YAML string forms; garbage -> null -> the standing posture)', () => {
+  // the string forms (the door keeps YAML scalars as strings — parseInt here)
+  assert.deepEqual(specCapacity({ max_parallel: '16', overflow_at: '1' }), { max_parallel: 16, overflow_at: 1 }, 'the X27 soak shape: both knobs parse');
+  assert.deepEqual(specCapacity({ max_parallel: 4 }), { max_parallel: 4, overflow_at: null }, 'one knob alone');
+  assert.deepEqual(specCapacity({}), { max_parallel: null, overflow_at: null }, 'absent -> both null (the chain config / env lane stands)');
+  // the bounds: [1,32] — the machine's own max_parallel ceiling
+  assert.deepEqual(specCapacity({ max_parallel: '32', overflow_at: 32 }), { max_parallel: 32, overflow_at: 32 }, 'the ceiling itself passes');
+  assert.equal(specCapacity({ max_parallel: 33 }).max_parallel, null, 'above the ceiling -> null (the door rejects it; a pre-door queue line fails to the standing posture)');
+  assert.equal(specCapacity({ max_parallel: 0 }).max_parallel, null, 'below the floor -> null');
+  assert.equal(specCapacity({ overflow_at: 0 }).overflow_at, null, 'overflow_at 0 -> null (never a zero threshold by accident)');
+  assert.equal(specCapacity({ max_parallel: 'garbage' }).max_parallel, null, 'NaN-safe');
+  assert.equal(specCapacity({ overflow_at: '' }).overflow_at, null, 'empty string safe');
+  assert.deepEqual(specCapacity(null), { max_parallel: null, overflow_at: null }, 'null-spec safe');
+  assert.deepEqual(specCapacity(undefined), { max_parallel: null, overflow_at: null }, 'undefined-spec safe (the reset lane calls with headLine?.spec)');
 });

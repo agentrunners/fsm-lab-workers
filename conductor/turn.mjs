@@ -36,7 +36,7 @@ import {
   DISPATCH_COST_MS, VERIFY_WINDOW_MS, specEpoch, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
   dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
-  chainContinuationDecision,
+  overflowThreshold, chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
@@ -417,7 +417,7 @@ async function main() {
       );
       // T46/s21 C-2 (audit a1, MAJOR — the double-dispatch): the target is
       // decided BEFORE any wire attempt. The occupancy arm (in-flight >=
-      // WORKER_OVERFLOW_AT) is PRE-FLIGHT: this dispatch goes STRAIGHT to
+      // overflow threshold) is PRE-FLIGHT: this dispatch goes STRAIGHT to
       // WORKER_REPO_2 and the same-repo attempt is SKIPPED — the old shape
       // ran the main ladder first (204) and then re-sent the SAME payload to
       // the second bucket: two workers grinding one task, 2x paid-key burn,
@@ -430,9 +430,17 @@ async function main() {
       // Store rides the checkout's origin), so the report lands on the MAIN
       // fsm-state. Unset WORKER_REPO_2 -> both decisions return false for
       // any input (byte-identical today path).
+      // s22/B-1 (the s22/Q1 adjudication): the threshold's PRECEDENCE — the
+      // STATE view wins (overflowThreshold: config.overflow_at ?? the
+      // env-parsed lane value ?? DEFAULT folded in the env parse): a drill
+      // epoch carries its own capacity posture (the spec's door-validated
+      // overflow_at, carried into the genesis config at the rollover /
+      // reset from_queue) while the repo var stays at whatever posture
+      // production wants. Absent in the config -> the env lane stands,
+      // byte-identical to the pre-B-1 wiring.
       const pre = overflowPreFlight({
         inFlightNow: priorInFlight + dispatchIndex - 1,
-        repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,
+        repo2: WORKER_REPO_2, pat: PAT, overflowAt: overflowThreshold(state.config, WORKER_OVERFLOW_AT),
       });
       let d;
       if (pre.overflow) {

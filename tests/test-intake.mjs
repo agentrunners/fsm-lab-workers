@@ -519,3 +519,49 @@ test('B-1 how-to: the multi-task form + the 32 cap are documented (the template 
   const p0 = parseSpecBlock(h);
   assert.ok(p0 && p0.spec.id === 'T-501', 'the single-task example still parses');
 });
+
+// ---------------------------------------------------------------------------
+// s22/B-1 commit 3 (the s22/Q1 adjudication): the spec-level CAPACITY knobs
+// at the DOOR — `max_parallel` [1,32] + `overflow_at` [1,32], epoch-level on
+// BOTH spec forms (the single-task top level and the tasks form's top
+// level); per-entry capacity keys are UNKNOWN keys (the posture is
+// epoch-wide, one decision, not per task).
+// ---------------------------------------------------------------------------
+
+test('B-1 c3 door: max_parallel/overflow_at — the single-task form accepts the pair [1,32]; out-of-bounds rejects with the bound named', () => {
+  const ok = validateSpec({ ...VALID, max_parallel: '16', overflow_at: '1' }, { issue: 1 });
+  assert.ok(ok.ok, JSON.stringify(ok.errors));
+  assert.ok(validateSpec({ ...VALID, max_parallel: '32', overflow_at: 32 }, { issue: 1 }).ok, 'the ceiling itself is legal (int form too)');
+  for (const bad of [0, 33, 'x', -1]) {
+    const v = validateSpec({ ...VALID, max_parallel: bad }, { issue: 1 });
+    assert.ok(!v.ok, `max_parallel ${bad} rejected`);
+    assert.ok(v.errors.some(e => /max_parallel (0|33|-1) is outside \[1, 32\]|max_parallel must be an integer in \[1, 32\]/.test(e)), v.errors.join(' | '));
+  }
+  const oa = validateSpec({ ...VALID, overflow_at: 33 }, { issue: 1 });
+  assert.ok(!oa.ok && oa.errors.some(e => e.includes('overflow_at 33 is outside [1, 32]')), oa.errors.join(' | '));
+});
+
+test('B-1 c3 door: the tasks form takes the capacity knobs at the TOP level; an ENTRY carrying one is an unknown key', () => {
+  const ok = validateSpec({
+    mode: 'mock', lease_minutes: '15', max_parallel: '4', overflow_at: '1',
+    tasks: [
+      { id: 'T-1', behavior: 'fast', title: 'a' },
+      { id: 'T-2', behavior: 'hang', title: 'b' },
+    ],
+  }, { issue: 27 });
+  assert.ok(ok.ok, JSON.stringify(ok.errors));
+  // the epoch-level bound still governs in the tasks form
+  const bad = validateSpec({ max_parallel: '40', tasks: [{ id: 'T-1', behavior: 'fast', title: 'a' }] }, { issue: 27 });
+  assert.ok(!bad.ok && bad.errors.some(e => e.includes('max_parallel 40 is outside [1, 32]')), bad.errors.join(' | '));
+  // per-entry capacity keys are unknown keys — the posture is epoch-wide
+  const entry = validateSpec({ tasks: [{ id: 'T-1', behavior: 'fast', title: 'a', max_parallel: '4' }] }, { issue: 27 });
+  assert.ok(!entry.ok);
+  assert.ok(entry.errors.some(e => /task entry 1 \(T-1\): unknown key\(s\): max_parallel/.test(e)), entry.errors.join(' | '));
+});
+
+test('B-1 c3 door: the how-to documents the capacity knobs (the epoch-level surface a stranger sees)', () => {
+  const h = howToComment();
+  assert.ok(h.includes('`max_parallel` / `overflow_at` optional (epoch-level)'), 'the knob pair is documented');
+  assert.ok(h.includes('integer [1, 32]'), 'the bound is documented');
+  assert.ok(h.includes('`mode`, `lease_minutes`, `max_parallel`, `overflow_at`'), 'the tasks form\'s epoch-level key list carries them');
+});
