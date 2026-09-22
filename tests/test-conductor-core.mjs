@@ -16,8 +16,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { genesis, apply, invariants, TERMINAL, rebuild } from '../lib/fsm.mjs';
-import { conductorTick } from '../lib/conductor-core.mjs';
-import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
+import { conductorTick, specToTask, specEpoch } from '../lib/conductor-core.mjs';
+import { fastProject, nextMilestoneFactory, mockProject } from '../lib/mock-project.mjs';
 
 const T0 = Date.parse('2026-09-06T10:00:00.000Z');
 const NM = nextMilestoneFactory(fastProject());
@@ -869,4 +869,145 @@ test('W-C1-R/mut-c: prune idempotence EXTENDED — 8 post-prune ticks, exactly O
   assert.equal(pruneCount, 1, `exactly ONE PRUNE record for A (got ${pruneCount} — the mutation's damage was a second PRUNE + done_at wipe)`);
   assert.equal(s.tasks.A.done_at, firstDoneAt, 'done_at stable across the extended age');
   assert.deepEqual(Object.keys(s.tasks.A).sort(), ['attempts', 'done_at', 'id', 'pruned', 'status'].sort(), 'the compact shape stable');
+});
+
+// ---------------------------------------------------------------------------
+// s22/B-1 (staged-mode §2.2/§8 B-1): the MULTI-TASK GENESIS MAPPING —
+// specEpoch is the pure seam makeGenesis (conductor/turn.mjs) consumes: a
+// spec carrying `tasks` maps EVERY entry through the canonical specToTask;
+// a plain spec maps its single task (byte-identical to the pre-B-1 inline
+// shape). milestones_total stays 1 for BOTH lanes ("the task SET is the
+// project") — B-1's `milestones_total = tasks.length` formula would fire
+// the clock's generator at milestone 1 < N and re-sprout the mock M2/M3
+// (the lens-1 live-sprout bug); the no-sprout pin below is the teeth.
+// ---------------------------------------------------------------------------
+
+test('B-1 genesis: the multi-task mapping — 4 entries -> 4 specToTask tasks (canonical mapper per entry; deps CUT; issue/bodySha8 per task)', () => {
+  const spec = {
+    mode: 'mock', lease_minutes: '15',
+    tasks: [
+      { id: 'T-STG-A-1031', behavior: 'fast', title: 'staged nightly A (happy path)' },
+      { id: 'T-STG-B-1031', behavior: 'fast', title: 'staged nightly B (mirror overflow)' },
+      { id: 'T-STG-C-1031', behavior: 'infra-flaky', title: 'staged nightly C (infra retry)' },
+      { id: 'T-STG-H-1031', behavior: 'hang', title: 'staged nightly H (lease expiry)' },
+    ],
+  };
+  const ep = specEpoch(spec, { issue: 31, bodySha8: 'ab12cd34' });
+  assert.equal(ep.tasks.length, 4);
+  assert.equal(ep.milestones, 1, 'milestones_total = 1 — the task SET is the project (the B-1 formula would re-arm the mock generator; see the no-sprout pin)');
+  for (const t of ep.tasks) {
+    assert.equal(t.deps.length, 0, `deps stay CUT (${t.id})`);
+    assert.equal(t.spec.issue, 31, `the intake thread rides every task (${t.id})`);
+    assert.equal(t.spec.body_sha8, 'ab12cd34');
+  }
+  assert.equal(ep.tasks[0].id, 'T-STG-A-1031');
+  assert.equal(ep.tasks[0].behavior, 'fast');
+  assert.equal(ep.tasks[0].work_ms, 4000, 'the specToTask default');
+  assert.equal(ep.tasks[3].behavior, 'hang');
+  // a mixed entry with accept + artifacts maps through the same canonical shape
+  const mixed = specEpoch({ tasks: [{ id: 'T-1', title: 'real lane', accept: 'criteria', artifacts: ['tasks/T-1/r.md'] }] }, { issue: 9, bodySha8: 'x' });
+  assert.equal(mixed.tasks[0].behavior, 'real', 'an accept entry mints behavior real');
+  assert.deepEqual(mixed.tasks[0].spec.artifacts, ['tasks/T-1/r.md']);
+  assert.equal(mixed.tasks[0].spec.accept, 'criteria');
+});
+
+test('B-1 genesis: the single-task path is BYTE-IDENTICAL to the pre-B-1 inline shape (the backward-compat pin)', () => {
+  const spec = { id: 'T-501', title: 'research the frob', accept: 'one paragraph', milestone: '2' };
+  const ep = specEpoch(spec, { issue: 42, bodySha8: 'abcd1234' });
+  // the EXACT object the pre-B-1 makeGenesis built inline:
+  //   const task = specToTask(spec, { issue, bodySha8 });
+  //   { tasks: [task], milestones: 1 }
+  assert.deepEqual(ep, { tasks: [specToTask(spec, { issue: 42, bodySha8: 'abcd1234' })], milestones: 1 });
+  assert.equal(ep.tasks[0].id, 'T-501');
+  assert.equal(ep.tasks[0].behavior, 'real');
+  // the spec-level milestone key stays INERT metadata (dropped by the mapper, as pre-B-1)
+  assert.ok(!('milestone' in ep.tasks[0]));
+  // a specless epoch is the mock path (makeGenesis's other arm) — specEpoch is never called
+  assert.equal(specEpoch(null, { issue: 1 }).tasks[0].id, 'task-i1', 'null-safe single lane');
+});
+
+test('B-1 genesis: THE NO-SPROUT PIN — a 4-task spec epoch with the ADAPTER generator wired completes at M1, exactly 4 tasks (the lens-1 F2 bound generalized)', () => {
+  // the LIVE adapter wiring: the mock drill's generator (M2+M3), the exact
+  // wiring that live-sprouted pre-fold single-task epochs
+  const ADAPTER_NM = nextMilestoneFactory(mockProject());
+  const spec = {
+    mode: 'mock',
+    tasks: [
+      { id: 'STG-A', behavior: 'succeed', title: 'a' },
+      { id: 'STG-B', behavior: 'succeed', title: 'b' },
+      { id: 'STG-C', behavior: 'succeed', title: 'c' },
+      { id: 'STG-H', behavior: 'succeed', title: 'h' },
+    ],
+  };
+  const ep = specEpoch(spec, { issue: 31, bodySha8: 'ns01' });
+  let s = genesis({ config: { ...CFG, max_parallel: 4 }, project: ep, chainId: 'c-b1ns', now: iso(T0), mode: 'mock', issue: 31 });
+  assert.equal(s.project.milestones_total, 1);
+  // the genesis tick assigns all 4 (max_parallel 4)
+  s = apply(s, tickEv('ns1'), iso(T0 + 1000), ADAPTER_NM).state;
+  assert.equal(Object.values(s.tasks).filter(t => t.status === 'assigned').length, 4, 'all 4 assigned in the genesis tick');
+  // every task reports done
+  let n = 0;
+  for (const id of ['STG-A', 'STG-B', 'STG-C', 'STG-H']) {
+    s = apply(s, { kind: 'REPORT', event_id: `rep-ns-${++n}`, task: id, lease: s.tasks[id].lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: `r${n}` }, iso(T0 + 2000 + n), ADAPTER_NM).state;
+  }
+  assert.equal(s.project.phase, 'done', 'completed — the generator was NEVER consulted');
+  assert.equal(s.project.milestone, 1, 'still at M1');
+  assert.deepEqual(Object.keys(s.tasks).sort(), ['STG-A', 'STG-B', 'STG-C', 'STG-H'], 'exactly the 4 spec tasks — NO mock M2/M3 sprout');
+});
+
+test('B-1 rollover: a queued 4-entry spec births the 4-task epoch in the halting tick (the genesisSpec slim shape; A12-local)', () => {
+  // the REAL mapping through the REAL rollover: makeGenesis wired to
+  // specEpoch (the adapter's shape, minus the I/O)
+  const mkG = (() => { let n = 0; return ({ config, spec, issue, bodySha8 } = {}) => {
+    const cfg = config || { ...CFG };
+    const chainId = `c-b1roll-${++n}`;
+    if (spec) {
+      const ep = specEpoch(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
+      const g = genesis({ config: cfg, project: ep, chainId, now: iso(T0 + n), mode: spec.mode || 'mock', issue: issue ?? null });
+      return { state: g, spec: { tasks: ep.tasks, milestones: ep.milestones, chainId, mode: g.project.mode } };
+    }
+    const mp = fastProject();
+    const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 2 }, chainId, now: iso(T0 + n), mode: 'mock' });
+    return { state: g, spec: { tasks: mp.m1, milestones: 2, chainId, mode: 'mock' } };
+  }; })();
+  // a DONE one-task epoch + the queued 4-task spec (the staged nightly shape)
+  const ONE = { m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  let pre = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-b1pre2', now: iso(T0) });
+  pre = apply(pre, tickEv('b1r0'), iso(T0), nextMilestoneFactory(ONE)).state;
+  pre = apply(pre, { kind: 'REPORT', event_id: 'rep-b1r0', task: 'X', lease: pre.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r0' }, iso(T0 + 500), nextMilestoneFactory(ONE)).state;
+  assert.equal(pre.project.phase, 'done');
+  const qline = {
+    issue: 31, body_sha8: 'b1abcd99', author: 'op', enqueued_at: iso(T0), id: 'int-b1',
+    spec: {
+      mode: 'mock', lease_minutes: '15',
+      tasks: [
+        { id: 'T-STG-A-1031', behavior: 'fast', title: 'staged nightly A (happy path)' },
+        { id: 'T-STG-B-1031', behavior: 'fast', title: 'staged nightly B (mirror overflow)' },
+        { id: 'T-STG-C-1031', behavior: 'infra-flaky', title: 'staged nightly C (infra retry)' },
+        { id: 'T-STG-H-1031', behavior: 'hang', title: 'staged nightly H (lease expiry)' },
+      ],
+    },
+  };
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(pre), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('b1roll'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis: mkG,
+  });
+  assert.equal(out.state.project.phase, 'executing', 'the fresh epoch is live');
+  assert.equal(out.state.project.issue, 31, 'the intake thread rides the project');
+  assert.equal(out.state.project.milestones_total, 1, 'milestones_total=1 (the task SET is the project)');
+  assert.deepEqual(Object.keys(out.state.tasks).sort(), ['T-STG-A-1031', 'T-STG-B-1031', 'T-STG-C-1031', 'T-STG-H-1031'], 'the 4 mapped tasks');
+  assert.equal(out.state.tasks['T-STG-C-1031'].behavior, 'infra-flaky');
+  assert.equal(out.state.config.lease_minutes, 15, 'the spec-level lease rides the A4-F1 carry');
+  const rollRec = out.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset' && String(j.note || '').startsWith('intake-rollover'));
+  assert.ok(rollRec, 'the rollover journals as a CONTROL reset');
+  assert.equal(rollRec.genesisSpec.tasks.length, 4, 'A12-local: genesisSpec.tasks.length === 4');
+  assert.equal(rollRec.genesisSpec.milestones, 1, 'the slim genesisSpec carries the mapping (rebuild replays it verbatim)');
+  assert.equal(rollRec.genesisSpec.mode, 'mock');
+  // rebuild parity: the journal replays the 4-task epoch
+  const base = genesis({ config: { ...CFG }, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-b1par', now: iso(T0) });
+  const rb = rebuild(base, out.journal);
+  assert.equal(Object.keys(rb.tasks).length, 4, 'rebuild: all 4 tasks replay');
+  assert.equal(rb.tasks['T-STG-H-1031'].behavior, 'hang');
 });
