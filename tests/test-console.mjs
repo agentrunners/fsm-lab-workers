@@ -758,6 +758,34 @@ test('s21/O-4: a rejected configure → a REJECTED CONTROL record carrying comma
   assert.ok(src.includes('j.event_id'), 'the alert carries the minted event id when present');
 });
 
+// s22/M-1 + R2-3 (lens-1 MAJOR, lens-2 R2-3): the reset-twin false alarm. A
+// REJECTED 'reset-duplicate' record is the TWIN of an APPLIED reset (the F-1
+// same-drain guard doing its job — behaviorally pinned at test-console's F-12
+// reset-lane test + test-w2-conductor's F-1 suite), not a failed control.
+// Before the fold the O-4 arm alerted it with "fix the patch and re-send" —
+// advice that re-sends a reset onto a LIVE epoch and destroys it. The pin
+// extracts the arm's guard VERBATIM from the adapter source (self-executing
+// I/O script — the source-pin-with-eval discipline) and proves the twin
+// produces NO comment while every real rejection class still alerts.
+test('s22/M-1 + R2-3: a reset-duplicate REJECTED journal record produces NO comment (the twin of an APPLIED reset — the alarm would advise epoch destruction)', () => {
+  const src = readFileSync(join(ROOT, 'conductor/turn.mjs'), 'utf8');
+  const m = /if \((j\.kind === 'REJECTED' && j\.origKind === 'CONTROL'[^{]*?)\) \{/.exec(src);
+  assert.ok(m, 'the CONTROL-REJECTED arm exists with its guard');
+  const arm = new Function('j', `return (${m[1]});`);
+  // THE twin: never alerts (the reset APPLIED — one comment here would tell
+  // the operator to re-send it onto the live epoch)
+  const twin = { kind: 'REJECTED', origKind: 'CONTROL', command: 'reset', reason: 'reset-duplicate', id: 'e914', event_id: 'ctl-IC_node_9-reset-1789000000000' };
+  assert.equal(arm(twin), false, 'a reset-duplicate REJECTED record trips NO comment');
+  // the F11 re-delivery artifact still never alerts
+  assert.equal(arm({ kind: 'REJECTED', origKind: 'CONTROL', command: 'configure', reason: 'duplicate', id: 'e1' }), false, 'the re-delivery duplicate class stays silent');
+  // every REAL rejection class still alerts (the O-4 contract intact)
+  for (const reason of ['bad-patch-key(max_paralell)', 'bad-patch(config.lease_minutes must be an integer)', 'configure-noop', 'unparseable']) {
+    assert.equal(arm({ kind: 'REJECTED', origKind: 'CONTROL', command: 'configure', reason, id: 'e2', event_id: 'ctl-IC_x-configure-1' }), true, `reason ${reason} still alerts`);
+  }
+  // non-control REJECTED records never reach the arm
+  assert.equal(arm({ kind: 'REJECTED', origKind: 'REPORT', reason: 'reset-duplicate' }), false, 'a REPORT-flavored REJECTED record is not the arm\'s business');
+});
+
 test('F-12 baseline pin: node_id-less records keep event_id = c.id — the mint NEVER fires for pre-console records', () => {
   const s = bootOne();
   const legacy = { cmd: 'pause', id: 'ctl-1789000000123-abc123', note: null, sender: 'ops', ts: iso(T0 + 60_000) };

@@ -510,7 +510,14 @@ async function main() {
     // ctl-<nodeId>-<cmd>-<clockMs>) joins the ack's audit trail. The
     // 'duplicate' class is the F11 re-delivery artifact — never alerted, or
     // a redelivered queue line would re-post the same rejection.
-    if (j.kind === 'REJECTED' && j.origKind === 'CONTROL' && j.reason !== 'duplicate') {
+    // s22/M-1 + R2-3 (lens-1 MAJOR): 'reset-duplicate' joins the exclusion —
+    // it is the twin of an APPLIED reset (the F-1 same-drain guard doing its
+    // job), not a failed control. Alerting it told the operator to "fix the
+    // patch and re-send" a reset that ALREADY APPLIED — the re-send lands on
+    // a live epoch and destroys it (epoch wipe through the alert's own
+    // advice). The twin journals REJECTED + the log line; that is the whole
+    // visible trace it needs.
+    if (j.kind === 'REJECTED' && j.origKind === 'CONTROL' && j.reason !== 'duplicate' && j.reason !== 'reset-duplicate') {
       await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
     }
     if (j.kind === 'BUDGET') {
