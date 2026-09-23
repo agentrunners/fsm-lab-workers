@@ -35,17 +35,26 @@
 // nemotron-3.5-lightning:free] (T46/W-D §D2: the s19 cc-lane eval verdict —
 // deepseek primary, glm fallback for provider diversity, nemotron the free
 // tail; deepseek-v4-flash-0731:free is NEVER on this lane — it hallucinated
-// the eval task, silent content-poison), flattened KEY-MAJOR (every model on
-// key 1 before key 2's first), bounded by
-// budget.lane_attempts (default 3). INFRA-class lane failure (401/402/429/5xx
-// text-as-answer, transport-shaped stderr, budget-misconfigured truncation)
-// → next lane. s21/W1: a KEY-CLASS failure (401/402/429) JUMPS to the next
-// key's first lane — a drained primary fails over to KEY_2 inside the
-// dispatched budget instead of grinding the dead key's remaining models
-// (ccNextLaneIndex). WORK-class (the CLI ran and answered: empty completion,
-// deterministic app error, max-turns) → NO hop: rotating the lane cannot
-// change the answer. GHA runners rotate IPs naturally (the TOS-multi-account
-// concern's real answer); sandbox-origin calls are validity probes only.
+// the eval task, silent content-poison, and is 404-dead upstream anyway
+// (s23 probe §1b) — the exclusion is now self-enforcing), flattened
+// KEY-MAJOR (every model on key 1 before key 2's first), bounded by
+// budget.lane_attempts (default 3). INFRA-class lane failure
+// (401/402/429/5xx text-as-answer, transport-shaped stderr,
+// budget-misconfigured truncation) → next lane. s21/W1: a KEY-CLASS
+// failure (401/402/429) JUMPS to the next key's first lane — a drained
+// primary fails over to KEY_2 inside the dispatched budget instead of
+// grinding the dead key's remaining models (ccNextLaneIndex). s23/B1:
+// when there IS no next key (the LAST key's key-class failure — both paid
+// keys dry, the W1 live arc's terminal shape), the advance skips the dead
+// key's PAID siblings and lands on the same key's `:free` tail slot (the
+// FREE-TAIL rule: a $0 request passes the cost-proportional credit
+// pre-flight — a drained key still serves free traffic; the paid siblings
+// share the dead key's credit state, so burning a slot on glm is a
+// no-backoff retry of a known-dead key). WORK-class (the CLI ran and
+// answered: empty completion, deterministic app error, max-turns) → NO
+// hop: rotating the lane cannot change the answer. GHA runners rotate IPs
+// naturally (the TOS-multi-account concern's real answer); sandbox-origin
+// calls are validity probes only.
 //
 // THE WALL (F-M6): the spawn is PROCESS-GROUP-scoped (detached:true makes the
 // CLI its own group leader; kill(-pid) reaps the whole group). The adapter
@@ -102,11 +111,16 @@ const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 // ---------------------------------------------------------------------------
 
 export const CC_BRIDGE_BASE_URL = 'https://openrouter.ai/api/v1';
-export const CC_MODEL_CHAIN_DEFAULTS = [
+// s23/B2: the PAID defaults (the OPENROUTER-KEYS §S23 approved pair — paid
+// traffic rides ONLY these two models) and the FREE tail slot, composed by
+// ccModelChain. CC_MODEL_CHAIN_DEFAULTS stays the DEFAULT chain's exact
+// shape (the deployed [ds, glm, nemotron:free], pinned verbatim below).
+export const CC_PAID_MODEL_DEFAULTS = [
   'deepseek/deepseek-v4.1-flash',
   'z-ai/glm-5.3-flash',
-  'nvidia/nemotron-3.5-lightning:free',
 ];
+export const CC_TAIL_MODEL_DEFAULT = 'nvidia/nemotron-3.5-lightning:free';
+export const CC_MODEL_CHAIN_DEFAULTS = [...CC_PAID_MODEL_DEFAULTS, CC_TAIL_MODEL_DEFAULT];
 // SA-5: the web tools are DENIED at the CLI boundary (mcp-web replaces them)
 export const CC_PERMISSION_DENIES = ['WebFetch', 'WebSearch'];
 // CLI-internal scratch the adapter never claims as write-back (workdir-local,
@@ -121,7 +135,37 @@ export function ccModelChain(env = process.env) {
   // retry that pushes glm/nemotron and KEY_2's block further out of the
   // 3-slot dispatched budget (compounds W1, the unreachable failover).
   // Custom wins (the operator's head position); the duplicate slot drops.
-  return [...custom, ...CC_MODEL_CHAIN_DEFAULTS.filter((m) => !custom.includes(m))];
+  //
+  // s23/B2 — THE TAIL SLOT (the free-model tail design §2.2/§2.7): the
+  // chain's LAST position is a `:free` model — the landing spot the B1
+  // advance rule aims the LAST key's key-class failure at. The env knobs:
+  //   CC_TAIL_MODEL=<slug>  swaps the tail (MUST end ':free' — a LOUD throw
+  //                         otherwise: the tail is the FREE lane by hard
+  //                         rule, and a paid tail would silently serve
+  //                         outside the §S23 approved pair; even an
+  //                         APPROVED paid model is a bad tail — ccTurn
+  //                         converts the throw to infra_failed
+  //                         'bad-tail-model(...)')
+  //   CC_TAIL_MODEL=''      the escape hatch: no `:free` slot in the chain →
+  //   CC_TAIL_DISABLED=1    the B1 rule degenerates to the pre-s23 `+1`
+  //                         advance, byte-identical (the quality-vs-
+  //                         completion call stays the OPERATOR's)
+  const tailDisabled = env.CC_TAIL_DISABLED === '1'
+    || (typeof env.CC_TAIL_MODEL === 'string' && env.CC_TAIL_MODEL.trim() === '');
+  let tail = CC_TAIL_MODEL_DEFAULT;
+  if (typeof env.CC_TAIL_MODEL === 'string' && env.CC_TAIL_MODEL.trim() !== '') {
+    tail = env.CC_TAIL_MODEL.trim();
+    if (!tail.endsWith(':free')) {
+      throw new Error(`ccModelChain: CC_TAIL_MODEL must end ':free' (got ${JSON.stringify(tail)}) — the tail is the FREE lane by hard rule (OPENROUTER-KEYS §S23: paid traffic rides only deepseek/deepseek-v4.1-flash or z-ai/glm-5.3-flash); set CC_TAIL_MODEL='' (or CC_TAIL_DISABLED=1) to disable the tail instead`);
+    }
+  }
+  const paid = CC_PAID_MODEL_DEFAULTS.filter((m) => !custom.includes(m));
+  // the tail dedups against the custom head too (the W7 discipline: a
+  // custom CC_MODEL that IS the tail model must not mint an exact
+  // (key, model) repeat at the tail position; the free slot then sits at
+  // m1 — the tail-as-head degenerate, no FORWARD free sibling → +1)
+  if (tailDisabled || custom.includes(tail)) return [...custom, ...paid];
+  return [...custom, ...paid, tail];
 }
 
 export function ccKeyPool(env = process.env) {
@@ -157,6 +201,23 @@ export const CC_KEY_CLASS_STATUSES = new Set([401, 402, 429]);
 // [k1m3 skipped], k2m1, k2m2, k2m3 — the common case k1m1(402)→k2m1 is the
 // like-for-like retry). Everything else (transport, 5xx, 400/404, bridge
 // spawn) advances one lane as before.
+//
+// s23/B1 — THE FREE-TAIL RULE (the W1 live arc's fix): when the failing
+// lane's key is the LAST key in the pool (no next key to jump to — the
+// both-paid-keys-dry posture), the ordinary `+1` advance burns the budget's
+// final slot on the dead key's next PAID sibling (the W1 arc:
+// k1ds(401)→JUMP→k2ds(402)→+1→k2glm(402)→exhausted→infra-retry×2→QUARANTINE
+// while the free slot sat ONE index away untried). The paid siblings share
+// the dead key's credit state — probe §1a: glm 402s wherever deepseek 402s
+// on every drained key, and the CLI's fixed 32000-token ask cannot fit any
+// drained key on either approved paid model — while a $0 request passes
+// the cost-proportional credit pre-flight (or-079, OVERDRAWN −$0.384:
+// paid deepseek 402 / free cohere 200 on the SAME key, SAME max_tokens).
+// So: scan FORWARD within the SAME keyIndex block for the first lane whose
+// model ends ':free'; none found → `i + 1` (today's fallback — the tail is
+// a bridge, not an immunity: a 1-key pool with no free slot, a free-as-head
+// chain, and the tail's OWN key-class failure all fall through to the same
+// bounded exhaustion as before).
 export function ccNextLaneIndex(lanes, i, keyClassFailure) {
   if (!Array.isArray(lanes) || !Number.isInteger(i) || i < 0 || i >= lanes.length) return i + 1;
   if (!keyClassFailure) return i + 1;
@@ -164,7 +225,12 @@ export function ccNextLaneIndex(lanes, i, keyClassFailure) {
   for (let j = i + 1; j < lanes.length; j++) {
     if (lanes[j].keyIndex !== dead) return j;
   }
-  return i + 1;   // no other key in the pool — ordinary advance (exhaustion follows)
+  // no other key in the pool — the LAST key's key-class failure: the
+  // same key's next `:free` slot (skipping the credit-dead paid siblings)
+  for (let j = i + 1; j < lanes.length; j++) {
+    if (lanes[j].keyIndex === dead && typeof lanes[j].model === 'string' && lanes[j].model.endsWith(':free')) return j;
+  }
+  return i + 1;   // no free sibling either — ordinary advance (exhaustion follows)
 }
 
 // M-4: the CLI pin — the live-proven X20/X21 version is the DEFAULT (the
@@ -743,7 +809,25 @@ export async function ccTurn(envelope, opts = {}) {
   // the wall: the lease deadline AND the turn's own wall budget, whichever
   // bites first (the ABSOLUTE deadline still gates — F-G(a) arithmetic)
   const wallDeadlineMs = Math.min(envelope.deadline_ms, t0 + budget.wall_ms);
-  const lanes = ccLanes(env);
+  // s23/B2: the lane BUILD is guarded — a misconfigured CC_TAIL_MODEL
+  // (non-`:free`) throws LOUD in the pure chain builder; the TURN converts
+  // the throw to the reportable routable-infra marker (the visible-waste
+  // doctrine — the operator's misconfiguration is diagnosable from the
+  // journal, never a silent paid serve outside the approved pair) instead
+  // of dying unhandled before the report.
+  let lanes;
+  try {
+    lanes = ccLanes(env);
+  } catch (e) {
+    return {
+      status: 'infra_failed',
+      detail: `bad-tail-model(${String(e?.message ?? e).slice(0, 200)})`,
+      artifact_refs: [],
+      summary: `cc: task ${taskId} attempt ${attempt} could not build the lane chain — ${String(e?.message ?? e).slice(0, 140)}`,
+      telemetry: { turns: 0, wall_ms: now() - t0, lane_attempts_used: 0, lanes: [] },
+      models: [], lane_attempts_used: 0, duration_ms: now() - t0,
+    };
+  }
   // s21/O-3 (audit a5): the POOL SIZE — distinct keys in the product (the
   // key-major flatten repeats each keyIndex once per model). This is the
   // modulo-base half of the serving-key pair the outcome now carries.
@@ -808,6 +892,7 @@ export async function ccTurn(envelope, opts = {}) {
             lane: i + 1, key_index: lane.keyIndex, model: lane.model,
             rc: null, signal: null, duration_ms: 0, wall_killed: false,
             class: 'infra', bridge_error: String(e?.message ?? e).slice(0, 120),
+            ...(typeof lane.model === 'string' && lane.model.endsWith(':free') ? { lane_class: 'free-tail' } : {}),
           });
           lastClass = `cc-bridge(${String(e?.message ?? e).slice(0, 80)})`;
           laneIdx = ccNextLaneIndex(lanes, laneIdx, false);
@@ -845,6 +930,12 @@ export async function ccTurn(envelope, opts = {}) {
         lane: i + 1, key_index: lane.keyIndex, model: lane.model,
         rc: r.rc, signal: r.signal ?? null, duration_ms: now() - laneT0,
         wall_killed: r.wallKilled, class: null,
+        // s23/B3: the free-tail marker — a lane whose model ends ':free' is
+        // the chain's tail slot (the slug derivation, §6.3's adjudicated
+        // v1: no fsm.mjs schema change). Rides telemetry.lanes[] verbatim
+        // (the adapter's OWN display space, 1-based key_index unchanged);
+        // the journal/console derive the tail from lane_stats' `:free` slug.
+        ...(typeof lane.model === 'string' && lane.model.endsWith(':free') ? { lane_class: 'free-tail' } : {}),
       };
       laneLog.push(laneInfo);
       models.push(lane.model);

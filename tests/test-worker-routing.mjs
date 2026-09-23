@@ -612,15 +612,21 @@ test('routing: W2 payload with mode=cc — the envelope budget bounds the lane c
   assert.equal(rep.outcome.status, 'infra_failed', 'every lane answered 429-text-as-answer → infra hop, hop, exhausted');
   assert.equal(rep.outcome.telemetry.lane_attempts_used, 3, 'W2 mints lane_attempts:3 — exactly three fake spawns');
   assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
-  // s21/W1: the E11 429 conviction is KEY-CLASS — attempt 1 (key-1 deepseek)
-  // JUMPS to key 2's first lane; attempts 2-3 burn key-2 lanes (no next key
-  // to jump to → ordinary model advance). Both keys rate-limited = the
-  // honest exhaustion shape; the budget still bounds the spawns exactly.
+  // s23/B5 — THE BEHAVIORAL PIN (the mutation spot): s21/W1's key-jump puts
+  // attempt 2 on key-2 deepseek; attempt 3 — the LAST key's key-class
+  // failure — now lands on the FREE TAIL (k2/nemotron:free), NOT the paid
+  // glm sibling (was [k1/ds, k2/ds, k2/glm] pre-s23: the glm slot burned on
+  // a model that shares the dead key's credit state while the :free slot
+  // sat one index away). The tail ALSO 429s here (the plain marker fires on
+  // every lane — the honest both-keys-quota-dead shape) → the exhaustion
+  // message is UNCHANGED: lane-exhausted(3/6) — the tail is a bridge, not
+  // an immunity.
   assert.deepEqual(rep.outcome.telemetry.lanes?.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
     [2, 'deepseek/deepseek-v4.1-flash'],
-    [2, 'z-ai/glm-5.3-flash'],
-  ], 'key-jump after the key-1 429, then key-2 model advance — three spawns, two keys served');
+    [2, 'nvidia/nemotron-3.5-lightning:free'],
+  ], 'key-jump after the key-1 429, then the FREE TAIL — three spawns, two keys served, the third slot is the :free lane');
+  assert.equal(rep.outcome.telemetry.lanes[2].lane_class, 'free-tail', 'B3: the tail marker rides the laneLog row');
 });
 
 test('routing: W2 payload with mode=real — the envelope budget bounds the lane chain (lane_attempts rides the dispatch)', async () => {

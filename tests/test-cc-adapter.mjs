@@ -501,6 +501,12 @@ test('cc rotation (B-1): key-1 exit-api-429 lane → JUMPS to key 2 and RECOVERS
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.class]), [
     [1, 'infra'], [2, 'done'],
   ]);
+  // s23/B6 (re-asserted, UNCHANGED by the tail): a HEALTHY key-2 means the
+  // tail NEVER fires — it aims only the LAST key's key-class failure. No
+  // `:free` lane was ever tried; the free slot stays reachable at m3 only
+  // through ordinary advance (5xx/provider-diversity), never needed here.
+  assert.ok(!result.models.some(m => typeof m === 'string' && m.endsWith(':free')),
+    'B6: no :free lane fired — the tail is the both-paid-keys-dry last resort, not a mid-ladder hop');
   roots.cleanup();
 });
 
@@ -525,9 +531,115 @@ test('cc W1 HEADLINE: key-1 402s on every lane at the DISPATCHED budget (lane_at
   roots.cleanup();
 });
 
-test('cc W1: single-key pool — the key-jump degenerates to ordinary advance (byte-identical rotation)', async () => {
-  // no second key: ccNextLaneIndex has no next key to jump to — the advance
-  // is +1 exactly as before (the 1-key deployment is unchanged by W1)
+test('cc s23 HEADLINE (B1+B2+B3): BOTH keys 402-shaped at the dispatched budget — the FREE TAIL completes the turn (the W1 quarantine arc becomes a done turn)', async () => {
+  // the W1 live arc's terminal shape: the drained primary (402) fails over
+  // to key 2, key 2 is ALSO credit-dry (402) — pre-s23 the third slot
+  // burned on k2/glm (the paid sibling sharing the dead key's credit state)
+  // → lane-exhausted(3/6) → net-zero ×3 → infra-exhausted QUARANTINE while
+  // the :free slot sat one index away untried. s23/B1's rule redirects that
+  // final slot to the tail: probe §1a's citation pair (paid 402 / free 200
+  // on the SAME overdrawn key, SAME 32K ask) — a $0 request passes the
+  // cost-proportional credit gate. The fixture keys on the LANE MODEL's
+  // freeness (the fake's unless-free form): paid lanes exit the real CLI
+  // error-exit shape, the :free lane answers normally.
+  const { result, roots } = await turn(fakeEnv(), {
+    prompt: '[fixture:exit-api-402-unless-free] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(classifyOutcome(result).status, 'done', 'the both-keys-dry arc now completes INSIDE the same 3-slot budget');
+  assert.equal(result.lane_attempts_used, 3, 'the tail REPLACES the last paid lane — the budget does NOT grow');
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model, l.class]), [
+    [1, 'deepseek/deepseek-v4.1-flash', 'infra'],
+    [2, 'deepseek/deepseek-v4.1-flash', 'infra'],
+    [2, 'nvidia/nemotron-3.5-lightning:free', 'done'],
+  ], 'k1ds(402) →JUMP→ k2ds(402) →TAIL→ k2nem(:free) — the brief\'s exact arithmetic');
+  // B3: the free-tail marker rides the laneLog row (the slug derivation)
+  assert.equal(result.telemetry.lanes[2].lane_class, 'free-tail');
+  assert.equal('lane_class' in result.telemetry.lanes[0], false, 'the paid lanes carry no tail marker');
+  // the third spawn's boundary rode the :free slug on the SAME (last) key —
+  // the tail inherits the last auth-known-alive key (the W1 key-jump has
+  // already rotated past auth-dead keys by the time the tail fires)
+  const e2 = readEcho(roots, 2);
+  assert.equal(e2.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the tail rides the LAST key (both paid keys dry, key 2 still auth-alive)');
+  roots.cleanup();
+});
+
+test('cc s23 (B2 escape hatch): CC_TAIL_MODEL=\'\' — the both-keys-dry arc is the PRE-s23 ladder again (byte-identical degenerate)', async () => {
+  const { result, roots } = await turn(fakeEnv({ CC_TAIL_MODEL: '' }), {
+    prompt: '[fixture:exit-api-402-unless-free] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(result.status, 'infra_failed', 'no :free slot → the third slot burns on the paid sibling again');
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
+    [1, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'z-ai/glm-5.3-flash'],
+  ], 'the pre-s23 W1 arc verbatim: k1ds → k2ds → k2glm (the quality-vs-completion call stays the OPERATOR\'s)');
+  roots.cleanup();
+});
+
+test('cc s23 (B2 swap): CC_TAIL_MODEL=cohere — the tail slot swaps without a code change (the reliability alternative, one env line)', async () => {
+  const { result, roots } = await turn(fakeEnv({ CC_TAIL_MODEL: 'cohere/north-mini-code:free' }), {
+    prompt: '[fixture:exit-api-402-unless-free] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(classifyOutcome(result).status, 'done');
+  assert.deepEqual(result.telemetry.lanes.map(l => l.model), [
+    'deepseek/deepseek-v4.1-flash',
+    'deepseek/deepseek-v4.1-flash',
+    'cohere/north-mini-code:free',
+  ]);
+  assert.equal(result.telemetry.lanes[2].lane_class, 'free-tail');
+  roots.cleanup();
+});
+
+test('cc s23 (B2 hard rule): a non-`:free` CC_TAIL_MODEL — LOUD throw converted to the reportable infra marker bad-tail-model (zero spawns)', async () => {
+  // the §2.7 hard rule: the tail is `:free`, ALWAYS — a paid tail (even an
+  // APPROVED paid model) would silently serve paid traffic on the exact
+  // path taken when credit is the problem. The pure chain builder throws;
+  // the TURN reports infra_failed with the distinct detail instead of dying
+  // unhandled (the visible-waste doctrine — diagnosable from the journal).
+  const { result, roots } = await turn(fakeEnv({ CC_TAIL_MODEL: 'z-ai/glm-5.3-flash' }), {
+    prompt: 'go', budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(result.status, 'infra_failed');
+  assert.match(result.detail, /bad-tail-model\(ccModelChain: CC_TAIL_MODEL must end ':free'/);
+  assert.equal(result.lane_attempts_used, 0, 'zero spawns — the misconfiguration never burns a lane');
+  assert.deepEqual(result.telemetry.lanes, []);
+  roots.cleanup();
+});
+
+test('cc s23 (the bridge, not an immunity): the tail ALSO fails key-class — the SAME bounded exhaustion (the quarantine verdict stays reachable)', async () => {
+  // the plain marker fires on EVERY lane (the 429 = the key's free-daily
+  // quota gone, or 401 = the key died between lanes): the tail 429s → the
+  // rule finds no FORWARD free sibling → +1 → the budget exhausts at 3 →
+  // the net-zero infra-retry ladder → the honest infra-exhausted quarantine.
+  // A fleet that exhausts even its free lane is honestly quarantinable.
+  const { result, roots } = await turn(fakeEnv(), {
+    prompt: '[fixture:exit-api-402] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  });
+  assert.equal(result.status, 'infra_failed');
+  assert.match(result.detail, /lane-exhausted\(3\/6 lanes, last lane-402\)/);
+  assert.equal(result.lane_attempts_used, 3);
+  assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
+    [1, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'deepseek/deepseek-v4.1-flash'],
+    [2, 'nvidia/nemotron-3.5-lightning:free'],
+  ], 'the third slot is still the tail — it just ALSO 402s (the exhaustion shape is unchanged)');
+  roots.cleanup();
+});
+
+test('cc W1: single-key pool — the key-jump degenerates to the tail skip (the last key IS the only key)', async () => {
+  // no second key: ccNextLaneIndex has no next key to jump to — s23/B1's
+  // rule then applies (the pool's only key is trivially the LAST key): the
+  // key-class failure skips the paid sibling and lands on the SAME key's
+  // `:free` slot. Pre-s23 this advanced +1 to glm (the paid sibling shares
+  // the dead key's credit state — the same no-backoff-retry rationale); the
+  // 1-key 402 arc now reaches the free slot at attempt 2 instead of 3.
+  // CC_TAIL_MODEL='' restores the pre-s23 ladder byte-identically (the
+  // escape hatch, pinned in the pure block below).
   const { result, roots } = await turn({ CC_FAKE_LLM: '1', OPENROUTER_API_KEY: KEY1 }, {
     prompt: '[fixture:exit-api-429] go',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 2 },
@@ -536,8 +648,8 @@ test('cc W1: single-key pool — the key-jump degenerates to ordinary advance (b
   assert.match(result.detail, /lane-exhausted\(2\/3 lanes, last lane-429\)/);
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
-    [1, 'z-ai/glm-5.3-flash'],
-  ], 'same-key model-chain rotation — the pre-W1 shape');
+    [1, 'nvidia/nemotron-3.5-lightning:free'],
+  ], 'the 1-key key-class ladder: ds → the :free tail (glm skipped — credit-dead sibling)');
   roots.cleanup();
 });
 
@@ -549,7 +661,9 @@ test('cc lane advance (W1 pure): ccNextLaneIndex — key-class jumps the key blo
   // key-class mid-block (k1m2) → still the next key's FIRST lane (k2m1):
   // the product is consumed strictly in order, dead-key tails skipped
   assert.equal(ccNextLaneIndex(lanes, 1, true), 3);
-  // key-class on the LAST key (k2m2) → no next key: ordinary advance
+  // key-class on the LAST key (k2m2) → no next key: the same key's :free
+  // slot is the IMMEDIATE next lane — the s23 tail answer and the pre-s23
+  // +1 answer COINCIDE here (5 either way)
   assert.equal(ccNextLaneIndex(lanes, 4, true), 5);
   // key-class on the very last lane → advance past the end (exhaustion)
   assert.equal(ccNextLaneIndex(lanes, 5, true), 6);
@@ -563,6 +677,91 @@ test('cc lane advance (W1 pure): ccNextLaneIndex — key-class jumps the key blo
   assert.equal(ccNextLaneIndex(null, 0, true), 1);
   // the key-class set is exactly the free lane's M5 rotate-class
   assert.deepEqual([...CC_KEY_CLASS_STATUSES].sort(), [401, 402, 429]);
+});
+
+test('cc tail (s23/B1 pure): the LAST key\'s key-class failure skips the paid siblings — the same key\'s next `:free` slot', () => {
+  const lanes = ccLanes(fakeEnv());   // 6 lanes: k1[ds,glm,nem], k2[ds,glm,nem]
+  // THE RULE (the W1 live arc's fix, design §2.1): i=3 (k2/ds) key-class →
+  // NO next key → the same key's next :free slot (5 = k2/nemotron:free),
+  // NOT +1 (4 = k2/glm — the paid sibling that shares the dead key's
+  // credit state: probe §1a, glm 402s wherever deepseek 402s on every
+  // drained key; the W1 live arc burned its third slot exactly there)
+  assert.equal(ccNextLaneIndex(lanes, 3, true), 5);
+  // the tail itself fails key-class → no FORWARD free sibling → +1 past
+  // the end (exhaustion — the tail is a bridge, not an immunity)
+  assert.equal(ccNextLaneIndex(lanes, 5, true), 6);
+  // a 3-key pool (hand-built — ccKeyPool reads 2 env slots today): the
+  // rule fires ONLY on the LAST key; k2's key-class still JUMPS to k3
+  // (the adjudicated v1 posture: the budget of 3 exhausts on the three
+  // keys' primaries before any tail — the 3-key question stays deferred)
+  const three = [];
+  for (const keyIndex of [1, 2, 3]) {
+    for (const model of ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'nvidia/nemotron-3.5-lightning:free']) {
+      three.push({ key: `k${keyIndex}`, keyIndex, model });
+    }
+  }
+  assert.equal(ccNextLaneIndex(three, 3, true), 6, 'k2 key-class → the k3 JUMP (not the k2 tail)');
+  assert.equal(ccNextLaneIndex(three, 6, true), 8, 'k3/ds key-class (the LAST key) → the k3 tail (k3/nemotron:free)');
+  // degenerate lanes with no free slot at all: a paid-only array — the
+  // rule degenerates to +1 byte-for-byte
+  const paidOnly = [
+    { key: 'k1', keyIndex: 1, model: 'deepseek/deepseek-v4.1-flash' },
+    { key: 'k1', keyIndex: 1, model: 'z-ai/glm-5.3-flash' },
+    { key: 'k2', keyIndex: 2, model: 'deepseek/deepseek-v4.1-flash' },
+    { key: 'k2', keyIndex: 2, model: 'z-ai/glm-5.3-flash' },
+  ];
+  assert.equal(ccNextLaneIndex(paidOnly, 2, true), 3, 'no :free lane exists → +1 (today\'s fallback)');
+});
+
+test('cc tail (s23/B2 pure): CC_TAIL_MODEL — the override, the `:free` hard rule, the escape hatches, the default-chain constraint', () => {
+  // the default-chain constraint pin (§2.7 item 2): the DEFAULT chain's
+  // non-tail models ARE the §S23 approved paid pair; the tail is `:free`.
+  // (A custom CC_MODEL that is neither approved-nor-`:free` rides the head
+  // at the operator's own call — the free-form head predates s23 and stays
+  // the operator's position; the tail slot is where the hard rule binds.)
+  assert.deepEqual(ccModelChain({}), CC_MODEL_CHAIN_DEFAULTS);
+  const nonTail = ccModelChain({}).filter(m => !m.endsWith(':free'));
+  assert.deepEqual(nonTail, ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
+    'the non-tail defaults ∈ the §S23 approved pair — paid traffic rides ONLY these two');
+  assert.ok(CC_MODEL_CHAIN_DEFAULTS[CC_MODEL_CHAIN_DEFAULTS.length - 1].endsWith(':free'),
+    'the chain\'s LAST slot is the :free tail');
+  // the override: a valid :free slug swaps the tail without a code change
+  assert.deepEqual(ccModelChain({ CC_TAIL_MODEL: 'cohere/north-mini-code:free' }),
+    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'cohere/north-mini-code:free']);
+  // the hard rule (§2.7 item 1): a paid tail throws LOUD — even an APPROVED
+  // paid model (the tail is the FREE lane by design; a paid tail would
+  // burn credit on the exact path taken when credit is the problem)
+  assert.throws(() => ccModelChain({ CC_TAIL_MODEL: 'z-ai/glm-5.3-flash' }), /CC_TAIL_MODEL must end ':free'/);
+  assert.throws(() => ccModelChain({ CC_TAIL_MODEL: 'deepseek/deepseek-v4.1-flash' }), /CC_TAIL_MODEL must end ':free'/);
+  assert.throws(() => ccModelChain({ CC_TAIL_MODEL: 'vendor/paid-model' }), /CC_TAIL_MODEL must end ':free'/);
+  // the escape hatches: '' and CC_TAIL_DISABLED=1 drop the slot — the B1
+  // rule then degenerates to the pre-s23 +1 advance, byte-identical
+  assert.deepEqual(ccModelChain({ CC_TAIL_MODEL: '' }),
+    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'], 'the empty string = the tail is OFF');
+  assert.deepEqual(ccModelChain({ CC_TAIL_DISABLED: '1' }),
+    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'], 'the dedicated kill switch');
+  // the paid-only chain + the rule: the escape hatch is behavioral, not
+  // just shape — the degenerate ladder is +1 (k2ds → k2glm, today's arc)
+  const paid = ccLanes(fakeEnv({ CC_TAIL_MODEL: '' }));
+  assert.deepEqual(paid.map(l => l.model),
+    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash']);
+  assert.equal(ccNextLaneIndex(paid, 0, true), 2, 'the key-jump still fires (k1ds → k2ds)');
+  assert.equal(ccNextLaneIndex(paid, 2, true), 3, 'k2ds key-class, no next key, NO free sibling → +1 (k2glm — the pre-s23 arc, byte-identical)');
+  // the tail-as-head degenerate: the :free slot at m1 (a custom CC_MODEL
+  // that IS free) — from a later k2 lane there is no FORWARD free sibling
+  // (the head sits behind) → +1
+  const freeHead = ccLanes(fakeEnv({ CC_MODEL: 'cohere/north-mini-code:free', CC_TAIL_MODEL: '' }));
+  assert.deepEqual(freeHead.map(l => l.model).slice(0, 3),
+    ['cohere/north-mini-code:free', 'deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash']);
+  assert.equal(ccNextLaneIndex(freeHead, 3, true), 4, 'k2/cohere key-class → no FORWARD free sibling → +1 (k2/ds)');
+  // the W7 dedup survives the split: a custom head dedups against the PAID
+  // defaults, and a custom head that IS the tail model dedups the tail slot
+  // (no exact (key, model) repeat at m1 AND m3)
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'z-ai/glm-5.3-flash' }),
+    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'nvidia/nemotron-3.5-lightning:free']);
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'nvidia/nemotron-3.5-lightning:free' }),
+    ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
+    'the free-as-head chain: the tail slot dedups (W7 discipline); the free slot sits at m1');
 });
 
 test('cc exit-json helpers (B-1 pure): the stdout parse + the numeric-status trigger', () => {

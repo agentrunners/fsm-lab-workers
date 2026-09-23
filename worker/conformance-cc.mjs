@@ -293,6 +293,79 @@ matrix.push(await matrixRow({
     `status=${result.status} detail=${result.detail}`);
   rmSync(roots, { recursive: true, force: true });
 }
+
+// ---------------------------------------------------------------------------
+// s23 — THE FREE TAIL (B7): the tail-fire row (both paid keys 402-shaped at
+// the dispatched budget — the W1 live arc's terminal shape — the :free tail
+// completes the turn) + the tail-also-fails row (the exhaustion shape is
+// UNCHANGED — the tail is a bridge, not an immunity) + the hard-rule row
+// (a non-`:free` CC_TAIL_MODEL → the reportable bad-tail-model marker).
+// The fixture keys on the LANE MODEL's freeness: paid lanes exit the REAL
+// CLI error-exit shape, `:free` lanes answer normally — the design probe
+// §1a's citation pair verbatim (or-079, OVERDRAWN −$0.384: paid deepseek
+// 402 / free cohere 200 on the SAME key, SAME 32K ask).
+// ---------------------------------------------------------------------------
+
+{
+  const { result, roots } = await adapterTurn(mkEnvelope({
+    prompt: '[fixture:exit-api-402-unless-free] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  }), { keepRoots: true });
+  const ladder = result.telemetry.lanes.map(l => [l.key_index, l.model, l.class]);
+  check('tail (s23): both paid keys 402-shaped at the dispatched budget — the FREE TAIL completes the turn (the W1 quarantine arc becomes a done turn)',
+    eq(classifyOutcome(result).status, 'done') && eq(result.lane_attempts_used, 3)
+      && eq(JSON.stringify(ladder), JSON.stringify([
+        [1, 'deepseek/deepseek-v4.1-flash', 'infra'],
+        [2, 'deepseek/deepseek-v4.1-flash', 'infra'],
+        [2, 'nvidia/nemotron-3.5-lightning:free', 'done'],
+      ]))
+      && eq(result.telemetry.lanes[2].lane_class, 'free-tail')
+      && eq('lane_class' in result.telemetry.lanes[0], false),
+    `status=${classifyOutcome(result).status} used=${result.lane_attempts_used} ladder=${JSON.stringify(ladder)}`);
+  // the third spawn's boundary rode the :free slug on the SAME (last) key —
+  // the tail inherits the last auth-known-alive key (the key-jump already
+  // rotated past auth-dead keys by the time the tail fires)
+  const e2 = readEcho(roots, 2);
+  check('tail (s23): the third spawn rode the :free slug on the LAST key (the tail inherits the last auth-alive key)',
+    eq(e2.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3.5-lightning:free') && eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2),
+    `model=${e2.env.ANTHROPIC_MODEL} auth=${e2.env.ANTHROPIC_AUTH_TOKEN === KEY2 ? 'key2 (last)' : 'OTHER'}`);
+  rmSync(roots, { recursive: true, force: true });
+}
+{
+  // the tail-also-fails row: the plain marker fires on EVERY lane (429 = the
+  // key's free-daily quota gone; 401 = the key died between lanes) — the
+  // tail's OWN key-class failure finds no forward free sibling → the SAME
+  // bounded exhaustion (a fleet that exhausts even its free lane is honestly
+  // quarantinable — the F-6 window sees the tail's 429s like paid 429s)
+  const { result, roots } = await adapterTurn(mkEnvelope({
+    prompt: '[fixture:exit-api-402] go',
+    budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
+  }));
+  const ladder = result.telemetry.lanes.map(l => [l.key_index, l.model]);
+  check('tail (s23): the tail-also-fails row — the SAME exhaustion shape (lane-exhausted 3/6, the quarantine verdict stays reachable)',
+    eq(result.status, 'infra_failed') && result.detail.includes('lane-exhausted(3/6 lanes, last lane-402)')
+      && eq(result.lane_attempts_used, 3)
+      && eq(JSON.stringify(ladder), JSON.stringify([
+        [1, 'deepseek/deepseek-v4.1-flash'],
+        [2, 'deepseek/deepseek-v4.1-flash'],
+        [2, 'nvidia/nemotron-3.5-lightning:free'],
+      ])),
+    `status=${result.status} detail=${result.detail} used=${result.lane_attempts_used} ladder=${JSON.stringify(ladder)}`);
+  rmSync(roots, { recursive: true, force: true });
+}
+{
+  // the §2.7 hard rule at the turn level: a paid CC_TAIL_MODEL never
+  // silently serves — the chain builder's throw converts to the reportable
+  // routable-infra marker (zero spawns)
+  const { result, roots } = await adapterTurn(mkEnvelope({ prompt: 'go' }), {
+    env: { ...fakeEnv, CC_TAIL_MODEL: 'z-ai/glm-5.3-flash' },
+  });
+  check('tail (s23): a non-`:free` CC_TAIL_MODEL → infra_failed bad-tail-model (the hard rule, LOUD, zero spawns)',
+    eq(result.status, 'infra_failed') && /bad-tail-model\(ccModelChain: CC_TAIL_MODEL must end ':free'/.test(result.detail ?? '')
+      && eq(result.lane_attempts_used, 0),
+    `status=${result.status} detail=${result.detail} used=${result.lane_attempts_used}`);
+  rmSync(roots, { recursive: true, force: true });
+}
 {
   const { result, roots } = await adapterTurn(mkEnvelope({ prompt: '[fixture:scratch] go' }));
   check('shape:the CLI scratch is never a claim',

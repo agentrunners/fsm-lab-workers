@@ -47,6 +47,14 @@
 //                             ANTHROPIC_AUTH_TOKEN contains <substr> — the
 //                             rotation-RECOVERY fixture (key-1 lanes exit
 //                             with the API error, a key-2 lane completes)
+//   [fixture:exit-api-<status>-unless-free]
+//                             the same error-exit shape ONLY when
+//                             ANTHROPIC_MODEL does NOT end ':free' — the
+//                             s23 FREE-TAIL drill (the design probe §1a's
+//                             citation pair verbatim: PAID lanes exit the
+//                             key-class error on a drained key, the `:free`
+//                             tail lane answers — the W1 both-keys-dry arc
+//                             k1ds(402)→JUMP→k2ds(402)→TAIL→k2nem done)
 //   [fixture:sleep-ms=<n>]    sleeps <n> REAL ms (spawning a same-group
 //                             grandchild that sleeps longer — the group-kill
 //                             proof), then normal done
@@ -96,13 +104,17 @@ const ENVS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL',
 const marker = (name) => prompt.includes(`[fixture:${name}]`);
 const sleepMatch = /\[fixture:sleep-ms=(\d+)\]/.exec(prompt);
 const ifMatch = /\[fixture:429-if:([^\]]+)\]/.exec(prompt);
-// the REAL CLI error-exit family (B-1): -if wins over the plain form
+// the REAL CLI error-exit family (B-1): -if wins over the plain form;
+// s23: -unless-free keys on the LANE MODEL's freeness (the tail drill)
 const apiExitIf = /\[fixture:exit-api-(\d{3})-if:([^\]]+)\]/.exec(prompt);
-const apiExitPlain = !apiExitIf ? /\[fixture:exit-api-(\d{3})\]/.exec(prompt) : null;
+const apiExitUnlessFree = !apiExitIf ? /\[fixture:exit-api-(\d{3})-unless-free\]/.exec(prompt) : null;
+const apiExitPlain = !apiExitIf && !apiExitUnlessFree ? /\[fixture:exit-api-(\d{3})\]/.exec(prompt) : null;
 const apiExitStatus = apiExitIf ? parseInt(apiExitIf[1], 10)
-  : (apiExitPlain ? parseInt(apiExitPlain[1], 10) : null);
+  : (apiExitUnlessFree ? parseInt(apiExitUnlessFree[1], 10)
+    : (apiExitPlain ? parseInt(apiExitPlain[1], 10) : null));
 const apiExitArmed = apiExitStatus !== null
-  && (!apiExitIf || String(process.env.ANTHROPIC_AUTH_TOKEN || '').includes(apiExitIf[2]));
+  && (!apiExitIf || String(process.env.ANTHROPIC_AUTH_TOKEN || '').includes(apiExitIf[2]))
+  && (!apiExitUnlessFree || !String(process.env.ANTHROPIC_MODEL || '').endsWith(':free'));
 
 // ---- the artifact-writing fixtures (the write-back surface) ---------------
 // The adapter hands the CLI a temp workdir and scans it after the turn; these
@@ -158,7 +170,7 @@ if (process.env.FAKE_CC_ECHO_PATH) {
     fixtures: [
       ...(sleepMatch ? [`sleep-ms=${sleepMatch[1]}`] : []),
       ...(ifMatch ? [`429-if:${ifMatch[1]}`] : []),
-      ...(apiExitStatus !== null ? [`exit-api-${apiExitStatus}${apiExitIf ? `-if:${apiExitIf[2]}` : ''}`] : []),
+      ...(apiExitStatus !== null ? [`exit-api-${apiExitStatus}${apiExitIf ? `-if:${apiExitIf[2]}` : ''}${apiExitUnlessFree ? '-unless-free' : ''}`] : []),
       ...['429', 'auth-text', 'done-marker-prose', 'reasoning', 'fail', 'exit-transport', 'exit-app', 'dup-report', 'max-turns', 'artifacts', 'scratch', 'wb-violation'].filter(m => marker(m)),
     ],
   }, null, 2));
