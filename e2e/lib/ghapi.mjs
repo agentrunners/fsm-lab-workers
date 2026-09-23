@@ -188,7 +188,16 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
       const repo = decodeURIComponent(m[1]);
       const wf = decodeURIComponent(m[2]);
       if (!/^(conductor|worker)\.yml$/.test(wf)) return send(404, { message: 'Not Found' });
-      let runs = runsProvider ? runsProvider(repo, wf) : [];
+      // (s23 fix — the workflow-name vocabulary: the URL carries the workflow
+      // FILE id ('worker.yml' — GitHub's API shape), but the scheduler's run
+      // ledger keys runs by the bare workflow NAME ('worker'). The old pass-
+      // through matched NOTHING: every runs page served an EMPTY array, so
+      // the law-4 union scan fetched "both buckets" and saw ZERO runs
+      // forever (runs=0 keys=0 — the fail-open design masked it: no flips,
+      // green-looking no-flip asserts on an empty scan). Normalize here —
+      // the ROUTE knows the URL shape; the provider contract stays
+      // "ledger runs for workflow <name>".)
+      let runs = runsProvider ? runsProvider(repo, wf.replace(/\.yml$/, '')) : [];
       const created = q.get('created');
       if (created) {
         // the law-4 created>= floor (encoded '>=<ISO>')
