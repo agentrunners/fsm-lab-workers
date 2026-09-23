@@ -426,7 +426,7 @@ export async function run({ quick, seed } = {}) {
     const apiBase = await ghapi.listen();
     world = createWorld({
       scratchDir, mainRepo: 'local/fsm-lab', repo2: 'local/fsm-lab-workers',
-      worktreeRoot: ROOT, apiBase, log: flog, keep: false,
+      worktreeRoot: ROOT, apiBase, log: flog, keep: process.env.CHAOS_KEEP === '1',
     });
     world.boot();
     ghapi.openIssue('local/fsm-lab', {
@@ -549,31 +549,62 @@ export async function run({ quick, seed } = {}) {
       }
     }
 
-    // the dispatch map: every fsm-task POST the conductor ever made
-    const dispatchMap = new Map();   // runId -> {task, attempt, t}
+    // the dispatch ledger: every fsm-task POST the conductor ever made, keyed
+    // by the payload's OWN identity — (task, attempt). The dispatch payload
+    // carries NO run_id (the conductor's run id rides only inside the ox
+    // envelope's session string; the WORKER run's id is minted by the runner
+    // AFTER the dispatch — the s23-chaos recovery fix: the prior shape keyed
+    // on cp.run_id, a field that never exists, so the map was ALWAYS empty —
+    // every applied report looked unattributed and every ASSIGN looked like a
+    // wedge). The honest dispatch record is the (task, attempt) POST itself.
+    const dispatchedPairs = new Set();     // `${task}#a${attempt}`
+    const dispatchCountByPair = new Map();  // pair -> POST count (the dispatch tally)
     for (const e of ghapi.ledger()) {
       if (e.method !== 'POST' || !/\/dispatches$/.test(String(e.path))) continue;
       if (!String(e.req || '').includes('"fsm-task"')) continue;
       try {
-        const body = JSON.parse(e.req);
-        const cp = body.client_payload || {};
-        if (cp.task && cp.run_id != null) dispatchMap.set(String(cp.run_id), { task: cp.task, attempt: cp.attempt, t: e.t });
+        const cp = JSON.parse(e.req).client_payload || {};
+        if (cp.task && cp.attempt != null) {
+          const pair = `${cp.task}#a${cp.attempt}`;
+          dispatchedPairs.add(pair);
+          dispatchCountByPair.set(pair, (dispatchCountByPair.get(pair) || 0) + 1);
+        }
       } catch { /* sliced body — the tallies only */ }
+    }
+    // the worker-run ledger: the scheduler creates a worker run ONLY from an
+    // fsm-task dispatch POST, so run-id ∈ this map ⟺ the run was dispatched.
+    // workerRunById: runId -> {task, attempt, name} (the run's own dispatch key
+    // = `${task}#a${attempt}`, joinable with dispatchedPairs).
+    const workerRunById = new Map();       // runId -> {task, attempt, name}
+    for (const r of sched.runs) {
+      if (r.workflow !== 'worker') continue;
+      const m = / a(\d+)$/.exec(r.name || '');
+      if (!m) continue;
+      workerRunById.set(String(r.id), { task: r.taskRef, attempt: parseInt(m[1], 10), name: r.name });
     }
 
     // the applied/rejected report ledger (journal side)
     const appliedInprogress = new Map();    // runId -> count of to=in_progress REPORT records (double-apply detector)
     const appliedRunIds = new Set();
+    const appliedEventIds = new Set();      // event ids of APPLIED worker reports — read from the journal records DIRECTLY
     const redeliverIds = new Set();         // REJECTED duplicate (origKind REPORT)
     const orphanRejectIds = new Set();      // REJECTED stale/unknown/… (accounted, superseded)
     const appliedTerminal = new Map();      // task -> [{kind, to}]
+    // the PR-stamp pointer records (task-pr.mjs stampPr) are kind REPORT with
+    // to=<status> — they are NOT task-arrival transitions (the task was
+    // already terminal when the stamp landed; the record is a pointer-only
+    // audit note). The exactly-one-terminal check must exclude them or every
+    // stamped artifacts task reads as double-terminal (the s23-chaos
+    // recovery's second false positive).
+    const isPrStamp = (j) => j.pr != null && typeof j.note === 'string' && j.note.startsWith('pr-opened');
     for (const j of journal) {
-      if (j.kind === 'REPORT' && j.applied !== false) {
+      if (j.kind === 'REPORT' && j.applied !== false && !isPrStamp(j)) {
         if (j.run_id != null) {
           const rid = String(j.run_id);
           appliedRunIds.add(rid);
           if (j.to === 'in_progress') appliedInprogress.set(rid, (appliedInprogress.get(rid) || 0) + 1);
         }
+        if (j.event_id) appliedEventIds.add(j.event_id);
         if (TERMINAL.has(j.to)) pushTerm(appliedTerminal, j.task, j);
       }
       if (j.kind === 'TIMEOUT' && TERMINAL.has(j.to)) pushTerm(appliedTerminal, j.task, j);
@@ -583,10 +614,6 @@ export async function run({ quick, seed } = {}) {
         else orphanRejectIds.add(j.event_id);
       }
     }
-    const appliedEventIds = new Set([...appliedRunIds].map((rid) => {
-      const d = dispatchMap.get(rid);
-      return d ? `rep-${rid}-a${d.attempt}` : null;
-    }).filter(Boolean));
 
     // the emitted ledger (worker side): every run whose log confirms a landed enqueue
     const EMIT_RE = /WORKER-DONE task=\S+ outcome=\S+ enqueue=ok|WORKER-GATE-REJECT task=\S+[^\n]*enqueue=ok|WORKER-REPORT-DUP first=true/;
@@ -608,7 +635,6 @@ export async function run({ quick, seed } = {}) {
         idx++;
       }
     }
-    const dispatchedPairs = new Set([...dispatchMap.values()].map((d) => `${d.task}#a${d.attempt}`));
     const wedges = assigns.filter((a) => !dispatchedPairs.has(`${a.task}#a${a.attempt}`));
     const wedgesRecovered = wedges.filter((w) => {
       const later = journal.slice(w.idx + 1).some((j) => j.kind === 'TIMEOUT' && j.task === w.task);
@@ -621,31 +647,63 @@ export async function run({ quick, seed } = {}) {
     const taskIds = tasks.map((t) => t.id);
     const finalStatus = new Map(taskIds.map((id) => [id, finalState?.tasks?.[id]?.status ?? '(absent)']));
 
+    // ---- DIAGNOSTICS (bounded, always collected — the settle/PR story) ------
+    // the settle-window conductor tally: which conductor runs STARTED in the
+    // last 150s, and what their logs say about the PR flow (the reuse lane's
+    // visible trace). Notes land in the report; CHAOS_DEBUG=1 additionally
+    // prints the driver-log tail.
+    {
+      const settleWindowFrom = Date.now() - 150_000;
+      const lateConductors = sched.runs.filter((r) => r.workflow === 'conductor' && (r.startedAt ?? 0) >= settleWindowFrom);
+      const prLines = [];
+      for (const r of lateConductors.slice(-14)) {
+        const text = sched.runLogText(r.id);
+        const hits = text.split('\n').filter((l) => /PR-FLOW|PR-OPEN|PR-STAMP|QUIESCED|PR-OPEN-FAILED|PR-FLOW-FAILED|PR-FLOW-DEFERRED/.test(l)).slice(-6);
+        if (hits.length) prLines.push(`run ${r.id} (${r.status}/${r.conclusion ?? '??'}): ${hits.join(' || ').slice(0, 400)}`);
+      }
+      rec.note(`settle window: ${lateConductors.length} conductor runs in the last 150s (${lateConductors.filter((r) => r.conclusion === 'success').length} success, ${lateConductors.filter((r) => r.conclusion === 'failure').length} failure, ${lateConductors.filter((r) => r.status !== 'completed').length} never-finished)${prLines.length ? `; PR-flow lines: ${prLines.slice(0, 6).join(' ;; ').slice(0, 1500)}` : '; NO PR-flow lines in any late conductor log'}`);
+      if (process.env.CHAOS_DEBUG === '1') {
+        try {
+          const dl = readFileSync(driverLog, 'utf8').split('\n');
+          console.log('---- DRIVER LOG TAIL (last 60) ----');
+          for (const l of dl.slice(-60)) console.log(l);
+          console.log('---- LATE CONDUCTOR PR/FLOW LINES ----');
+          for (const p of prLines) console.log(p);
+        } catch { /* best effort */ }
+      }
+    }
+
     // ---- the achieved-class tally per kill ---------------------------------
     const killsByBoundary = {};
     for (const b of BOUNDARIES) killsByBoundary[b] = { fired: 0, events: killer.eventCounts.get(b) || 0, achieved: {} };
-    const dispatchTsByRun = new Map();
+    // every fsm-task POST's timestamp, with the conductor run that was
+    // in flight when it landed (conductor runs SERIALIZE — the group admits
+    // one running at a time — so the in-flight run at e.t is unambiguous;
+    // the old shape keyed POSTs on cp.run_id, a field the dispatch payload
+    // never carries).
+    const taskPostTs = [];
     for (const e of ghapi.ledger()) {
       if (e.method !== 'POST' || !/\/dispatches$/.test(String(e.path)) || !String(e.req || '').includes('"fsm-task"')) continue;
-      try {
-        const cp = JSON.parse(e.req).client_payload || {};
-        if (cp.run_id != null) {
-          const rid = String(cp.run_id);
-          dispatchTsByRun.set(rid, [...(dispatchTsByRun.get(rid) || []), e.t]);
-        }
-      } catch { /* sliced */ }
+      taskPostTs.push(e.t);
     }
+    taskPostTs.sort((a, b) => a - b);
+    const conductorRunList = sched.runs.filter((r) => r.workflow === 'conductor');
     for (const k of killer.kills) {
       const slot = killsByBoundary[k.boundary];
       slot.fired += 1;
       let cls = 'killed';
-      const evId = (() => {
-        const d = dispatchMap.get(String(k.victimRunId));
-        return d ? `rep-${k.victimRunId}-a${d.attempt}` : null;
-      })();
+      const wr = workerRunById.get(String(k.victimRunId));
+      const evId = wr ? `rep-${k.victimRunId}-a${wr.attempt}` : null;
       const accounted = evId && (appliedEventIds.has(evId) || redeliverIds.has(evId) || orphanRejectIds.has(evId));
       if (k.boundary === 'conductor-post-commit') {
-        const posts = (dispatchTsByRun.get(String(k.victimRunId)) || []).filter((t) => t >= k.ts).length;
+        // the victim's in-flight window: [startedAt, finishedAt ?? +inf) — POSTs
+        // the victim landed AFTER the kill's commit observation (k.ts) = the
+        // action loop survived past the commit (mid-dispatch); zero = the
+        // crash class (assigned-but-never-dispatched leases, the wedge).
+        const victim = conductorRunList.find((r) => r.id === k.victimRunId);
+        const from = k.ts;
+        const to = victim && victim.finishedAt ? victim.finishedAt + 1 : Number.POSITIVE_INFINITY;
+        const posts = taskPostTs.filter((t) => t >= from && t <= to).length;
         cls = posts === 0 ? 'pre-dispatch (the crash class)' : `mid-dispatch (${posts} POSTs)`;
       } else if (k.boundary === 'conductor-mid-pr') {
         cls = 'pr-opened-pre-stamp (reuse lane re-stamps)';
@@ -690,6 +748,14 @@ export async function run({ quick, seed } = {}) {
     for (const [task, recs] of appliedTerminal) {
       if (recs.length !== 1 || new Set(recs.map((r) => r.to)).size !== 1) multiTerminal.push(`${task}(${recs.map((r) => `${r.kind}->${r.to}`).join('|')})`);
     }
+    if (multiTerminal.length) {
+      const dump = multiTerminal.map((m) => {
+        const t = /^([^ (]+)/.exec(m)[1];
+        const recs = journal.filter((j) => j.task === t && (j.kind === 'REPORT' || j.kind === 'TIMEOUT' || j.kind === 'CANCEL_CASCADE') && j.applied !== false);
+        return `${t}: ${recs.map((j) => `${j.kind}->${j.to}${j.run_id != null ? ` run=${j.run_id}` : ''}${j.pr != null ? ` pr=${j.pr}` : ''}${j.note ? ` note=${String(j.note).slice(0, 30)}` : ''}`).join(' ; ')}`;
+      }).join(' || ').slice(0, 1200);
+      rec.note(`multi-terminal diagnostic: ${dump}`);
+    }
     const missingTerminal = taskIds.filter((id) => !appliedTerminal.has(id));
     rec.check('every task has EXACTLY ONE applied terminal-arrival record', multiTerminal.length === 0 && missingTerminal.length === 0,
       `multi: ${multiTerminal.join(', ') || 'none'}; missing: ${missingTerminal.join(', ') || 'none'}`);
@@ -701,13 +767,28 @@ export async function run({ quick, seed } = {}) {
     const doubleApplied = [...appliedInprogress].filter(([, n]) => n > 1).map(([rid]) => rid);
     rec.check('ZERO double-applied reports (one in_progress arrival per event id)', doubleApplied.length === 0,
       doubleApplied.length ? `run ids applied twice: ${doubleApplied.join(', ')}` : `${appliedRunIds.size} distinct applied ids, dedup absorbed ${redeliverIds.size} re-deliveries`);
-    const phantom = [...appliedRunIds].filter((rid) => !dispatchMap.has(rid));
+    // the applied report's run attribution, rebuilt per journal record (the
+    // LOSS class: an APPLIED report whose run was never dispatched — an
+    // orphan report from a run the runner never created. Killed-before-report
+    // runs are the HEALTHY complement: no report, no attribution needed).
+    const appliedRunTask = new Map();      // runId -> task (from applied REPORT records)
+    for (const j of journal) {
+      if (j.kind === 'REPORT' && j.applied !== false && !isPrStamp(j) && j.run_id != null) {
+        appliedRunTask.set(String(j.run_id), j.task);
+      }
+    }
+    const phantom = [...appliedRunTask.keys()].filter((rid) => {
+      const wr = workerRunById.get(rid);
+      if (!wr) return true;                                    // no worker run ever existed — the orphan class
+      if (wr.task !== appliedRunTask.get(rid)) return true;      // run/task mismatch — misattributed
+      return !dispatchedPairs.has(`${wr.task}#a${wr.attempt}`);  // run exists but its dispatch POST is absent
+    });
     rec.check('every applied report attributes to a dispatched worker run', phantom.length === 0,
-      phantom.length ? `unattributed run ids: ${phantom.join(', ')}` : `${appliedRunIds.size}/${appliedRunIds.size} attributed`);
+      phantom.length ? `unattributed run ids: ${phantom.join(', ')}` : `${appliedRunTask.size}/${appliedRunTask.size} attributed (${dispatchedPairs.size} dispatch POST keys, ${workerRunById.size} worker runs)`);
 
     // 4. the wedged shapes resolve via the lease-reap recovery path
     rec.check('every assigned-but-never-dispatched attempt is lease-reaped (wedge recovery)', wedges.length === wedgesRecovered.length,
-      `${wedgesRecovered.length}/${wedges.length} wedged attempts recovered via TIMEOUT${wedges.length !== wedgesRecovered.length ? ` — unrecovered: ${wedges.filter((w) => !wedgesRecovered.includes(w)).map((w) => w.task).join(', ')}` : ''}`);
+      `${wedgesRecovered.length}/${wedges.length} wedged attempts recovered via TIMEOUT${wedges.length !== wedgesRecovered.length ? ` — unrecovered: ${wedges.filter((w) => !wedgesRecovered.includes(w)).map((w) => `${w.task}#a${w.attempt}`).join(', ')}` : ''}`);
 
     // 5. the final halt is reachable + the queue drained
     rec.check('final halt reachable (chain halted, phase done, within budget)', !!(finalState?.chain?.halted && finalState?.project?.phase === 'done') && !budgetNote,
