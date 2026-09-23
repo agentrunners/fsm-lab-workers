@@ -309,3 +309,61 @@ test('laneSection (s21/O-3): real-lane-shaped REPORT records render the HOP rows
   assert.equal(fallback[1], '- lane keys: 1/2 distinct served (k0:1)');
   assert.match(fallback[2], /^- lane hops \(last 1\): b 9ms 200$/);
 });
+
+// ---------------------------------------------------------------------------
+// 12. s23/B8 — the TAIL line. A record whose lane_stats.models carries a
+//     `:free` slug with ok>0 was SERVED by the chain's free tail (the
+//     answering lane was free — BOTH paid keys dry at that turn): the
+//     operator-action line renders (top up or swap a key). Old-format
+//     records / free-never-served records degrade to NO line (the guard
+//     family — never a crash, never a lie).
+// ---------------------------------------------------------------------------
+test('laneSection (s23/B8): tail-served REPORT records render the `lane tail:` line (slug + key spread); paid-served records do NOT', () => {
+  // the live W1→tail arc's journal shape: k1ds(402)→JUMP→k2ds(402)→TAIL→
+  // k2nem:free(200) — the free lane is the ANSWERING lane (ok>0), the paid
+  // lanes never answered (ok:0), key_index 1 = the 0-based pool slot.
+  const tailServed = { kind: 'REPORT', task: 'TA1', key_index: 1, pool_size: 2,
+    lane_stats: { calls: 3, ok: 1, err429: 0, err5xx: 2, tokens: 10, cost: 0, p50_ms: 100, p95_ms: 200,
+      models: {
+        'deepseek/deepseek-v4.1-flash': { calls: 2, ok: 0, err5xx: 2, tokens: 0, cost: 0 },
+        'nvidia/nemotron-3.5-lightning:free': { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0 },
+      }, rate_classes: {} } };
+  const lines = laneSection([], [tailServed]);
+  const tailLine = lines.find(l => l.startsWith('- lane tail:'));
+  assert.ok(tailLine, 'the tail line renders on a tail-served window');
+  assert.equal(tailLine, '- lane tail: 1 turns on nemotron-3.5-lightning:free:1 (k1) — BOTH paid keys dry (operator: top up or swap a key)',
+    'the slug (short name + turns on it) + the serving key spread + the operator action');
+  // two tail turns across two keys: the count and the spread aggregate
+  const second = { ...structuredClone(tailServed), task: 'TA2', key_index: 0 };
+  const lines2 = laneSection([], [tailServed, second]);
+  const tailLine2 = lines2.find(l => l.startsWith('- lane tail:'));
+  assert.equal(tailLine2, '- lane tail: 2 turns on nemotron-3.5-lightning:free:2 (k0+k1) — BOTH paid keys dry (operator: top up or swap a key)');
+  // a paid-served window (deepseek ok) → NO tail line at all
+  const paid = { kind: 'REPORT', task: 'P1', key_index: 0, pool_size: 2,
+    lane_stats: { calls: 1, ok: 1, tokens: 5, cost: 0.003, p50_ms: 50, p95_ms: 50,
+      models: { 'deepseek/deepseek-v4.1-flash': { calls: 1, ok: 1, tokens: 5, cost: 0.003 } }, rate_classes: {} } };
+  const paidLines = laneSection([], [paid]);
+  assert.ok(!paidLines.some(l => l.startsWith('- lane tail:')), 'a paid-served window carries no tail line (nothing to act on)');
+  // the free lane TRIED but never answered (ok:0 — the 500-taxed tail):
+  // NOT tail-served — no line (the turn was not SERVED by the tail)
+  const freeTried = { kind: 'REPORT', task: 'FT1', key_index: 1, pool_size: 2,
+    lane_stats: { calls: 1, ok: 0, err5xx: 1, tokens: 0, cost: 0, p50_ms: null, p95_ms: null,
+      models: { 'nvidia/nemotron-3.5-lightning:free': { calls: 1, ok: 0, err5xx: 1, tokens: 0, cost: 0 } }, rate_classes: {} } };
+  const triedLines = laneSection([], [freeTried]);
+  assert.ok(!triedLines.some(l => l.startsWith('- lane tail:')), 'a never-answered free lane is not a tail-served turn');
+  // old-format records (no models map / no lane_stats) → no line, no crash
+  const legacy = laneSection([], [{ kind: 'REPORT', task: 'L1', lane_stats: { calls: 1, ok: 1, tokens: 1, cost: 0, p50_ms: 5, p95_ms: 5, rate_classes: {} } }]);
+  assert.ok(!legacy.some(l => l.startsWith('- lane tail:')), 'no models map → no tail line (graceful)');
+  // a MIXED window: the tail line rides ALONGSIDE the paid telemetry (one
+  // tail turn among paid turns — the honest degraded-but-alive view)
+  const mixed = laneSection([], [paid, tailServed]);
+  const mixedTail = mixed.find(l => l.startsWith('- lane tail:'));
+  assert.equal(mixedTail, '- lane tail: 1 turns on nemotron-3.5-lightning:free:1 (k1) — BOTH paid keys dry (operator: top up or swap a key)');
+  assert.match(mixed[0], /4 calls/, 'the mixed window aggregates BOTH records (paid + tail)');
+  // no key_index on the tail record → the slug renders, the key spread omits
+  const noKey = { kind: 'REPORT', task: 'NK1', lane_stats: structuredClone(tailServed.lane_stats) };
+  const noKeyLines = laneSection([], [noKey]);
+  assert.equal(noKeyLines.find(l => l.startsWith('- lane tail:')),
+    '- lane tail: 1 turns on nemotron-3.5-lightning:free:1 — BOTH paid keys dry (operator: top up or swap a key)',
+    'the (k…) spread degrades to absent when the record carries no key_index (the guard family)');
+});

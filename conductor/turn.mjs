@@ -40,6 +40,10 @@ import {
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
+// s23/B9: the FREE-TAIL alert's 24h marker dedup — the watchdog's own F-D
+// discipline (alertDedup + alertCommentsPath), marker-parameterized so the
+// tail's distinct body token classes separately from every other alert.
+import { alertDedup, alertCommentsPath } from '../lib/watchdog-core.mjs';
 
 const REPO = process.env.GITHUB_REPOSITORY || 'claudecode-headless/fsm-lab';
 const API = process.env.GITHUB_API_URL || 'https://api.github.com'; // T9 (s21) seam: GHA sets this env itself — unset -> the literal, byte-identical
@@ -151,6 +155,58 @@ async function budgetAlertIssue(action) {
   }
   const or = await api(`/repos/${REPO}/issues`, 'POST', {
     title: '[fsm-alert] lane budget exhausted — epoch parked',
+    body, labels: ['fsm-watchdog-alert'],
+  });
+  return or.status === 201 && or.data?.number ? { ok: true, issue: or.data.number } : { ok: false, where: 'open' };
+}
+
+// s23/B9 (design §2.6): the FREE-TAIL RIDING alert — the budgetAlertIssue
+// precedent verbatim (find-open→comment / none→open on the ONE
+// fsm-watchdog-alert issue) with a DISTINCT body token + the ISSUE-side 24h
+// MARKER dedup (the F-D discipline, marker-parameterized): a fresh trusted
+// FREE-TAIL marker on the open issue means the alert is already standing —
+// skip the post (the re-minted per-tick action costs two GETs, never a
+// comment). The token separation works BOTH ways: a budget-pause comment
+// never refreshes the tail's window and vice versa. ALERT-ONLY: no pause,
+// no second commit — the tail is SERVING work (cost 0); the counter itself
+// resets in the drain the moment any paid-served report lands.
+async function tailAlertIssue(action) {
+  const body = [
+    '**[fsm-alert] FREE-TAIL RIDING**',
+    '',
+    `Trigger: ${action.trigger === 'turns' ? `${action.tail_turns} tail turns ≥ N=3` : `riding ≥ X=${action.window_min}min`} — the CC lane's free tail is serving turns: BOTH paid keys are dry (a bridge posture, never a home).`,
+    `Tail turns: ${action.tail_turns} · since ${action.tail_since ?? '?'}`,
+    '',
+    'The tail is nemotron-class: turns COMPLETE but generic — a degraded-but-alive fleet, not a paused one (no action forced: the tail burns nothing).',
+    '',
+    '**Operator actions**:',
+    '- top up a paid key (OpenRouter credits), or',
+    '- swap in a funded key (the `OPENROUTER_API_KEY` / `OPENROUTER_API_KEY_2` repo secrets), or',
+    '- set `CC_TAIL_MODEL` to another `:free` model (e.g. `cohere/north-mini-code:free`), or',
+    "- set `CC_TAIL_MODEL=''` to DISABLE the tail (the lane ladder degenerates to the pre-s23 advance — quarantine over generic completion).",
+    '',
+    '_This alert re-arms at most once per 24h while the posture holds; any paid-served turn resets it._',
+  ].join('\n');
+  const fr = await api(`/repos/${REPO}/issues?state=open&labels=fsm-watchdog-alert&per_page=10`);
+  if (fr.status !== 200 || !Array.isArray(fr.data)) return { ok: false, where: 'search' };
+  const nowMs = Date.now();
+  if (fr.data.length) {
+    const issue = fr.data[0].number;
+    // the 24h marker dedup on the OPEN issue — per_page=100 + since=<window
+    // floor> (law-20: order-independent, the fresh marker can never page
+    // out), trusted authors only (the conductor posts as github-actions[bot]).
+    const cr = await api(alertCommentsPath(REPO, issue, nowMs), 'GET');
+    if (cr.status !== 200 || !Array.isArray(cr.data)) return { ok: false, where: 'comments' };
+    const dedup = alertDedup({ comments: cr.data, nowMs, marker: 'FREE-TAIL RIDING' });
+    if (dedup.skip) {
+      console.log(`TAIL-ALERT-SKIP (fresh trusted FREE-TAIL marker <24h on issue #${issue}: age=${dedup.markerAgeMin}min by=${dedup.markerBy}) — the alert is already standing`);
+      return { ok: true, issue, deduped: true };
+    }
+    const post = await api(`/repos/${REPO}/issues/${issue}/comments`, 'POST', { body });
+    return post.status === 201 ? { ok: true, issue } : { ok: false, where: 'comment' };
+  }
+  const or = await api(`/repos/${REPO}/issues`, 'POST', {
+    title: '[fsm-alert] free-tail riding — both paid keys dry',
     body, labels: ['fsm-watchdog-alert'],
   });
   return or.status === 201 && or.data?.number ? { ok: true, issue: or.data.number } : { ok: false, where: 'open' };
@@ -641,6 +697,23 @@ async function main() {
         console.error(`BUDGET-PAUSE-COMMIT-NOT-COMMITTED (${out2.reason}) — the window re-triggers next tick; run is RED`);
         process.exitCode = 1;
       }
+    }
+  }
+
+  // s23/B9: the FREE-TAIL RIDING alert — ALERT-ONLY execution (the action
+  // re-mints per riding tick; the issue-side 24h marker dedup bounds the
+  // posts). A failed post = red run (law 5: visible), NO state was burned
+  // (no latch exists to suppress the retry — the next tick re-posts; the
+  // correlated-failure self-heal). Success = one comment/open; the chain
+  // keeps dispatching (the tail is serving work).
+  const tailAction = actionList.find(a => a.type === 'TAIL_RIDING_ALERT');
+  if (tailAction) {
+    const alert = await tailAlertIssue(tailAction);
+    if (!alert.ok) {
+      console.error(`TAIL-ALERT-POST-FAILED (${alert.where}) — the chain keeps running; the action re-mints next tick (law 5: this run is RED)`);
+      process.exitCode = 1;
+    } else if (!alert.deduped) {
+      console.log(`TAIL-ALERT posted (issue #${alert.issue}) — FREE-TAIL RIDING, alert-only (no pause)`);
     }
   }
 

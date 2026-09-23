@@ -327,3 +327,37 @@ test('s23/LATCHED-body (source shape): the production latch template carries the
     assert.ok(!t[0].includes('**[fsm-watchdog LATCHED]**'), `a live template literal still carries the old divergent body: ${t[0].slice(0, 80)}`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// s23/B9 — the marker-parameterized dedup: the conductor's FREE-TAIL alert
+// lane classes SEPARATELY from the watchdog's (and the budget pause's): a
+// fresh trusted FREE-TAIL marker suppresses ONLY the tail class, and a fresh
+// trusted [fsm-watchdog] marker suppresses ONLY the watchdog class. The
+// distinct body token is the class identity (the s23/latch lesson: a body
+// the filter cannot match is a class the dedup can never see).
+// ---------------------------------------------------------------------------
+test('s23/B9: alertDedup marker= — the FREE-TAIL class dedups on its OWN token only (both directions)', () => {
+  const tailMarker = cm(10, { type: 'Bot', login: 'github-actions[bot]', body: '**[fsm-alert] FREE-TAIL RIDING** — the CC lane\'s free tail is serving turns' });
+  const watchdogMarker = cm(5, { type: 'Bot', login: 'github-actions[bot]', body: '**[fsm-watchdog]** LATCHED — 3 consecutive re-primes' });
+  // the tail class: its own fresh marker skips; the watchdog's fresh marker
+  // (5min, NEWER) does NOT — different class, no cross-suppression
+  assert.equal(alertDedup({ comments: [tailMarker], nowMs: NOW, marker: 'FREE-TAIL RIDING' }).skip, true,
+    'a fresh trusted FREE-TAIL marker dedups the tail class');
+  assert.equal(alertDedup({ comments: [watchdogMarker], nowMs: NOW, marker: 'FREE-TAIL RIDING' }).skip, false,
+    'a fresh trusted WATCHDOG marker does NOT suppress the tail class (the tokens class separately)');
+  // the watchdog class (the default): unaffected by the new parameter
+  assert.equal(alertDedup({ comments: [tailMarker], nowMs: NOW }).skip, false,
+    'a fresh FREE-TAIL marker does NOT suppress the watchdog class (the default marker)');
+  assert.equal(alertDedup({ comments: [watchdogMarker], nowMs: NOW }).skip, true,
+    'the default [fsm-watchdog] behavior is byte-identical (marker defaults)');
+  // the ANONYMOUS gate holds for the tail class too (the F-D hardening is
+  // marker-agnostic: a stranger's FREE-TAIL comment counts for nothing)
+  const stranger = cm(5, { assoc: 'NONE', type: 'User', login: 'drive-by', body: '**[fsm-alert] FREE-TAIL RIDING** fake' });
+  assert.equal(alertDedup({ comments: [stranger, tailMarker], nowMs: NOW, marker: 'FREE-TAIL RIDING' }).skip, true,
+    'the trusted (older) marker still wins over a stranger\'s newer one');
+  assert.equal(alertDedup({ comments: [stranger], nowMs: NOW, marker: 'FREE-TAIL RIDING' }).skip, false,
+    'a stranger\'s tail marker alone suppresses nothing');
+  // a stale (>24h) trusted tail marker: the window re-arms (post again)
+  assert.equal(alertDedup({ comments: [cm(1500, { type: 'Bot', login: 'github-actions[bot]', body: '**[fsm-alert] FREE-TAIL RIDING**' })], nowMs: NOW, marker: 'FREE-TAIL RIDING' }).skip, false,
+    'a >24h tail marker is stale — the alert re-arms');
+});
