@@ -572,3 +572,81 @@ degraded-but-alive into stopped)** through the fsm-watchdog-alert lane, and
 404-DEAD upstream on every key class; cohere/north-mini-code:free promoted
 to slot 2 — the probe's 6/6 reliability pick). 603/603 + conformance 31/31 +
 M1/M3 mutations bite (6 / 2 pins).
+
+## The stage-0 ADOPTION — the first GREEN (2026-09-23)
+
+**Five attempts to first green, four real runner-caught bugs — the drill
+adoption arc that proves the CI-existence theorem at its strongest: a gate
+that runs where the merges land catches what the sandbox never sees.**
+
+**The adoption setup:** drill issue **#21** created (org-admin author — the
+door's author gate rides it) + `vars.DRILL_ISSUE=21` set; the seed reopens it
+nightly with the dated spec. `STAGED_DRILL_ENABLED` stays UNSET (manual mode)
+— the nightly ladder earns its promotion with dated greens (3 needed).
+
+**THE FOUR RUNNER-CAUGHT BUGS (attempts 1-5):**
+1. **Attempt 1 — verify.mjs's unimported `fileURLToPath`** (af230820): the
+   report-writer path used it without importing it — a RUNNER-ONLY class (the
+   unit pins test the pure functions; the `invokedAsMain` guard kept the path
+   cold under `node --test`, so 606/606 in the sandbox meant nothing for the
+   CLI-entry path; the runner's verify job died `fileURLToPath is not
+   defined` on the first manual fire). Fix: the import + the FAMILY GUARD pin
+   (every fileURLToPath/pathToFileURL usage in e2e/staged/*.mjs must carry
+   its node:url import — generic for the whole driver family),
+   mutation-verified.
+2. **Attempt 1 — THE NEEDS-CHAIN GAP** (aee4318e): GHA job outputs are
+   readable ONLY by DIRECT needs members — the teardown's `needs:[verify]`
+   left `needs.run.outputs.seeded` EMPTY (a transitive read is a silent
+   empty string) → the seed-no-output misclassification on a seed that RAN
+   and birthed an epoch → the stuck-recovery reset SKIPPED on a live epoch.
+   Fix: `needs:[gate, run, verify]` + the exported `RED_FAMILY_ACTIONS`
+   {red, gate-read-red, seed-no-output} gating the recovery arm. 3 pins, 2
+   mutations bite.
+3. **Attempt 3 — THE RESTING-SHAPE RACE + THE QUEUED-DISPATCH WINDOW
+   INFLATION** (f07fb529 + df7d0818): the monitor's first poll (seed+1s)
+   declared DONE on the PREDECESSOR'S halted resting shape while tonight's
+   epoch was 4 seconds from birth (the door+rollover latency band ~15s) —
+   fixed with the birth-wait hold (max(2×poll, 120)s). AND the verify's
+   window anchored at `github.run_started_at`, which sat 59 MINUTES in the
+   shared bucket's queue (run_started_at preceded the epoch by an hour): the
+   predecessor's records smuggled into the window and the wall inflated to a
+   false 60-min stuck verdict on a seconds-old epoch → the teardown's
+   stuck-recovery reset wiped a HEALTHY epoch. Fix: the genesis-anchored
+   window (the journal boundary's ts) + haltExitAllowed. The teardown's
+   RED_FAMILY recovery itself worked exactly as designed — the machinery was
+   right, the verdict's inputs were wrong.
+4. **Attempt 4 — THE A11 WATCHDOG-CADENCE lesson** (d0b11ffe + c722fcee):
+   A11 asserted `>=1 watchdog run completed in-window`, calibrated to the
+   NOMINAL `*/10` cron — the watchdog's MEASURED cadence on this repo's
+   bucket runs 4-5h gaps (live: 00:51 → 05:20 → 10:07). **The A-1/R2-1
+   cadence law's THIRD recurrence — this time on the verify's OWN
+   assertion** (the same law that recalibrated the pinger and the deadman).
+   Fix: the 6h liveness lookback ENDING at the drill's end (measured 4h47m
+   max + ~1h headroom, the R2-1 rule); the alert-free half stays strictly
+   in-window. 11/12 → 12/12.
+
+**The duty-8 breaker gate (the adjacent catch):** issue #24 (the work-lane
+breaker alert) fired at 09:53 on the drill epoch's TERMINAL state
+(timeouts=3 done=0 ratio=1.000 — an hour AFTER the halt): every stage-0 hang
+night would page on the epoch's designed final record. The breaker (executor
+@ 2bb0435) now gates on HALTED/PAUSED chains — a halted chain cannot churn;
+its stats are the epoch's final record and the completion digest already
+carries the verdict. #24 closed not-planned with the explanation.
+
+**THE VERDICT — run 35852711826** (fired 11:07:29Z @ c722fcee, completed
+~11:59Z): all four jobs green (gate 10s, run, verify, teardown). **`STAGED-DRILL-VERIFY
+GREEN asserts=12/12 failed=[] stuck=false wall=46min`** — the arc as designed:
+MONITOR-BIRTH-WAIT 120s held the halt-exit through the predecessor's resting
+shape; the T-STG-H-0923 hang epoch ran its FULL ladder (3 timeout attempts →
+quarantined → halted DEGRADED-clean — **the hang night's honest degraded
+shape: 0 done + 1 quarantined + phase degraded=true**, asserted as the
+expected verdict, not an error); VERIFY-WINDOW genesis-anchored
+start=11:08:22 (the queue delay excluded); STAGED-DRILL-HALT-HELD yes. The
+**GREEN marker posted on #21** (`STAGED-DRILL GREEN · 2026-09-23 · wall 46
+min · tasks 1 · asserts 12/12 · watchdog green`); the drill closed its own
+issue (#21, HTTP 200) and the stale RED #23 auto-closed at 11:55:41Z
+(RED-AUTOCLOSE swept the stale fsm-staged-red backlog).
+
+**Stage-0 is adopted: the nightly now self-verifies, self-cleans, and posts
+its own marker — 1/3 dated greens toward the weekly promotion
+(`STAGED_DRILL_ENABLED=weekly` when 3/3).**
