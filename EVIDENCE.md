@@ -650,3 +650,89 @@ issue (#21, HTTP 200) and the stale RED #23 auto-closed at 11:55:41Z
 **Stage-0 is adopted: the nightly now self-verifies, self-cleans, and posts
 its own marker — 1/3 dated greens toward the weekly promotion
 (`STAGED_DRILL_ENABLED=weekly` when 3/3).**
+
+## X28 — the clean retuned-posture soak (2026-09-23)
+
+**The X27 refire with the fixed variables isolated: the mirror lane restored,
+KEY_2 funded, the genesis window init. 24 tasks at `max_parallel:16 /
+overflow_at:13 / lease:45` through the door — the specCapacity carry verbatim
+into the genesis config (CONTROL e3976 @ 12:00:41.599Z, issue #25). Epoch
+c-1790164841598: 12:00:41 → 12:12:26 halt, ~11m45s wall.**
+
+**THE SATURATION + PEAK CONCURRENCY:** the first multi-assign tick (16 tasks)
+dispatched **13 runs on the MAIN bucket + 3 on the MIRROR** (12:00:45-48) —
+the pre-flight overflow arm firing at the in-flight ≥13 boundary exactly as
+tuned; the second tick's 8 tasks → 7 main + 1 mirror (12:01:20-22). **Peak: 16
+concurrent FSM task-runs across the two buckets (13 main + 3 mirror at
+12:00:48-50) — the main bucket never above 13, the ceiling exactly
+max_parallel=16.** Total: **32 worker runs = 28 main + 4 mirror, EVERY ONE
+completed success.**
+
+**THE FIXED-LANE PROOF (the X27 isolation):** X27's mirror workers died AT
+CHECKOUT (`Bad credentials` — the expired LAB_PAT; the shim never ran, no
+mirror reports ever landed). X28's mirror workers (runs 35857865113/65195/65706
++ 35857923738) ran END-TO-END: clean checkout → the full envelope (OX_RAW
+T-X28-15: budget, mode mock, attempt 1) → the shim turn → the report landing.
+**The mirror runs' existence + completion IS the proof** — the overflow lane
+carries real work again (the mirror's LAB_PAT = the org-admin PAT interim,
+rotation debt recorded).
+
+**THE ARC:**
+1. **Genesis clean 77s** — no birth re-pause (the X27 v1→v2 quirk: the fresh
+   epoch re-paused 3s in on the dead epoch's straggler noise; the s23
+   genesis `budget_window:[]` init + cohort gate held — the pause that came
+   was armed by THIS epoch's OWN reports).
+2. **The budget-pause, alert-first, mid-saturation** — the infra-flaky
+   quartet's first reports (the shim's designed `lane-429` class, all lane
+   attempts burned) put 3 distinct tasks inside the 15-min window ≥ threshold
+   3: conductor run 35857953845 logged `BUDGET-PAUSE-TRIGGER distinct-tasks
+   3>=3 — alert-first` (12:01:50.438) → the alert comment on the STANDING
+   fsm-watchdog-alert issue **#12** → `BUDGET-PAUSE applied (alert issue #12)`
+   (12:01:59.642). The epoch PARKED at done=18/24 for ~9m24s — the at-least-once
+   drain kept consuming while parked (the tail pair + stragglers landed
+   12:02:00-12:02:15, done 18→20).
+3. **The operator resume** (23-wrap): `fsm-control {command:resume}` (204) →
+   CONTROL e4029 @ 12:11:22.087 (actor xfnwfpho1) — plus a benign
+   double-consume (e4042, two conductor runs processed the same dispatch
+   event 17ms apart — the X23 straggler-race family, idempotent).
+4. **The quartet's ladder drained to its DESIGNED terminus** — the re-dispatch
+   envelope carries `attempt:1` (net-zero: the infra retry never burns a work
+   attempt; verified in run 35857942510's OX_RAW), so the shim's infra-flaky
+   contract (infra_failed on attempt ≤1, done on attempt 2+) re-failed each
+   re-run: INFRA_RETRY_MAX=3 total → **4 QUARANTINED
+   (`infra-exhausted(infra_attempts=3)`, attempts never past 1, 2 net-zero
+   retries each — infra_retries=8)**. This is the X23 arc-1 shape verbatim
+   ("3 dispatches, 2 infra retries, task QUARANTINED, epoch closed
+   degraded-halt, zero uncontrolled burn") — NOT a lane death: all 32 runs
+   green on both buckets.
+5. **The dup-report pairs absorbed:** T-X28-21/22's second reports REJECTED
+   `duplicate` (2 journal records, event_ids intact) — and the
+   **REJECTED-never-arms gate held live: NO second pause through the
+   post-resume drain (budget_pauses stayed 1)** — the X27 re-pause class dead
+   on its second arm too.
+6. **The halt verdict:** PHASE executing→done @ 12:12:26.175 — **done=20/24,
+   quarantined=4, failed=0, timeouts=0, dispatched=32, infra_retries=8,
+   budget_pauses=1, rejected_events=2, orphaned_reports=0**; the completion
+   digest posted on #25 (12:12:29). `tail_turns` ABSENT (the CC-lane-only
+   metric — the mock epoch never touches the lane; the expected honest
+   marker).
+
+**THE HONEST ISOLATION VERDICT:** same quarantine COUNT as X27 (4), OPPOSITE
+mechanism — X27's 4 were the quartet × THE DEAD MIRROR LANE (workers never
+ran); X28's 4 are the quartet × THE DESIGNED infra-flaky contract on LIVE
+lanes (the workers ran and reported the shim's own failure class, the ladder
+drained net-zero to the fail-loud terminus). The isolation is proven by the
+mirror runs themselves, not the terminal count. **The finding recorded for
+future specs:** a "quartet drains green" expectation is unreachable for the
+mock infra-flaky class under the net-zero ladder — the class's live soak
+terminus IS the infra-exhaustion quarantine unless the lease burns (attempt 2
+needs a 45-min expiry in a 12-min epoch); a drain-green shape would need the
+shim keyed on infra_attempts or a lease-burn spec.
+
+**What X28 proves:** the retuned posture LIVE and clean — 16-parallel
+saturation with the overflow arm at 13 routing real work to a LIVE mirror
+lane; the budget-pause machinery end-to-end in its designed shape
+(alert-first → park → protection → operator resume → drain); both X27 pause
+quirks dead (genesis init + REJECTED-never-arms, live-proven); the dup-report
+CAS absorbing doubles at saturation; and a DEGRADED-CLEAN halt with zero
+timeouts, zero orphans, zero uncontrolled burn.
