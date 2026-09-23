@@ -721,3 +721,33 @@ test('seed: the DORMANT full mix renders but today\'s single-task door rejects i
   assert.equal(verdict.ok, false, 'the dormant mix does NOT pass today\'s door');
   assert.ok(verdict.errors.some((e) => /duplicate key `id`/.test(e)));
 });
+
+// ---------------------------------------------------------------------------
+// s23 (the stage-0 first-green catch — the runner-only bug class): verify.mjs
+// used fileURLToPath at its report-writer path (line 527) without importing
+// it — the unit pins test the PURE functions, and the invokedAsMain guard
+// means the CLI-entry path never runs under `node --test`. The runner's
+// verify job died with "fileURLToPath is not defined". THE FAMILY GUARD:
+// every node:url built-in used in the staged driver family must be imported
+// in THAT file (a generic guard for the whole e2e/staged/ dir — the same
+// class would recur in any driver).
+// ---------------------------------------------------------------------------
+test('s23/url-imports (source shape): every fileURLToPath/pathToFileURL usage in e2e/staged/*.mjs carries its node:url import', async () => {
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const REPO_ROOT = join(import.meta.dirname, '..');
+  const dir = join(REPO_ROOT, 'e2e', 'staged');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.mjs'));
+  assert.ok(files.length >= 6, `the staged driver family is present (${files.length} files)`);
+  for (const f of files) {
+    const src = fs.readFileSync(join(dir, f), 'utf8');
+    const usesFileURL = /\bfileURLToPath\s*\(/.test(src);
+    const usesPathToFile = /\bpathToFileURL\s*\(/.test(src);
+    if (!usesFileURL && !usesPathToFile) continue;
+    const m = src.match(/import\s*\{([^}]*)\}\s*from\s*'node:url'/);
+    assert.ok(m, `${f} uses node:url builtins but has no node:url import`);
+    const imported = m[1].split(',').map(s => s.trim()).filter(Boolean);
+    if (usesFileURL) assert.ok(imported.includes('fileURLToPath'), `${f} uses fileURLToPath without importing it (the stage-0 runner catch)`);
+    if (usesPathToFile) assert.ok(imported.includes('pathToFileURL'), `${f} uses pathToFileURL without importing it`);
+  }
+});
