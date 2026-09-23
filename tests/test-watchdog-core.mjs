@@ -293,3 +293,37 @@ test('T45/F-D: the LAB_PAT fallback lane (COLLABORATOR) and Bot lane both stay f
   const bot = alertDedup({ comments: [cm(60, { assoc: 'NONE', type: 'Bot', login: 'github-actions[bot]' })], nowMs: NOW });
   assert.equal(bot.skip, true, 'the bot lane still dedups');
 });
+
+// ---------------------------------------------------------------------------
+// s23 (the stress battery-4 finding — the LATCHED-body filter divergence):
+// the latch alert's marker body must carry the dedup class token. The old
+// production body '**[fsm-watchdog LATCHED]**' does NOT contain the
+// '[fsm-watchdog]' substring (the filter's token) — alertDedup could never
+// match the latch's own comments, so a sustained latch posted ~12 alert
+// comments/day instead of the F-6 24h-dedup contract. The pin is BOTH:
+// the behavioral half (a LATCHED-suffix body dedups like any marker) and
+// the source-shape half (the production template actually carries the
+// token — the deviation class this fix kills).
+// ---------------------------------------------------------------------------
+test('s23/LATCHED-body: a LATCHED-suffix marker body dedups (the filter class matches)', () => {
+  const d = alertDedup({ comments: [cm(10, { assoc: 'MEMBER', login: 'watchdog-runner', body: '**[fsm-watchdog]** LATCHED — 3 consecutive re-primes with NO chain progress' })], nowMs: NOW });
+  assert.equal(d.skip, true, 'the LATCHED-suffix body is a marker the filter sees');
+  assert.equal(d.reason, 'trusted-marker-fresh');
+});
+
+test('s23/LATCHED-body (source shape): the production latch template carries the dedup class token', async () => {
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const REPO_ROOT = join(import.meta.dirname, '..');
+  const src = fs.readFileSync(join(REPO_ROOT, 'watchdog', 'scan.mjs'), 'utf8');
+  // the latch body template: the line that builds the LATCH alert body
+  const m = src.match(/const body = `([^`]*consecutive re-primes[^`]*)`/);
+  assert.ok(m, 'the latch body template exists in scan.mjs');
+  assert.ok(m[1].includes('[fsm-watchdog]'), 'the latch body carries the [fsm-watchdog] class token (alertDedup can match it)');
+  // the old divergent shape must not appear in ANY template literal (the
+  // explanatory comments may quote it — split-literal style — but a live
+  // `...` string may not carry it)
+  for (const t of src.matchAll(/`[^`]*`/g)) {
+    assert.ok(!t[0].includes('**[fsm-watchdog LATCHED]**'), `a live template literal still carries the old divergent body: ${t[0].slice(0, 80)}`);
+  }
+});
