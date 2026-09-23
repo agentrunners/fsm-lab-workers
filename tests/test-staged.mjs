@@ -843,3 +843,52 @@ test('s23/genesis-anchored window: the queue delay is excluded from the drill wa
   // no dispatch ts (env missing) -> the boundary stands alone
   assert.equal(refineWindowStart({ boundaryTs: boundary }), boundary);
 });
+
+// ---------------------------------------------------------------------------
+// s23/a11 (attempt 4's live catch — the cadence lesson, THIRD recurrence):
+// the watchdog-run liveness check was calibrated to the NOMINAL */10 cron
+// and expected >=1 run inside the drill's 47-min window; the watchdog's
+// MEASURED cadence on this repo's bucket runs 4-5h gaps (live: 00:51 ->
+// 05:20 -> 10:07) — the exact A-1/R2-1 law (never assert on nominal crons),
+// now applied to the verify's OWN assertion. The liveness half reads a 6h
+// lookback ending at the drill's end; the alert-free half stays in-window.
+// ---------------------------------------------------------------------------
+test('s23/a11: the watchdog liveness reads the MEASURED cadence (6h lookback, never the nominal cron)', async () => {
+  const { runVerdict, WATCHDOG_LIVENESS_LOOKBACK_MS } = await import('../e2e/staged/verify.mjs');
+  assert.equal(WATCHDOG_LIVENESS_LOOKBACK_MS, 6 * 3_600_000, 'the 6h lookback (the measured 4h47m max gap + ~1h headroom — the R2-1 rule)');
+  // the attempt-4 shape: the drill window 07:52:47 -> 08:39:41 (47 min),
+  // the watchdog ran at 05:20:46 (3h19m before the end) — OUTSIDE the drill
+  // window but INSIDE the 6h lookback: A11 must pass its liveness half
+  const base = {
+    state: { chain: { id: 'c1', seq: 80, halted: true }, project: { phase: 'done', issue: '21', mode: 'mock' }, tasks: {}, stats: {} },
+    journalSegment: { records: [] },
+    runsMain: [], runsMirror: [],
+    drillIssue: { number: '21', comments: [] },
+    window: { start: '2026-09-23T07:52:47.472Z', end: '2026-09-23T08:39:41.000Z' },
+    watchdogRuns: [
+      { created_at: '2026-09-23T05:20:46Z', status: 'completed', conclusion: 'success' },   // the only nearby run — outside the window
+      { created_at: '2026-09-23T10:07:21Z', status: 'completed', conclusion: 'success' },   // after the window end
+    ],
+    alertIssues: [],
+  };
+  // minimal A-table drive: only A11's evidence varies; feed a state the rest
+  // can digest — the pure function tolerates sparse inputs for THIS pin via
+  // the A11-only read (we assert the A11 row directly)
+  const v = runVerdict(base);
+  const a11 = v.report.asserts.find((a) => a.id === 'A11');
+  assert.equal(a11.ok, true, 'the 05:20 run is inside the 6h lookback (3h19m before the end) — liveness holds despite ZERO in-window runs');
+  // the counterfactual: NO run within 6h of the end -> liveness fails
+  const dead = runVerdict({ ...base, watchdogRuns: [
+    { created_at: '2026-09-22T01:00:00Z', status: 'completed', conclusion: 'success' },  // >24h stale
+  ] });
+  const a11dead = dead.report.asserts.find((a) => a.id === 'A11');
+  assert.equal(a11dead.ok, false, 'no run within 6h -> the watchdog plane is genuinely dark -> A11 fails');
+  // the alert half stays strictly in-window: an alert DURING the drill fails A11
+  const alerted = runVerdict({ ...base, alertIssues: [{ created_at: '2026-09-23T08:00:00Z' }] });
+  const a11alert = alerted.report.asserts.find((a) => a.id === 'A11');
+  assert.equal(a11alert.ok, false, 'an in-window alert issue fails A11 (the real signal)');
+  // an alert OUTSIDE the window (before/after) does not
+  const outside = runVerdict({ ...base, alertIssues: [{ created_at: '2026-09-23T06:00:00Z' }] });
+  const a11out = outside.report.asserts.find((a) => a.id === 'A11');
+  assert.equal(a11out.ok, true, 'an alert outside the drill window is not the drill\'s signal');
+});
