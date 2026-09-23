@@ -53,6 +53,14 @@ const TERMINAL = new Set(['done', 'quarantined', 'cancelled']);
 // RED page (no epoch, the queue was never touched); DEFERRED exits green
 // with ZERO teardown (§1.4); a missing verdict is RED (never silently green
 // — law 5: a crashed verify is not a green drill).
+// s23: the RED-family actions — every one of these must run the §4.2
+// stuck-recovery arm when the chain is non-terminal (the first stage-0
+// green caught the gap: a seed-no-output classification — from the
+// workflow's needs-chain bug reading RUN_SEEDED empty — skipped the reset
+// on a LIVE epoch because the arm only fired on action === 'red'). The
+// epoch does not care WHICH red class paged it; it cares that it is stuck.
+export const RED_FAMILY_ACTIONS = new Set(['red', 'gate-read-red', 'seed-no-output']);
+
 export function teardownDecision({ gateResult, seeded, verdict } = {}) {
   if (gateResult === 'failure') {
     return { action: 'gate-read-red', effectiveVerdict: 'RED', redClass: 'gate-read' };
@@ -241,10 +249,13 @@ async function main() {
   }
 
   // ---- the stuck-recovery arm (§4.2) — only a NON-TERMINAL drill ---------
+  // s23: RED_FAMILY_ACTIONS (the whole red family, not just 'red') — a
+  // seed-no-output/gate-read-red classification with a LIVE non-terminal
+  // epoch is EXACTLY the stuck shape the reset exists for.
   let resetDispatched = null;
-  if (action === 'red' && nonTerminalState(state)) {
+  if (RED_FAMILY_ACTIONS.has(action) && nonTerminalState(state)) {
     resetDispatched = await dispatchStuckRecovery({ date });
-  } else if (action === 'red') {
+  } else if (RED_FAMILY_ACTIONS.has(action)) {
     console.log(`STAGED-DRILL-NO-RESET (the chain is terminal: ${recovery} — §3.4: an assertion-RED on a halted-clean chain leaves the system alone; the next night retries)`);
   }
 
