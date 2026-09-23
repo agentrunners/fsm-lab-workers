@@ -70,6 +70,17 @@ export const ASSERT_NAMES = {
   A12: 'the rollover record',
 };
 
+// s23: the genesis-anchored window start (pure, exported for the unit
+// pins). Returns the refined start ms when a parseable boundary ts exists
+// AND it postdates the dispatch (the queue-delay exclusion); null when the
+// run_started_at fallback should stand (no boundary, or the boundary
+// precedes the dispatch — impossible in production, guarded anyway).
+export function refineWindowStart({ boundaryTs, dispatchMs } = {}) {
+  if (!Number.isFinite(boundaryTs)) return null;
+  if (!Number.isFinite(dispatchMs)) return boundaryTs;
+  return boundaryTs > dispatchMs ? boundaryTs : null;
+}
+
 function normWindow(w) {
   const end = toMs(w?.end ?? w?.endMs);
   const endMs = Number.isFinite(end) ? end : Date.now();
@@ -454,6 +465,24 @@ async function main() {
     return finish(v, { window, readTimings });
   }
   const segment = epochSegment(g.journals);
+
+  // s23 (attempt 3's live catch — the queued-dispatch window inflation): the
+  // drill's wall must start at OUR epoch's genesis (the journal boundary's
+  // ts), NOT github.run_started_at — a QUEUED dispatch (the F4 class,
+  // live-observed: attempt 3 sat 59 minutes in the shared bucket's queue)
+  // puts run_started_at an hour BEFORE the epoch exists, smuggling the
+  // PREDECESSOR'S records into the window and inflating the wall (the
+  // 60-min "stuck" verdict on a seconds-old epoch; A2/A3/A5/A9 cascade).
+  // The boundary is the authority on when tonight's epoch began — it can
+  // never precede the dispatch (the seed runs after the workflow starts);
+  // no parseable boundary -> the run_started_at fallback stands.
+  {
+    const refined = refineWindowStart({ boundaryTs: toMs(segment?.boundary?.ts), dispatchMs: toMs(runStartedAt) });
+    if (refined != null) {
+      window.start = new Date(refined).toISOString();
+      console.log(`VERIFY-WINDOW genesis-anchored start=${window.start} (the journal boundary ts; the dispatch was ${runStartedAt} — the queue delay is excluded from the drill wall)`);
+    }
+  }
 
   // ---- the API reads, 3 attempts each -------------------------------------
   const tApi = Date.now();

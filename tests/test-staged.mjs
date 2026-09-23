@@ -796,3 +796,50 @@ test('s23/stage-0 catch #2: the RED FAMILY fires the stuck-recovery — seed-no-
   // and a terminal chain under a red action does not either
   assert.equal(nonTerminalState({ chain: { halted: true }, project: { phase: 'done' }, tasks: { t: { status: 'done' } } }), false);
 });
+
+// ---------------------------------------------------------------------------
+// s23 (the stage-0 attempt-3 catches — the resting-shape race + the queued-
+// dispatch window inflation): (1) the monitor's halt-exit is HELD for the
+// birth-wait (the seed's door+rollover latency ~15s can trail the first
+// poll — attempt 3 polled at seed+1s, the boundary landed at seed+4s, and
+// the monitor declared DONE on the PREDECESSOR'S resting shape while
+// tonight's epoch was seconds old); (2) the verify's window anchors at the
+// journal boundary's ts, NOT github.run_started_at (attempt 3 sat 59 MIN
+// in the shared bucket's queue — run_started_at preceded the epoch by an
+// hour, smuggling the predecessor's records in and inflating the wall to
+// the 60-min "stuck" verdict).
+// ---------------------------------------------------------------------------
+test('s23/birth-wait: the monitor holds the halt-exit inside the wait (the resting-shape race)', async () => {
+  const { haltExitAllowed } = await import('../e2e/staged/monitor.mjs');
+  // the attempt-3 shape: the first poll 1s in — the halt read is the
+  // predecessor's resting shape, NOT tonight's completion
+  assert.equal(haltExitAllowed(1000), false, 'a 1s-in halt read is held (the door+rollover band is ~15s)');
+  assert.equal(haltExitAllowed(60_000), false, 'a 60s-in halt read is still held (the default wait is 120s)');
+  // the legitimate completion path: past the wait, the halt is admissible
+  assert.equal(haltExitAllowed(120_000), true, 'at the wait boundary the halt-exit is allowed');
+  assert.equal(haltExitAllowed(300_000), true, 'well past the wait (a real hang-night ladder) the exit fires');
+  // garbage elapsed never admits the exit (fail-closed)
+  assert.equal(haltExitAllowed(NaN), false);
+  assert.equal(haltExitAllowed(undefined), false);
+  // the wait floor scales with the poll interval but never below 120s
+  assert.equal(haltExitAllowed(119_999, 120_000), false);
+  assert.equal(haltExitAllowed(120_000, 120_000), true);
+});
+
+test('s23/genesis-anchored window: the queue delay is excluded from the drill wall', async () => {
+  const { refineWindowStart } = await import('../e2e/staged/verify.mjs');
+  // the attempt-3 shape: dispatched 03:26:18Z, queued 59min, boundary 04:26:13Z
+  const dispatch = Date.parse('2026-09-23T03:26:18.000Z');
+  const boundary = Date.parse('2026-09-23T04:26:13.000Z');
+  const refined = refineWindowStart({ boundaryTs: boundary, dispatchMs: dispatch });
+  assert.equal(refined, boundary, 'the window starts at the boundary (the 59-min queue delay is EXCLUDED)');
+  // the normal shape: the boundary lands ~15s after the dispatch
+  const refined2 = refineWindowStart({ boundaryTs: dispatch + 15_000, dispatchMs: dispatch });
+  assert.equal(refined2, dispatch + 15_000, 'the normal birth (+15s) anchors at the boundary');
+  // no boundary -> the run_started_at fallback stands (null = no refinement)
+  assert.equal(refineWindowStart({ boundaryTs: NaN, dispatchMs: dispatch }), null);
+  // a boundary PRECEDING the dispatch (impossible in production) -> null (guarded)
+  assert.equal(refineWindowStart({ boundaryTs: dispatch - 60_000, dispatchMs: dispatch }), null);
+  // no dispatch ts (env missing) -> the boundary stands alone
+  assert.equal(refineWindowStart({ boundaryTs: boundary }), boundary);
+});
