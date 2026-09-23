@@ -75,6 +75,13 @@ export const ASSERT_NAMES = {
 // AND it postdates the dispatch (the queue-delay exclusion); null when the
 // run_started_at fallback should stand (no boundary, or the boundary
 // precedes the dispatch — impossible in production, guarded anyway).
+// s23/a11: the watchdog liveness lookback — the watchdog's MEASURED
+// cadence on this repo's bucket runs 4-5h gaps (00:51 -> 05:20 -> 10:07,
+// live-observed 2026-09-23) despite the nominal */10 cron. The liveness
+// assertion reads a 6h lookback (the measured max + ~1h headroom, the R2-1
+// calibration rule); alert-freedom stays strictly in the drill window.
+export const WATCHDOG_LIVENESS_LOOKBACK_MS = 6 * 3_600_000;
+
 export function refineWindowStart({ boundaryTs, dispatchMs } = {}) {
   if (!Number.isFinite(boundaryTs)) return null;
   if (!Number.isFinite(dispatchMs)) return boundaryTs;
@@ -333,20 +340,32 @@ export function runVerdict(input = {}) {
   }
 
   // ---- A11: watchdog stayed green -----------------------------------------
+  // s23/a11 (attempt 4's live catch — the cadence lesson the THIRD time):
+  // the watchdog-run check was calibrated to the NOMINAL */10 cron; the
+  // watchdog's MEASURED cadence on this repo's bucket runs 4-5h gaps
+  // (live-observed: 00:51 -> 05:20 -> 10:07) — the same A-1/R2-1 law that
+  // recalibrated the pinger and the deadman: never assert on nominal crons.
+  // A 47-min drill window containing zero watchdog runs is the NORM, not an
+  // anomaly. The liveness half now reads a 6h lookback ENDING at the drill's
+  // end (the measured 4h47m max gap + ~1h headroom — the R2-1 rule): the
+  // watchdog was ALIVE around the drill. The alert-free half stays strictly
+  // in-window (an alert DURING the drill is the real signal).
   {
     const wdRuns = Array.isArray(input.watchdogRuns) ? input.watchdogRuns : null;
     const alerts = Array.isArray(input.alertIssues) ? input.alertIssues : null;
     const hasData = wdRuns !== null && alerts !== null;
     const inWinWd = hasData ? wdRuns.filter((r) => inWindowTs(r?.created_at, win)) : [];
-    const okWd = inWinWd.some((r) => r?.status === 'completed' && r?.conclusion === 'success');
+    const lookbackWin = { startMs: win.endMs - WATCHDOG_LIVENESS_LOOKBACK_MS, endMs: win.endMs };
+    const nearWd = hasData ? wdRuns.filter((r) => inWindowTs(r?.created_at, lookbackWin)) : [];
+    const okWd = nearWd.some((r) => r?.status === 'completed' && r?.conclusion === 'success');
     const okAlerts = hasData && !alerts.some((it) => inWindowTs(it?.created_at, win));
     add('A11', hasData ? okWd && okAlerts : false,
-      '≥1 watchdog run completed in-window with success; zero fsm-watchdog-alert issues created in-window',
-      hasData ? `watchdog-runs-in-window=${inWinWd.length} (success: ${inWinWd.filter((r) => r?.status === 'completed' && r?.conclusion === 'success').length}); in-window alert issues=${alerts.filter((it) => inWindowTs(it?.created_at, win)).length}`
+      `≥1 watchdog run completed within the ${Math.round(WATCHDOG_LIVENESS_LOOKBACK_MS / 3_600_000)}h liveness lookback ending at the drill's end (the measured 4-5h cadence — never the nominal cron); zero fsm-watchdog-alert issues created in-window`,
+      hasData ? `watchdog-runs-lookback=${nearWd.length} (success: ${nearWd.filter((r) => r?.status === 'completed' && r?.conclusion === 'success').length}); in-window alert issues=${alerts.filter((it) => inWindowTs(it?.created_at, win)).length}`
         : 'INPUT MISSING (watchdogRuns/alertIssues)',
       !hasData ? 'the caller did not supply the watchdog evidence (fail-noisy: never silently green)'
-        : okWd && okAlerts ? 'a live self-ticking chain is fresh by construction — the scan stayed green'
-        : `${!okWd ? 'no successful in-window watchdog run; ' : ''}${!okAlerts ? 'an fsm-watchdog-alert issue was CREATED in-window' : ''}`.trim());
+        : okWd && okAlerts ? 'the watchdog is alive around the drill (the measured-cadence lookback) and no alert fired in-window'
+        : `${!okWd ? `no successful watchdog run within ${Math.round(WATCHDOG_LIVENESS_LOOKBACK_MS / 3_600_000)}h of the drill's end (the measured cadence is 4-5h — this is a genuinely dead or degraded watchdog plane); ` : ''}${!okAlerts ? 'an fsm-watchdog-alert issue was CREATED in-window' : ''}`.trim());
   }
 
   // ---- A12: the rollover record -------------------------------------------
