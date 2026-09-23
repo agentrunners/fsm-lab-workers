@@ -107,6 +107,41 @@
 // registry contract). Linux-only (/proc — stress/lib/kill-proc.mjs).
 //
 // ---------------------------------------------------------------------------
+// s23-chaos3 RECOVERY NOTES (the deltas that made it green — round 3):
+//   * THE EVENT-ID MIRAGE (the lost-reports false conviction): the applied
+//     REPORT journal records carry run_id but NO event_id (the documented
+//     shape: {kind, task, lease, to, run_id, ...lane} — only REJECTED records
+//     carry event_id), so an appliedEventIds set read from the journal was
+//     ALWAYS EMPTY: every emission looked "lost" except the REJECTED ones.
+//     The honest emission ledger is the QUEUE-LANDING COMMITS — every report
+//     enqueue is a CAS commit whose subject is `report-queue +1 <task>
+//     <event_id>`, and the branch HISTORY retains all of them (rotation
+//     prunes files from the tree, never commits). Accounting joins by run_id
+//     (applied) or event_id (rejected) — the id parses back to the run id.
+//   * ROTATION-PROOF JOURNAL READBACK: the retained branch carries only the
+//     last keepGens=4 generations (~2000 records); a long epoch (the full
+//     mode's 18 tasks / 50 kills) rotates the earliest records OUT of the
+//     branch readback. Every pruned generation's FINAL content is still
+//     recoverable in history (its last Add/Modify commit) — the analysis
+//     now merges branch-retained gens with history-recovered gens, so every
+//     journal-based invariant (terminal arrivals, wedges, PR stamps, report
+//     accounting) reads the COMPLETE journal.
+//   * COVERAGE-FIRST SCHEDULE: the first entry of every boundary is the
+//     COVERAGE entry — skip=0, and for worker-report-push a delay calibrated
+//     INSIDE the dup gap (300-1200ms of the 1500ms inter-enqueue sleep, clear
+//     margins both sides) — so the boundary class crosses in the quick
+//     epoch's thin event supply (the one exception: conductor-post-commit's
+//     first entry keeps its skip 2-3 productive-phase guard — its supply is
+//     hundreds of events). Quick's worker-report-push entries ALL take
+//     skip=0 and the quick cohort carries TWO dup tasks (the gap supply).
+//   * SEED PURITY vs THE RE-ARM (the design tension, resolved): purity hashes
+//     the INITIAL derivation — a byte-snapshot of the entries taken BEFORE
+//     the scheduler runs (the re-arm is RUNTIME retry bookkeeping on the
+//     entry objects, not a schedule change). The runtime half of the check
+//     is the accounting: every scheduled entry is fired exactly once or
+//     flushed as a documented epoch-ended dud (kills + duds = the schedule).
+//
+// ---------------------------------------------------------------------------
 // s23-chaos2 RECOVERY NOTES (the deltas that made it green):
 //   * DUD RE-ARMING: a kill whose victim exits before the delayed SIGKILL (or
 //     whose immediate victim is already gone) is RE-QUEUED at the boundary's
@@ -177,9 +212,9 @@ function cohort(quick) {
     T('CQ-F1', null, 'cc-fast', 3_000),
     T('CQ-F2', null, 'cc-fast', 3_000),
     T('CQ-F3', null, 'cc-fast', 4_000),
-    T('CQ-F4', null, 'cc-fast', 3_000),
     T('CQ-F5', null, 'cc-fast', 4_000),
     T('CQ-D1', 'dup-report', 'cc-dup', 4_000),
+    T('CQ-D2', 'dup-report', 'cc-dup', 4_000),
     T('CQ-I1', 'exit-transport', 'cc-infra', 4_000),
   ] : [
     T('CF-S1', 'sleep-ms=26000', 'cc-slow', 26_000),
@@ -211,8 +246,14 @@ function cohort(quick) {
 // Entry semantics: per boundary, entries fire in order; an entry with skip=k
 // lets k matching events pass and kills at the (k+1)-th. delayMs postpones
 // the SIGKILL after the event (B1: mid-work on a long attempt; B3: inside the
-// dup-report 1500ms gap or just after a plain report push). The first B2
-// entry skips 2-3 events so the epoch's productive phase is not wedged at t0.
+// dup-report 1500ms gap or just after a plain report push). COVERAGE-FIRST
+// (s23-chaos3): the FIRST entry of every boundary is the coverage entry —
+// skip=0 so the class crosses on the first matching event (B3's coverage
+// delay is calibrated mid-gap: 300-1200ms of the 1500ms inter-enqueue sleep,
+// margins both sides). The exception is the first B2 entry: skip stays 2-3
+// (the productive-phase guard — the epoch must not be wedged at t0; B2's
+// supply is hundreds of events, coverage was never in question). Quick's B3
+// entries all take skip=0 — the quick cohort's two dup tasks are the supply.
 export const BOUNDARIES = ['worker-pre-report', 'conductor-post-commit', 'worker-report-push', 'worker-post-taskbranch', 'conductor-mid-pr'];
 
 export function killPlanFor(seed, quick) {
@@ -226,9 +267,15 @@ export function killPlanFor(seed, quick) {
       let skip = Math.floor(rng() * (boundary === 'conductor-post-commit' ? 3 : 2));
       if (boundary === 'conductor-post-commit' && i === 0) skip = 2 + Math.floor(rng() * 2);  // let the first assigns fly
       if (boundary === 'worker-post-taskbranch' || boundary === 'conductor-mid-pr') skip = 0;  // rare events — never skip
+      if (i === 0 && boundary !== 'conductor-post-commit') skip = 0;                          // the COVERAGE entry
+      if (boundary === 'worker-report-push' && quick) skip = 0;                               // quick: every dup gap is supply
       let delayMs = 0;
       if (boundary === 'worker-pre-report') delayMs = 1500 + Math.floor(rng() * 7000);         // mid-work on a >=15s attempt
-      if (boundary === 'worker-report-push') delayMs = 30 + Math.floor(rng() * 1350);          // the dup gap is 1500ms
+      if (boundary === 'worker-report-push') {
+        delayMs = i === 0
+          ? 300 + Math.floor(rng() * 900)                                                      // the coverage kill: mid-gap, margins both sides
+          : 30 + Math.floor(rng() * 1350);                                                     // the dup gap is 1500ms
+      }
       plan.entries.push({ boundary, skip, delayMs });
     }
   }
@@ -433,6 +480,7 @@ class KillScheduler {
     this.seq += 1;
     const rec = {
       seq: this.seq, boundary: p.boundary, victimRunId: p.runId, victimTask: p.task ?? null,
+      scheduleIdx: this.plan.entries.indexOf(p.entry),   // the initial-schedule accounting key (s23-chaos3)
       ts: p.ts, delayMs: p.entry.delayMs, killedGroups: procs.length,
       killed: procs.map((x) => ({ pid: x.pid, cmd: x.cmd.slice(0, 90) })),
     };
@@ -461,8 +509,14 @@ export async function run({ quick, seed } = {}) {
   const maxKicks = quick ? 500 : 1500;
   const { tasks, byId } = cohort(quick);
   const plan = killPlanFor(seed, quick);
+  // s23-chaos3: the SEED-PURITY snapshot — the byte-image of the INITIAL
+  // derivation, taken BEFORE the KillScheduler runs. The re-arm is RUNTIME
+  // retry bookkeeping on the entry objects (entry.rearms), NOT a schedule
+  // change: purity compares the re-derivation to THIS snapshot, and the
+  // runtime half of the contract is the separate accounting check below.
+  const initialEntriesJson = JSON.stringify(plan.entries);
   rec.note(`epoch: ${tasks.length} tasks (mixed: fast/slow/dup/artifacts/infra/fail), max_parallel=${MAX_PARALLEL}, lease=${LEASE_MIN}min (the floor — real clock), max_attempts=${MAX_ATTEMPTS}, mode=cc (the full boundary surface)`);
-  rec.note(`kill schedule (seed ${seed}, fingerprint ${plan.fingerprint}): ${plan.entries.length} entries — ${BOUNDARIES.map((b) => `${b}=${plan.entries.filter((e) => e.boundary === b).length}`).join(', ')}`);
+  rec.note(`kill schedule (seed ${seed}, fingerprint ${plan.fingerprint}, coverage-first): ${plan.entries.length} entries — ${BOUNDARIES.map((b) => `${b}=${plan.entries.filter((e) => e.boundary === b).length}`).join(', ')}`);
 
   const scratchDir = mkdtempSync(join(tmpdir(), 'fsm-chaos-'));
   const driverLog = join(scratchDir, 'chaos-driver.log');
@@ -605,21 +659,53 @@ export async function run({ quick, seed } = {}) {
     if (budgetNote) rec.note(`DRIVER: ${budgetNote}`);
 
     // ---- the post-hoc ledger analysis --------------------------------------
-    // the full journal (every retained generation, in order)
+    // the full journal — ROTATION-PROOF (s23-chaos3): the retained branch
+    // carries only the last keepGens=4 generations (~2000 records); a long
+    // epoch rotates the earliest applied/rejected records OUT of the branch
+    // readback (the drain's accounting evidence would silently vanish). The
+    // git HISTORY retains every commit: each pruned generation's FINAL
+    // content is recoverable at its last Add/Modify commit — the merge below
+    // reads branch-retained gens ∪ history-recovered gens, so every
+    // journal-based invariant (terminal arrivals, wedges, PR stamps, report
+    // accounting) reads the COMPLETE journal.
     await fetchProbe();
     const ls = await agit(['-C', world.probeClone, 'ls-tree', '--name-only', 'refs/remotes/origin/fsm-state', 'state/']);
-    const gens = ls.out.split('\n').map((x) => x.trim()).filter(Boolean)
+    const branchGens = ls.out.split('\n').map((x) => x.trim()).filter(Boolean)
       .map((f) => /^state\/journal-(\d+)\.jsonl$/.exec(f)).filter(Boolean)
       .map((m) => parseInt(m[1], 10)).sort((a, b) => a - b);
+    // history walk: the newest-first log's FIRST A/M sighting of each gen is
+    // its final content commit (gens are append-then-freeze — F5 disjoint
+    // generations; the F-A rollback sweep rewrites via M, newest still wins).
+    const lastAM = new Map();          // gen -> sha (its final Add/Modify commit)
+    {
+      const logRaw = await agit(['--git-dir', world.mainBare, 'log', '--format=%H', '--name-status', 'fsm-state', '--', 'state/']);
+      let sha = null;
+      for (const line of logRaw.out.split('\n')) {
+        const t = line.trim();
+        if (/^[0-9a-f]{40}$/.test(t)) { sha = t; continue; }
+        const m = /^([AM])\tstate\/journal-(\d+)\.jsonl$/.exec(t);
+        if (m && sha) {
+          const g = parseInt(m[2], 10);
+          if (!lastAM.has(g)) lastAM.set(g, sha);
+        }
+      }
+    }
+    const allGens = [...new Set([...branchGens, ...lastAM.keys()])].sort((a, b) => a - b);
     const journal = [];
-    for (const gn of gens) {
-      const raw = await showProbe(`state/journal-${gn}.jsonl`);
+    for (const gn of allGens) {
+      // a gen currently on the branch: its live content IS its final content;
+      // a pruned gen: its last-A/M-in-history content. (Never both — the
+      // branch version supersedes when present.)
+      const raw = branchGens.includes(gn)
+        ? await showProbe(`state/journal-${gn}.jsonl`)
+        : (await agit(['--git-dir', world.mainBare, 'show', `${lastAM.get(gn)}:state/journal-${gn}.jsonl`])).out || null;
       for (const line of (raw || '').split('\n')) {
         const t = line.trim();
         if (!t) continue;
         try { journal.push(JSON.parse(t)); } catch { /* bad line — the drain's own class */ }
       }
     }
+    rec.metric('journalGens', { retained: branchGens.length, recoveredFromHistory: allGens.length - branchGens.length, records: journal.length });
 
     // the dispatch ledger: every fsm-task POST the conductor ever made, keyed
     // by the payload's OWN identity — (task, attempt). The dispatch payload
@@ -658,7 +744,6 @@ export async function run({ quick, seed } = {}) {
     // the applied/rejected report ledger (journal side)
     const appliedInprogress = new Map();    // runId -> count of to=in_progress REPORT records (double-apply detector)
     const appliedRunIds = new Set();
-    const appliedEventIds = new Set();      // event ids of APPLIED worker reports — read from the journal records DIRECTLY
     const redeliverIds = new Set();         // REJECTED duplicate (origKind REPORT)
     const orphanRejectIds = new Set();      // REJECTED stale/unknown/… (accounted, superseded)
     const appliedTerminal = new Map();      // task -> [{kind, to}]
@@ -671,12 +756,16 @@ export async function run({ quick, seed } = {}) {
     const isPrStamp = (j) => j.pr != null && typeof j.note === 'string' && j.note.startsWith('pr-opened');
     for (const j of journal) {
       if (j.kind === 'REPORT' && j.applied !== false && !isPrStamp(j)) {
+        // NOTE (s23-chaos3, the event-id mirage): applied REPORT records
+        // carry run_id but NO event_id (the documented shape — only REJECTED
+        // records carry event_id), so there is NO applied-event-id set to
+        // read here; the accounting joins by RUN ID (the minted event id
+        // embeds it: rep-<runId>-a<attempt>).
         if (j.run_id != null) {
           const rid = String(j.run_id);
           appliedRunIds.add(rid);
           if (j.to === 'in_progress') appliedInprogress.set(rid, (appliedInprogress.get(rid) || 0) + 1);
         }
-        if (j.event_id) appliedEventIds.add(j.event_id);
         if (TERMINAL.has(j.to)) pushTerm(appliedTerminal, j.task, j);
       }
       if (j.kind === 'TIMEOUT' && TERMINAL.has(j.to)) pushTerm(appliedTerminal, j.task, j);
@@ -687,16 +776,52 @@ export async function run({ quick, seed } = {}) {
       }
     }
 
-    // the emitted ledger (worker side): every run whose log confirms a landed enqueue
-    const EMIT_RE = /WORKER-DONE task=\S+ outcome=\S+ enqueue=ok|WORKER-GATE-REJECT task=\S+[^\n]*enqueue=ok|WORKER-REPORT-DUP first=true/;
-    const emitted = new Map();   // eventId -> {runId, task}
-    for (const r of sched.runs) {
-      if (r.workflow !== 'worker') continue;
-      const m = / a(\d+)$/.exec(r.name || '');
-      if (!m) continue;
-      const text = sched.runLogText(r.id);
-      if (EMIT_RE.test(text)) emitted.set(`rep-${r.id}-a${m[1]}`, { runId: r.id, task: r.taskRef });
+    // the emission ledger — the QUEUE-LANDING COMMITS (s23-chaos3): every
+    // report enqueue is a CAS push whose commit subject is `report-queue +1
+    // <task> <event_id>`, and the branch HISTORY retains ALL of them
+    // (rotation prunes files from the tree, never commits). This is the
+    // honest full emission set — the prior run-log regex lane keyed the
+    // claims by the run NAME's attempt suffix, which is NOT the minted id's
+    // attempt component (the drill's world pins GITHUB_RUN_ATTEMPT='1' for
+    // every run — production-faithful: a fresh run id per FSM attempt), and
+    // SIGKILL can lose a killed run's buffered stdout, so the logs UNDERCOUNT
+    // (the claims survive as a cross-check metric, not as the ledger).
+    const EMIT_ID_RE = /^rep-(\d+)-a(\d+)$/;   // MINT_TABLE's REPORT shape
+    const emittedIds = new Map();    // eventId -> task (every report that ever LANDED)
+    {
+      const subj = await agit(['--git-dir', world.mainBare, 'log', '--format=%s', 'fsm-state']);
+      for (const line of subj.out.split('\n')) {
+        const m = /^report-queue \+1 (\S+) (\S+)$/.exec(line.trim());
+        if (m && !emittedIds.has(m[2])) emittedIds.set(m[2], m[1]);
+      }
     }
+    // the run-log claim lane (diagnostic cross-check only): the runs whose
+    // log survived long enough to confirm an enqueue (killed runs can lose
+    // buffered stdout — claims ≤ landings by construction)
+    let logClaimed = 0;
+    {
+      const EMIT_RE = /WORKER-DONE task=\S+ outcome=\S+ enqueue=ok|WORKER-GATE-REJECT task=\S+[^\n]*enqueue=ok|WORKER-REPORT-DUP first=true/;
+      for (const r of sched.runs) {
+        if (r.workflow !== 'worker') continue;
+        if (EMIT_RE.test(sched.runLogText(r.id))) logClaimed += 1;
+      }
+    }
+    // the accounting join: a landed report is accounted iff its event id was
+    // REJECTED (duplicate re-delivery or orphan/superseded) OR its run id has
+    // an APPLIED REPORT record (the minted id embeds the run id — the drill's
+    // minted attempt is always '1', and the run ids are unique per attempt,
+    // so the join is exact either way).
+    const rejectedRunIds = new Set();
+    for (const id of [...redeliverIds, ...orphanRejectIds]) {
+      const m = EMIT_ID_RE.exec(id);
+      if (m) rejectedRunIds.add(m[1]);
+    }
+    const accountOf = (eventId) => {
+      if (redeliverIds.has(eventId) || orphanRejectIds.has(eventId)) return 'rejected';
+      const m = EMIT_ID_RE.exec(eventId);
+      if (m && appliedRunIds.has(m[1])) return 'applied';
+      return null;
+    };
 
     // the wedge analysis: every ASSIGN whose (task, attempt) was NEVER dispatched
     const assigns = [];
@@ -764,9 +889,11 @@ export async function run({ quick, seed } = {}) {
       const slot = killsByBoundary[k.boundary];
       slot.fired += 1;
       let cls = 'killed';
-      const wr = workerRunById.get(String(k.victimRunId));
-      const evId = wr ? `rep-${k.victimRunId}-a${wr.attempt}` : null;
-      const accounted = evId && (appliedEventIds.has(evId) || redeliverIds.has(evId) || orphanRejectIds.has(evId));
+      // the victim's report accounting — by RUN ID (s23-chaos3): applied
+      // records join on run_id, rejected ids parse back to the run id, so
+      // the attempt-component mismatch (run-name suffix vs the minted id's
+      // env attempt) never misclassifies the achieved class.
+      const accounted = appliedRunIds.has(String(k.victimRunId)) || rejectedRunIds.has(String(k.victimRunId));
       if (k.boundary === 'conductor-post-commit') {
         // the victim's in-flight window: [startedAt, finishedAt ?? +inf) — POSTs
         // the victim landed AFTER the kill's commit observation (k.ts) = the
@@ -805,7 +932,8 @@ export async function run({ quick, seed } = {}) {
     rec.metric('boundaryEvents', Object.fromEntries(killer.eventCounts));
     rec.metric('tasks', { total: taskIds.length, byStatus: Object.fromEntries([...finalStatus].map(([id, s]) => [id, s])) });
     rec.metric('reportsLedger', {
-      emitted: emitted.size,
+      landed: emittedIds.size,        // the commit-proven emission ledger (full history)
+      logClaimed,                    // the run-log claims that survived the kills (≤ landed)
       applied: appliedRunIds.size,
       redeliveries: redeliverIds.size,
       orphanRejects: orphanRejectIds.size,
@@ -852,10 +980,16 @@ export async function run({ quick, seed } = {}) {
     rec.check('every task has EXACTLY ONE applied terminal-arrival record', multiTerminal.length === 0 && missingTerminal.length === 0,
       `multi: ${multiTerminal.join(', ') || 'none'}; missing: ${missingTerminal.join(', ') || 'none'}`);
 
-    // 2+3. the report ledger diff — zero lost, zero double-applied
-    const lost = [...emitted.keys()].filter((id) => !(appliedEventIds.has(id) || redeliverIds.has(id) || orphanRejectIds.has(id)));
-    rec.check('ZERO lost reports (every worker-confirmed emission is accounted)', lost.length === 0,
-      lost.length ? `lost: ${lost.join(', ')}` : `${emitted.size} emitted → ${appliedRunIds.size} applied + ${redeliverIds.size} re-deliveries + ${orphanRejectIds.size} orphan-rejects`);
+    // 2+3. the report ledger diff — zero lost, zero double-applied.
+    // s23-chaos3: the emission ledger is the QUEUE-LANDING COMMITS (every
+    // `report-queue +1 <task> <event_id>` subject on the branch history —
+    // SIGKILL-proof, rotation-proof); the accounting joins by run id (applied)
+    // or event id (rejected). A landed report that is neither applied nor
+    // rejected is the LOSS class — the conductor's consumed-applied-or-
+    // rejected drain law (F1) says it cannot exist.
+    const lost = [...emittedIds.keys()].filter((id) => accountOf(id) === null);
+    rec.check('ZERO lost reports (every queue-landed report is applied or rejected)', lost.length === 0,
+      lost.length ? `lost: ${lost.join(', ')}` : `${emittedIds.size} landed (commit-proven; ${logClaimed} log-claimed) → ${appliedRunIds.size} applied runs + ${redeliverIds.size} re-deliveries + ${orphanRejectIds.size} orphan-rejects`);
     const doubleApplied = [...appliedInprogress].filter(([, n]) => n > 1).map(([rid]) => rid);
     rec.check('ZERO double-applied reports (one in_progress arrival per event id)', doubleApplied.length === 0,
       doubleApplied.length ? `run ids applied twice: ${doubleApplied.join(', ')}` : `${appliedRunIds.size} distinct applied ids, dedup absorbed ${redeliverIds.size} re-deliveries`);
@@ -912,10 +1046,30 @@ export async function run({ quick, seed } = {}) {
     rec.check(`kill floor (>=${firedFloor} fired) and all five boundaries exercised`, killer.kills.length >= firedFloor && unexercised.length === 0,
       `${killer.kills.length}/${plan.entries.length} fired (${terminalDuds.length} terminal duds = event-supply exhaustion, ${rearmedWaste.length} re-armed waste events); unexercised: ${unexercised.join(', ') || 'none'}`);
 
-    // 7. seed purity — the schedule is a function of the seed (re-derived, compared)
+    // 7. seed purity + the executed-log accounting — SPLIT (s23-chaos3, the
+    // design tension resolved): the re-arm is RUNTIME retry bookkeeping on
+    // the entry objects (entry.rearms), not a schedule change, so the LIVE
+    // plan.entries are EXPECTED to differ from a fresh derivation after any
+    // re-arm — the pre-recovery-3 shape compared the live entries and
+    // convicted the pure derivation of its own runtime retry state.
+    // (a) THE PURE PROPERTY: a fresh derivation is byte-identical to the
+    //     INITIAL snapshot taken before the scheduler ran.
+    // (b) THE ACCOUNTING PROPERTY: the executed log is a complete ledger of
+    //     the initial schedule — every entry fired EXACTLY ONCE or was
+    //     flushed as a documented epoch-ended dud; kills + unfired = the
+    //     schedule, and no kill references an entry that is not in it.
     const recheck = killPlanFor(seed, quick);
-    rec.check('kill schedule is seed-pure (re-derivation is byte-identical)', recheck.fingerprint === plan.fingerprint && JSON.stringify(recheck.entries) === JSON.stringify(plan.entries),
-      `fingerprint ${plan.fingerprint} (seed ${seed}${quick ? ', quick' : ', full'})`);
+    rec.check('kill schedule is seed-pure (the INITIAL derivation re-derives byte-identical)',
+      recheck.fingerprint === plan.fingerprint && JSON.stringify(recheck.entries) === initialEntriesJson,
+      `fingerprint ${plan.fingerprint} (seed ${seed}${quick ? ', quick' : ', full'}); the live entries carry the runtime re-arm bookkeeping — the accounting check below is the runtime half`);
+    const firedIdxList = killer.kills.map((k) => k.scheduleIdx);
+    const firedIdx = new Set(firedIdxList);
+    const phantomKillIdx = firedIdxList.filter((i) => !Number.isInteger(i) || i < 0 || i >= plan.entries.length);
+    const unfiredEntries = plan.entries.filter((e, i) => !firedIdx.has(i));
+    const unfiredFlushed = unfiredEntries.filter((e) => terminalDuds.some((d) => d.entry === e));
+    rec.check('every scheduled kill is accounted (fired exactly once or a documented dud)',
+      phantomKillIdx.length === 0 && firedIdx.size === firedIdxList.length && unfiredEntries.length === unfiredFlushed.length && killer.kills.length + terminalDuds.length === plan.entries.length,
+      `${killer.kills.length} fired + ${terminalDuds.length} unfired-at-stop = ${plan.entries.length} scheduled${unfiredEntries.length !== unfiredFlushed.length ? ` — UNACCOUNTED entries: ${plan.entries.filter((e, i) => !firedIdx.has(i) && !terminalDuds.some((d) => d.entry === e)).length}` : ''}`);
 
     // 8. no orphaned processes outlive the battery
     sweptPids = sweepProcs(underScratch);
