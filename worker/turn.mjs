@@ -104,8 +104,14 @@ export function sleepCapMs(env = process.env) {
 
 export const REAL_MODEL_CHAIN_DEFAULTS = [
   'nvidia/nemotron-3.5-lightning:free',
-  'deepseek/deepseek-v4-flash-0731:free',
   'cohere/north-mini-code:free',
+  // s23 (the cctail design §1b/§6.5): deepseek/deepseek-v4-flash-0731:free
+  // REMOVED — 404 not_found_error on every key class (the live probe,
+  // 2026-09-23; the slug is gone from the upstream catalog). The s19
+  // poison exclusion ('hallucinated the task — never unsupervised') is now
+  // self-enforcing upstream; the slot was a guaranteed-404 rotation hop.
+  // cohere/north-mini-code:free PROMOTED to slot 2 (the cctail probe's
+  // reliability pick: 6/6 across five key classes, 978ms-5.2s, 256K ctx).
 ];
 
 export function realModelChain(env = process.env) {
