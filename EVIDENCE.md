@@ -480,3 +480,95 @@ reports drain, or accept the double-resume as operator routine.
 - The failure machinery under real lane death: law-4 → net-zero infra-retry → quarantine (4 tasks), the budget-pause cycling on the churn — every safety layer fired as designed, the chain never wedged.
 
 **The residual recorded honestly:** the epoch ends DEGRADED (the 4 quarantined tasks were the infra-flaky quartet × the dead mirror lane — the quarantine is the correct verdict for a dead lane). The v1 wipe was operator error (the orchestrator's misfire — the reset command's blast radius is real; the twin-guard/dedup machinery absorbed the report storm, and the REJECTED unknown-task records prove the fresh chain's fail-closed door).
+
+## s23 — the production-grade round closed (2026-09-23, session 23)
+
+**The session that closed every open build item: the W1 key closure, all six
+stress batteries, both documented-RED e2e scenarios, the genesis-window and
+LATCHED fixes, the stage-0 first GREEN, and the CC free-model tail — main
+@c722fcee, 606/606, nine session-23 branches merged.**
+
+**THE W1 KEY CLOSURE (the funded second key):** the principal's re-issued keys
+probed live through the relay — or-084 (srbuhiartur73, $5.76 remaining) passes
+the 32K-token pre-flight on the REAL surface and is **deployed as `KEY_2` on
+BOTH buckets**; or-074 ($8.88) stays the funded primary. The pool re-fronted:
+or-079/or-082 re-tiered elevated-free (1000 free req/day each) → **3 elevated
++ 68 free = 71 keys**. The standing model constraint recorded in
+OPENROUTER-KEYS §S23: paid models ONLY on the two approved keys, else `:free`.
+**The probe protocol note (a real catch):** the relay is POST-JSON-spec — a
+direct-style querystring call 401s; the first probe's all-401 was a PROTOCOL
+error, not key death. Registry + §S23 pushed (cc-gha-exploration @ 0b3c4b9/2f7040b).
+
+**THE FIX WAVES (the s22 remainder, all landed on main):**
+- **The genesis `budget_window` init + REJECTED-never-arms** (ff9f6ab1, the
+  X27 finding's candidate fix): genesis now initializes `budget_window:[]` +
+  `budget_window_cleared_at` (an epoch boundary IS a window-clear boundary;
+  predecessor stragglers are cohort-gated), and the drain's wasRejected gate
+  covers BOTH the window push and the infra-exhausted backstop latch — a
+  quota-shaped report for an UNKNOWN task never arms the fresh epoch's pause.
+  5 pins incl. straggler-stamp-at-genesis + rebuild parity; 3 mutations bite.
+  **The X27 re-pause class is dead on both arms — live-proven in X28 below.**
+- **The LATCHED-body class fix** (2bac884f, the battery-4 finding): the latch
+  alert's marker body now carries the dedup class token (`**[fsm-watchdog]**
+  LATCHED — …`, class-first); the old `**[fsm-watchdog LATCHED]**` shape did
+  not contain the alertDedup filter's substring, so a sustained latch posted
+  ~12 alert comments/day instead of the F-D 24h-dedup contract. 2 pins,
+  mutation-verified.
+- **BOTH documented-RED e2e scenarios GREEN** (1f97b664 + 87a75a28): the
+  overflow UNION-VERIFY root causes — (1) the until-predicate
+  `cRuns[last].status === 'completed'` is PERMANENTLY FALSY on a live chain
+  (the conductor POSTs its next self-tick dispatch BEFORE exiting, so the
+  newest ledger entry is always queued/pending); (2) the ghapi stand-in's runs
+  route passed the URL's workflow FILE id (`worker.yml`) to a provider keyed
+  by the bare NAME (`worker`) — every runs page empty forever, masked by the
+  fail-open design; (3) the fixture backdated only `issued_at` (an impossible
+  lease — expires is always issued+lease). The budget-pause scenario's first
+  full run: the seed's `lease_minutes: 2` = the s22/B-1 trap value (floor 3)
+  and the alert filter re-pointed from the generic `[fsm-alert]` body to the
+  BUDGET alert's distinctive `Lane budget exhausted` token. All drill-side,
+  zero production changes; 3-seed stable; 577/577.
+
+**THE STRESS BATTERIES — ALL SIX COMPLETE (a6 §6.1 fully landed):**
+- **soak30d 22/22** (d1431c4a + d0287442) — **THE HEADLINE: current windows
+  (pinger 300min, deadman 300min, imported from lib/pinger-watch.mjs) ⇒ ZERO
+  false alarms over 30 virtual days at the MEASURED [120,247]min cadence; the
+  OLD windows (45/180min) ⇒ N=1223 (pinger 1079 + deadman 144)** — the
+  A-1/R2-1 before/after number the audits demanded. State bytes 16.5-17.2KB
+  over the span (PRUNE + rotateAt=500/keepGens=4 honored), zero false latches
+  (the sabotage-window TRUE latch fires AND releases), the deadman throttle
+  mechanics pinned, the dead-pinger true-alarm control caught same-day.
+- **journal-flood full-mode 24/24** — the cycles calibration (98→105: the
+  ≥20-rotation boundary undershot at 19; per-cycle records run ~99) + **lane C
+  re-pointed at the PRODUCTION template** (sourced live from
+  watchdog/scan.mjs — the s23/latch fix's battery-level regression coverage,
+  the OLD shape kept as the BEFORE record).
+- **chaos quick 13/13** (cfa225d1, battery 6/6) — the KillScheduler
+  (seed-pure 5-boundary schedule: worker-pre-report, conductor-post-commit,
+  worker-report-push, worker-post-taskbranch, conductor-mid-PR), the full
+  mode's 18-task / 50-seeded-kill shape with firedFloor ≥24 and all five
+  boundaries exercised: **zero lost reports, zero double-applied reports,
+  every task exactly-one-terminal, every wedge recovered via lease-reap**
+  (assigned-but-never-dispatched attempts later TIMEOUT-reaped), every done
+  declared-artifacts task PR-stamped in the journal (the B5 reuse-lane
+  recovery). The build's own lessons: the emission ledger = the
+  QUEUE-LANDING COMMITS not run logs (SIGKILL loses buffered stdout); the
+  range-read for buried commits; numeric run-id coercion; per-ATTEMPT terminal
+  invariants when retries are designed.
+
+**THE CC FREE-MODEL TAIL (the W1 candidate improvement, built + merged):**
+the cctail design (research/s23-cc-tail.md @ 54073ff5 — 45 live relay probes,
+$0 spend) adjudicated the attach point: **the tail is ALREADY in the chain —
+the defect is the KEY-JUMP's no-next-key fallback burning the final slot on
+the dead key's paid sibling.** B1-B10 landed (baab4a7 + efa60cbd + 56c16abd):
+the free-tail rule in ccNextLaneIndex (the LAST key's key-class failure scans
+forward in the same key block for the first `:free` lane, skipping the
+credit-dead paid siblings), `CC_TAIL_MODEL` (default nemotron:free, the
+`:free` hard rule with LOUD validation, the escape hatch restores the
+pre-s23 ladder byte-identically), `lane_class:'free-tail'` telemetry + the
+console `lane tail:` line, **the FREE-TAIL RIDING alert (N=3/X=15min,
+ALERT-ONLY — the tail SERVES work at $0; parking would convert
+degraded-but-alive into stopped)** through the fsm-watchdog-alert lane, and
+**the real-lane dead-slug removal** (deepseek-v4-flash-0731:free is
+404-DEAD upstream on every key class; cohere/north-mini-code:free promoted
+to slot 2 — the probe's 6/6 reliability pick). 603/603 + conformance 31/31 +
+M1/M3 mutations bite (6 / 2 pins).
