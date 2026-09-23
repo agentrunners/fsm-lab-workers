@@ -466,7 +466,16 @@ async function main() {
   // fsm-tick lands, last_tick advances past the re-prime runs and the latch
   // condition is false on the next scan — re-priming resumes automatically.
   if (decision.latched) {
-    const body = `**[fsm-watchdog LATCHED]** ${LATCH_REPRIMES} consecutive re-primes with NO chain progress (seq frozen at ${state.chain.seq}, last_tick ${state.chain.last_tick}) — re-priming is DISABLED until a tick lands.\n\n`
+    // s23/LATCHED-body fix (the battery-4 finding): the marker body must
+    // carry the dedup filter's class token '[fsm-watchdog]' — the old
+    // '**[fsm-watchdog LATCHED]**' did NOT contain it as a substring, so
+    // alertDedup (lib/watchdog-core.mjs) never matched the latch's own
+    // comments: every re-prime refresh posted a NEW alert comment (~12/day
+    // sustained-latch) instead of the 24h dedup the F-D contract promises.
+    // tests/test-watchdog-core.mjs's fixture bodies already carried the
+    // correct shape ('**[fsm-watchdog]** LATCHED — marker') — the production
+    // string was the deviation. LATCHED rides as a suffix, class-first.
+    const body = `**[fsm-watchdog]** LATCHED — ${LATCH_REPRIMES} consecutive re-primes with NO chain progress (seq frozen at ${state.chain.seq}, last_tick ${state.chain.last_tick}) — re-priming is DISABLED until a tick lands.\n\n`
       + `Re-arm (the T43 breaker contract): fix the root cause, then dispatch ONE manual tick:\n`
       + `POST /repos/${REPO}/dispatches {"event_type":"fsm-tick","client_payload":{"reason":"manual"}}\n\n`
       + `If that tick lands, the latch releases automatically on the next scan.\n\n`
