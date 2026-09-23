@@ -338,6 +338,14 @@ function accumulateLaneStats(recs) {
   const keys = {};      // key_index -> turns served (the window's spread)
   let poolSize = null;  // the max pool_size seen (the pick's modulo base)
   const hops = [];      // hop_telemetry rows, journal order
+  // s23/B8: the FREE-TAIL derivation — a record whose lane_stats.models
+  // carries a `:free` slug with ok>0 was SERVED by the tail (the answering
+  // lane was free: BOTH paid keys were dry at that turn). At most one lane
+  // family answers per turn, so free-ok ⟺ tail-served — the same
+  // slug derivation the drain's counter keys on (no schema change).
+  let tailTurns = 0;
+  const tailModels = {};
+  const tailKeys = {};
   for (const r of recs) {
     const s = r.lane_stats;
     calls += Number(s.calls) || 0;
@@ -363,8 +371,19 @@ function accumulateLaneStats(recs) {
     }
     for (const [m, mm] of Object.entries(s.models || {})) models[m] = (models[m] || 0) + (Number(mm.calls) || 0);
     for (const [k, v] of Object.entries(s.rate_classes || {})) classes[k] = (classes[k] || 0) + (Number(v) || 0);
+    // s23/B8: the tail tally — :free slug entries with ok>0 (the answering
+    // lane was the tail). Old-format records without a models map (or with
+    // the free lane never answering) contribute NOTHING — the guard family:
+    // the tail line degrades to absent, never renders a lie.
+    const freeServed = Object.entries(s.models || {})
+      .filter(([slug, mm]) => slug.endsWith(':free') && Number(mm?.ok) > 0);
+    if (freeServed.length) {
+      tailTurns += 1;
+      for (const [slug] of freeServed) tailModels[slug] = (tailModels[slug] || 0) + 1;
+      if (Number.isFinite(r.key_index)) tailKeys[r.key_index] = (tailKeys[r.key_index] || 0) + 1;
+    }
   }
-  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes, keys, poolSize, hops };
+  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes, keys, poolSize, hops, tailTurns, tailModels, tailKeys };
 }
 
 function renderLaneLines(acc, sourceLabel) {
@@ -409,6 +428,18 @@ function renderLaneLines(acc, sourceLabel) {
     lines.push(`- lane hops (last ${last.length}): ${rows}`);
   }
   if (top) lines.push(`- lane models: ${top}${cls ? ` · limits: ${cls}` : ''}`);
+  // s23/B8: the TAIL line — turns served by the chain's `:free` slot in the
+  // window (derived from lane_stats.models' `:free`-with-ok entries + the
+  // record's key_index). Riding the tail means BOTH paid keys were dry — a
+  // bridge posture, never a home: this is the operator-action line (top up
+  // or swap a key). Absent on old-format/free-never-served records (the
+  // established guard family — no line, never a crash, never a lie).
+  if (acc.tailTurns > 0) {
+    const slugs = Object.entries(acc.tailModels).sort((a, b) => b[1] - a[1])
+      .map(([m, n]) => `${m.split('/').pop()}:${n}`).join(' ');
+    const ks = Object.keys(acc.tailKeys).sort((a, b) => Number(a) - Number(b)).map(k => `k${k}`).join('+');
+    lines.push(`- lane tail: ${acc.tailTurns} turns on ${slugs}${ks ? ` (${ks})` : ''} — BOTH paid keys dry (operator: top up or swap a key)`);
+  }
   return lines;
 }
 

@@ -195,7 +195,7 @@ test('pool: dead-key rotation (the fold, lens-1 F2) — a 401/402 hop advances t
     responses: [jsonRes(401, {}), jsonRes(401, {})],
   });
   assert.equal(burned.raw.status, 'infra_failed');
-  assert.match(burned.raw.detail, /lane-exhausted\(2\/3 lanes, last lane-401\)/);
+  assert.match(burned.raw.detail, /lane-exhausted\(2\/2 lanes, last lane-401\)/);
   assert.equal(burned.raw.key_index, (fnv1a('pool-pin-T1') + 1) % 3, 'the rotated-onto slot is the reported one');
 });
 

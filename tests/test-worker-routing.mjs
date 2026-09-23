@@ -272,7 +272,7 @@ const okBody = (text) => ({ choices: [{ message: { content: text } }] });
 const models = (fetches) => fetches.map(([, init]) => JSON.parse(init.body).model);
 
 test('routing: real chain — D1: nemotron-3.5 leads, dots-studio/nemotron-3-ultra demoted OUT; the free defaults lead', () => {
-  assert.deepEqual(realModelChain({}), ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free', 'cohere/north-mini-code:free']);
+  assert.deepEqual(realModelChain({}), ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);  // s23: the 0731 dead slug removed (404 upstream); cohere promoted to slot 2
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: '' }), realModelChain({}), 'empty env model = absent');
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: ' x/y ' })[0], 'x/y', 'env model heads the chain (trimmed)');
   assert.ok(!JSON.stringify(realModelChain({})).includes('minimax'), 'the retired slug stays dead');
@@ -292,8 +292,8 @@ test('routing: real fallback — primary 429 → ONE hop → the fallback model 
   assert.equal(r.exitCode, 0);
   assert.equal(h.enqueued[0].outcome.status, 'done');
   assert.equal(h.enqueued[0].outcome.artifact, 'the fallback answer');
-  assert.deepEqual(models(h.fetches), ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free'], 'exactly one hop');
-  assert.deepEqual(h.enqueued[0].outcome.models, ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free']);
+  assert.deepEqual(models(h.fetches), ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free'], 'exactly one hop');
+  assert.deepEqual(h.enqueued[0].outcome.models, ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);
   assert.equal(h.enqueued[0].outcome.telemetry.lane_attempts_used, 2);
 });
 
@@ -319,7 +319,7 @@ test('routing: real all-lanes-dead — infra_failed \'lane-exhausted\' after the
   const r = await h.turn();
   assert.equal(r.exitCode, 0);
   assert.equal(h.enqueued[0].outcome.status, 'infra_failed');
-  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(2\/3 lanes, last lane-429\)/);
+  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(2\/2 lanes, last lane-429\)/);
   assert.equal(models(h.fetches).length, 2);
 });
 
@@ -331,7 +331,7 @@ test('routing: real lane_attempts=1 — NO hop (the lane budget bounds the chain
   });
   await h.turn();
   assert.equal(models(h.fetches).length, 1, 'lane_attempts 1 = the primary only');
-  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(1\/3 lanes, last lane-429\)/);
+  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(1\/2 lanes, last lane-429\)/);
 });
 
 test('routing: real transport throw on the primary → infra hop → done', async () => {
@@ -408,7 +408,7 @@ test('routing: real hop_telemetry — per-hop {model, ms, status} on the two-hop
       : jsonRes(200, okBody('telemetry after the hop')),
   });
   assert.equal(raw.content, 'telemetry after the hop');
-  assert.deepEqual(raw.models, ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4-flash-0731:free']);
+  assert.deepEqual(raw.models, ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);
   assert.ok(Array.isArray(raw.hop_telemetry), 'the optional per-hop field rides the raw lane return');
   assert.equal(raw.hop_telemetry.length, 2, 'one entry per attempted hop');
   const [hop1, hop2] = raw.hop_telemetry;
@@ -416,7 +416,7 @@ test('routing: real hop_telemetry — per-hop {model, ms, status} on the two-hop
   assert.equal(hop1.model, 'nvidia/nemotron-3.5-lightning:free');
   assert.equal(hop1.status, 429, 'the first hop carries the lane answer that triggered the hop');
   assert.ok(Number.isFinite(hop1.ms) && hop1.ms >= 0, 'the hop wall is a finite ms');
-  assert.equal(hop2.model, 'deepseek/deepseek-v4-flash-0731:free');
+  assert.equal(hop2.model, 'cohere/north-mini-code:free');
   assert.equal(hop2.status, 200);
   assert.ok(Number.isFinite(hop2.ms) && hop2.ms >= 0);
 });
@@ -612,15 +612,21 @@ test('routing: W2 payload with mode=cc — the envelope budget bounds the lane c
   assert.equal(rep.outcome.status, 'infra_failed', 'every lane answered 429-text-as-answer → infra hop, hop, exhausted');
   assert.equal(rep.outcome.telemetry.lane_attempts_used, 3, 'W2 mints lane_attempts:3 — exactly three fake spawns');
   assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
-  // s21/W1: the E11 429 conviction is KEY-CLASS — attempt 1 (key-1 deepseek)
-  // JUMPS to key 2's first lane; attempts 2-3 burn key-2 lanes (no next key
-  // to jump to → ordinary model advance). Both keys rate-limited = the
-  // honest exhaustion shape; the budget still bounds the spawns exactly.
+  // s23/B5 — THE BEHAVIORAL PIN (the mutation spot): s21/W1's key-jump puts
+  // attempt 2 on key-2 deepseek; attempt 3 — the LAST key's key-class
+  // failure — now lands on the FREE TAIL (k2/nemotron:free), NOT the paid
+  // glm sibling (was [k1/ds, k2/ds, k2/glm] pre-s23: the glm slot burned on
+  // a model that shares the dead key's credit state while the :free slot
+  // sat one index away). The tail ALSO 429s here (the plain marker fires on
+  // every lane — the honest both-keys-quota-dead shape) → the exhaustion
+  // message is UNCHANGED: lane-exhausted(3/6) — the tail is a bridge, not
+  // an immunity.
   assert.deepEqual(rep.outcome.telemetry.lanes?.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
     [2, 'deepseek/deepseek-v4.1-flash'],
-    [2, 'z-ai/glm-5.3-flash'],
-  ], 'key-jump after the key-1 429, then key-2 model advance — three spawns, two keys served');
+    [2, 'nvidia/nemotron-3.5-lightning:free'],
+  ], 'key-jump after the key-1 429, then the FREE TAIL — three spawns, two keys served, the third slot is the :free lane');
+  assert.equal(rep.outcome.telemetry.lanes[2].lane_class, 'free-tail', 'B3: the tail marker rides the laneLog row');
 });
 
 test('routing: W2 payload with mode=real — the envelope budget bounds the lane chain (lane_attempts rides the dispatch)', async () => {
@@ -633,5 +639,5 @@ test('routing: W2 payload with mode=real — the envelope budget bounds the lane
   // W2 mints lane_attempts:3 → the chain tries primary + ONE fallback hop
   assert.equal(models(h.fetches).length, 2);
   assert.equal(h.enqueued[0].outcome.status, 'infra_failed');
-  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(2\/3 lanes, last lane-429\)/);
+  assert.match(h.enqueued[0].outcome.error, /lane-exhausted\(2\/2 lanes, last lane-429\)/);
 });

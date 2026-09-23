@@ -23,7 +23,7 @@ import assert from 'node:assert/strict';
 import { genesis, apply, rebuild, invariants } from '../lib/fsm.mjs';
 import {
   conductorTick, isQuotaDetail, specToTask, specLeaseMinutes, DISPATCH_COST_MS, dispatchBudgetFromWall,
-  dispatchVerificationEvents, VERIFY_WINDOW_MS,
+  dispatchVerificationEvents, VERIFY_WINDOW_MS, tailServedFromOutcome, TAIL_ALERT_TURNS, TAIL_ALERT_WINDOW_MS,
 } from '../lib/conductor-core.mjs';
 import { fastProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 
@@ -848,4 +848,208 @@ test('s23/X27 pin 3: the negative control — the SAME quota-shaped report for a
   assert.ok(alert, 'the F-6 count-trigger still fires (the contract unchanged)');
   assert.deepEqual(new Set(alert.tasks), new Set(ids), 'the distinct task list is the KNOWN cohort');
   assert.deepEqual(invariants(out.state), []);
+});
+
+// ---------------------------------------------------------------------------
+// s23/B9 — the FREE-TAIL RIDING counter + the ALERT-ONLY trigger (the
+// design §2.6: N=3 turns / X=15min, whichever first; the slug derivation —
+// a REPORT whose lane_stats.models carries a `:free` slug with ok>0 was
+// SERVED by the tail; a paid-ok report resets the counter).
+// ---------------------------------------------------------------------------
+
+// the LIVE W1→tail arc's report shape: k1ds(402)→JUMP→k2ds(402)→TAIL→
+// k2nem:free(200)→done — the bridge JSONL aggregate the adapter attaches
+// (calls 3, ok 1: the two paid 402s + the free 200; the free lane ANSWERED).
+const TAIL_MODELS = {
+  'deepseek/deepseek-v4.1-flash': { calls: 2, ok: 0, err429: 0, err5xx: 2, tokens: 0, cost: 0, p50_ms: null, p95_ms: null },
+  'nvidia/nemotron-3.5-lightning:free': { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0, p50_ms: 100, p95_ms: 100 },
+};
+const PAID_MODELS = {
+  'deepseek/deepseek-v4.1-flash': { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 12, cost: 0.003, p50_ms: 90, p95_ms: 90 },
+};
+const tailReport = (state, id, n, models = TAIL_MODELS) => ({
+  kind: 'REPORT', event_id: `rep-tail${n}-${id}`, task: id,
+  lease: state.tasks[id].lease.token,
+  outcome: {
+    status: 'done',
+    lane_stats: { calls: 3, ok: 1, err429: 0, err5xx: 2, tokens: 10, cost: 0, p50_ms: 100, p95_ms: 200, models, rate_classes: {} },
+  },
+  run_id: `run-tail-${n}`,
+});
+
+test('s23/B9 pure: tailServedFromOutcome — the slug derivation (free-ok ⟺ tail-served; paid-ok ⟺ a key recovered)', () => {
+  // the live W1→tail shape: the free lane ANSWERED (ok>0) → tail-served,
+  // NOT paid-served (at most one lane family answers per turn)
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { models: TAIL_MODELS } }), { tail: true, paid: false });
+  // a healthy paid turn: deepseek ok → paid-served, no tail
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { models: PAID_MODELS } }), { tail: false, paid: true });
+  // the free lane TRIED but never answered (ok:0 — a 500-taxed tail that
+  // never got a 2xx): NOT tail-served (the turn was not SERVED by the tail)
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { models: { 'nvidia/nemotron-3.5-lightning:free': { calls: 2, ok: 0, err5xx: 2 } } } }), { tail: false, paid: false });
+  // mock/real-lane reports (no lane_stats / no models map) → inert
+  assert.deepEqual(tailServedFromOutcome({ status: 'done' }), { tail: false, paid: false });
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { calls: 1 } }), { tail: false, paid: false });
+  assert.deepEqual(tailServedFromOutcome(null), { tail: false, paid: false });
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { models: [] } }), { tail: false, paid: false });
+  // a paid model whose slug merely CONTAINS 'free' mid-name is NOT :free
+  assert.deepEqual(tailServedFromOutcome({ lane_stats: { models: { 'vendor/freedom-paid': { calls: 1, ok: 1 } } } }), { tail: false, paid: true });
+});
+
+test('s23/B9 (N trigger): 3 tail-served reports → stats.tail_turns=3 + TAIL_RIDING_ALERT (trigger:turns) — ALERT-ONLY, no pause, no budget alert', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned tasks');
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s),
+    queue: ids.map((id, i) => tailReport(s, id, i)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('t3'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  // the counter + the stamp
+  assert.equal(out.state.stats.tail_turns, 3, 'three tail-served turns counted');
+  assert.ok(typeof out.state.stats.tail_since === 'string' && Date.parse(out.state.stats.tail_since) > 0,
+    'tail_since armed on the FIRST tail turn of the episode');
+  // the action: ALERT-ONLY
+  const alert = out.actions.find(a => a.type === 'TAIL_RIDING_ALERT');
+  assert.ok(alert, 'the TAIL_RIDING_ALERT action fired at N=3');
+  assert.equal(alert.trigger, 'turns');
+  assert.equal(alert.tail_turns, 3);
+  assert.equal(alert.tail_since, out.state.stats.tail_since);
+  assert.equal(alert.window_min, 15, 'X rides the action for the body');
+  // ALERT-ONLY: the chain NEVER pauses; the F-6 window never armed (a done
+  // report is not quota-shaped infra — the tail is not a pause cause)
+  assert.equal(out.state.chain.paused, false, 'ALERT-ONLY — the tail is serving work, parking the epoch would stop a degraded-but-alive fleet');
+  assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'no budget-pause crossfire');
+  assert.deepEqual(out.state.budget_window, [], 'the F-6 window stays empty');
+  assert.deepEqual(invariants(out.state), []);
+});
+
+test('s23/B9 (the N boundary): 2 tail turns inside the window → NO alert yet (1-2 turns = a transient drain edge, not a posture)', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 2).map(t => t.id);
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s),
+    queue: ids.map((id, i) => tailReport(s, id, i)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('t2'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.stats.tail_turns, 2, 'the counter counts them');
+  assert.ok(!out.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), 'below N=3 and inside X=15min → quiet');
+  assert.deepEqual(invariants(out.state), []);
+});
+
+test('s23/B9 (X trigger): 2 tail turns then 16min of continuous riding → TAIL_RIDING_ALERT (trigger:duration) — whichever fires FIRST', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 2).map(t => t.id);
+  const n1 = makeNow(T0 + 60_000);
+  const first = conductorTick({
+    cur: structuredClone(s),
+    queue: ids.map((id, i) => tailReport(s, id, i)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('x1'), now: n1.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(!first.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), '2 turns, fresh stamp → quiet');
+  // 16 minutes later (an empty-queue tick — the counter is PERSISTED window
+  // state, the posture is "still riding"): the DURATION arm fires
+  const n2 = makeNow(T0 + 60_000 + 16 * 60_000);
+  const second = conductorTick({
+    cur: structuredClone(first.state), queue: [],
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('x2'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  const alert = second.actions.find(a => a.type === 'TAIL_RIDING_ALERT');
+  assert.ok(alert, 'the duration arm fired at X=15min of continuous riding');
+  assert.equal(alert.trigger, 'duration');
+  assert.equal(alert.tail_turns, 2, 'below N — the duration arm alone crossed');
+  assert.equal(second.state.chain.paused, false, 'still ALERT-ONLY');
+  assert.deepEqual(invariants(second.state), []);
+  // the boundary's other side: 14min → quiet (the window is 15)
+  const n3 = makeNow(T0 + 60_000 + 14 * 60_000);
+  const third = conductorTick({
+    cur: structuredClone(first.state), queue: [],
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('x3'), now: n3.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.ok(!third.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), '14min of riding → still a bridge, not an alert');
+});
+
+test('s23/B9 (the reset): a paid-served report lands → the counter + stamp RESET (a key recovered — the alert re-arms fresh on the next episode)', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  const n1 = makeNow(T0 + 60_000);
+  const first = conductorTick({
+    cur: structuredClone(s),
+    queue: ids.map((id, i) => tailReport(s, id, i)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('r1'), now: n1.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(first.state.stats.tail_turns, 3);
+  assert.ok(first.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), 'the episode armed');
+  // a paid-served turn (key 2 topped up / quota reset): the counter zeroes
+  // (a STILL-ASSIGNED task — the first tick's three reported tasks are done,
+  // their leases released; the clock kept a fourth lease live)
+  const paidTask = Object.values(first.state.tasks).find(t => t.status === 'assigned');
+  assert.ok(paidTask, 'fixture: a lease-live task survived the first tick');
+  const n2 = makeNow(T0 + 60_000 + 5 * 60_000);
+  const second = conductorTick({
+    cur: structuredClone(first.state),
+    queue: [tailReport(first.state, paidTask.id, 'paid', PAID_MODELS)],
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('r2'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(second.state.stats.tail_turns, 0, 'RESET — a paid-served report means a key recovered');
+  assert.equal(second.state.stats.tail_since, null, 'the stamp cleared too');
+  assert.ok(!second.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), 'no alert on the reset tick');
+  // and the next single tail turn starts a FRESH episode (armed stamp, no
+  // carry-over count — 1 turn is quiet again)
+  const freshTask = Object.values(second.state.tasks).find(t => t.status === 'assigned');
+  assert.ok(freshTask, 'fixture: a lease-live task for the fresh episode');
+  const n3 = makeNow(T0 + 60_000 + 8 * 60_000);
+  const third = conductorTick({
+    cur: structuredClone(second.state),
+    queue: [tailReport(second.state, freshTask.id, 'fresh')],
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('r3'), now: n3.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(third.state.stats.tail_turns, 1, 'the fresh episode counts from 1');
+  assert.ok(!third.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), '1 turn → quiet (no carry-over from the dead episode)');
+  assert.deepEqual(invariants(third.state), []);
+});
+
+test('s23/B9 (the X27 discipline): a tail-shaped REJECTED report (unknown task) never touches the counter; a PAUSED chain counts but never alerts', () => {
+  // the ghost half: the dead epoch's straggler traffic carrying tail-shaped
+  // lane_stats lands REJECTED — the counter stays 0 (the same wasRejected
+  // guard the budget window and the backstop share)
+  const s = assignedState({ max_parallel: 4 });
+  const ghost = {
+    kind: 'REPORT', event_id: 'rep-tail-ghost', task: 'GHOST-TAIL', lease: 'lease-ghost',
+    outcome: { status: 'done', lane_stats: { calls: 1, ok: 1, models: TAIL_MODELS, rate_classes: {} } },
+    run_id: 'run-ghost',
+  };
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: [ghost],
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('g1'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.stats.rejected_events >= 1, true, 'the ghost report was REJECTED (unknown-task)');
+  assert.equal(Number(out.state.stats.tail_turns) || 0, 0, 'the counter never moved');
+  assert.equal(out.state.stats.tail_since, undefined, 'never armed');
+  // the paused half: the drain still counts (reports are not pause-gated)
+  // but the trigger stays quiet (the F-9 quiesced-noop contract)
+  const paused = structuredClone(out.state);
+  paused.chain.paused = true;
+  paused.chain.paused_reason = 'test';
+  const ids = Object.values(paused.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  const out2 = conductorTick({
+    cur: paused,
+    queue: ids.map((id, i) => tailReport(paused, id, `p${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('g2'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out2.state.stats.tail_turns, 3, 'the drain counted the tail turns (reports are not pause-gated)');
+  assert.ok(!out2.actions.some(a => a.type === 'TAIL_RIDING_ALERT'), 'a PAUSED chain never re-triggers (quiesced-noop)');
+  assert.deepEqual(invariants(out2.state), []);
 });
