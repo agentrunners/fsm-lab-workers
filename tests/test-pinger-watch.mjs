@@ -543,6 +543,15 @@ test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) 
   // one minute inside is fresh
   const fresh = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:36:00.000Z' }, nowMs: NOW });
   assert.equal(fresh.verdict, 'fresh', 'age 299 < window -> fresh');
+  // s22/R2-1 before/after: the fixture's 3h-old marker (06:35 -> 09:35) read
+  // STALE under the old 180min window (nominal-cadence arithmetic — the A-1
+  // mistake repeated on the deadman); at the measured sparsity band a 3h
+  // marker gap is HEALTHY, and the recalibrated window must read it fresh.
+  // The old window's alarm is pinned via the override (soak30d's battery
+  // prints the 30-day counterfactual count).
+  const three = watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW });
+  assert.equal(three.verdict, 'fresh', 'a 3h-old marker is FRESH at the recalibrated 300min window (R2-1: the measured band runs multi-hour gaps)');
+  assert.equal(watchdogDeadmanVerdict({ journalNote: newestWatchdogJournalNote(DEADMAN_FIXTURE), nowMs: NOW, staleAfterMin: 180 }).verdict, 'stale', 'the OLD 180min window would have false-alarmed on it (the R2-1 counterfactual)');
   // NO markers at all -> stale (the watchdog is expected to run)
   const none = watchdogDeadmanVerdict({ nowMs: NOW });
   assert.equal(none.verdict, 'stale');
@@ -565,7 +574,7 @@ test('s21/A-3 deadman: the verdict — a stalled watchdog (no marker > N hours) 
 test('s21/A-3 deadman: the alert note — watchdogDeadmanComment (the stalled-watchdog alarm body)', () => {
   // THE brief's pin: a stalled watchdog yields the alert note
   const NOW = Date.parse('2026-09-21T09:35:00.000Z');
-  const v = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:35:00.000Z' }, nowMs: NOW });
+  const v = watchdogDeadmanVerdict({ journalNote: { ts: '2026-09-21T04:35:00.000Z' }, nowMs: NOW });   // 300min old — the R2-1 boundary
   assert.equal(v.verdict, 'stale');
   const c = watchdogDeadmanComment({ repo: 'claudecode-headless/fsm-lab', staleAfterMin: 300, note: v.note, ageMin: v.ageMin });
   // the dedup marker prefix — DISTINCT from the pinger-watch marker (the two
@@ -603,4 +612,23 @@ test('s21/A-3 deadman: watchdogStaleAfterMin(env) — the WATCHDOG_STALE_AFTER_M
   const note = { ts: '2026-09-21T06:35:00.000Z' };   // 60min old
   assert.equal(watchdogDeadmanVerdict({ journalNote: note, nowMs: NOW, staleAfterMin: watchdogStaleAfterMin({ WATCHDOG_STALE_AFTER_MIN: '30' }) }).verdict, 'stale', 'a 30min override alarms on a 60min-old marker');
   assert.equal(watchdogDeadmanVerdict({ journalNote: note, nowMs: NOW, staleAfterMin: watchdogStaleAfterMin({}) }).verdict, 'fresh', 'the default wiring stays fresh');
+});
+
+test('s22/R2-1: both watcher windows sit at the SAME calibrated 300min — the measured-band headroom rule, pinned', () => {
+  // The calibration invariant: PINGER_STALE_AFTER_MIN and
+  // WATCHDOG_STALE_AFTER_MIN are BOTH 300min (A-1 + R2-1) — each window
+  // sits above the same live-measured sparsity band (2h00m–4h07m marker
+  // gaps on this repo's cron class) with ~1h headroom, and both OLD
+  // windows (45min pinger / 180min deadman) were nominal-cadence
+  // arithmetic that false-alarmed on the measured band. The soak30d
+  // battery pins the before/after COUNTS over 30 virtual days; this pin
+  // guards the constants themselves (a future recalibration of one window
+  // without the other is exactly the drift R2 flagged).
+  assert.equal(PINGER_STALE_AFTER_MIN, 300);
+  assert.equal(WATCHDOG_STALE_AFTER_MIN, 300);
+  assert.equal(PINGER_STALE_AFTER_MIN, WATCHDOG_STALE_AFTER_MIN, 'the two watchers share the measured-band headroom rule');
+  // the OLD windows, characterized as the counterfactual pair (a regression
+  // to either is caught by the soak30d battery's false-alarm count)
+  assert.ok(PINGER_STALE_AFTER_MIN > 45, 'the pinger window left the 45min nominal-cadence trap behind (A-1)');
+  assert.ok(WATCHDOG_STALE_AFTER_MIN > 180, 'the deadman window left the 180min nominal-cadence trap behind (R2-1)');
 });
