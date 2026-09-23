@@ -25,6 +25,24 @@ import { pathToFileURL } from 'node:url';
 import { emitOutput, envInt } from './lib.mjs';
 
 const POLL_S = envInt('MONITOR_POLL_S', 60);
+// s23 (attempt 3's live catch — the resting-shape race): the seed's
+// door+rollover latency (~15s live) can trail the monitor's first poll; a
+// halted+done read in the opening seconds is the PREDECESSOR'S resting
+// shape, not tonight's completion (attempt 3: poll at seed+1s saw the
+// halted drill-epoch-#1, the boundary landed at seed+4s, the monitor
+// declared DONE on an epoch that was seconds old). The birth-wait: ignore
+// the halt-exit until the wait elapses; a legitimate epoch cannot reach
+// halt inside it (the fastest mock task needs ~30s+ of worker+drain).
+const BIRTH_WAIT_MS = Math.max(POLL_S * 2, 120) * 1000;
+
+// s23: the pure birth-wait predicate (exported for the unit pins). A
+// halted+done read is only an admissible EXIT once the birth-wait has
+// elapsed — inside the wait the read is presumed the predecessor's
+// resting shape (the seed's door+rollover latency can trail the first
+// poll).
+export function haltExitAllowed(elapsedMs, birthWaitMs = BIRTH_WAIT_MS) {
+  return Number.isFinite(elapsedMs) && elapsedMs >= birthWaitMs;
+}
 const TIMEOUT_MIN = envInt('MONITOR_TIMEOUT_MIN', 55);
 
 async function main() {
@@ -78,6 +96,12 @@ async function main() {
       // a degraded halt also lands here (phase is still 'done'); the
       // quality-gate verdict is verify's A3, not the monitor's.
       if (s.chain.halted === true && s.project?.phase === 'done') {
+        if (!haltExitAllowed(Date.now() - t0)) {
+          if (!seen.birthWait) {
+            seen.birthWait = true;
+            console.log(`MONITOR-BIRTH-WAIT ${Math.round(BIRTH_WAIT_MS / 1000)}s — halted+done observed ${Math.round((Date.now() - t0) / 1000)}s in; the door+rollover latency band is ~15s, this may be the PREDECESSOR'S resting shape (the halt-exit is held until the wait elapses)`);
+          }
+        } else {
         if (!seen.halt) {
           seen.halt = true;
           console.log(`CHECKPOINT HALT-AND-DONE seq=${s.chain.seq} done=${done} quarantined=${quarantined} cancelled=${Number(s.stats?.cancelled) || 0} degraded-shape=${done * 2 < tasks.length ? 'yes (expected on hang-only stage-0 nights)' : 'no'}`);
@@ -87,6 +111,7 @@ async function main() {
         emitOutput('halted', 'true');
         emitOutput('wallMin', String(wallMin));
         return;
+      }
       }
 
       console.log(`MONITOR seq=${s.chain.seq} phase=${s.project?.phase ?? '?'} halted=${s.chain.halted} tasks=${tasks.length} active=${active.length} done=${done} quarantined=${quarantined} epoch=${ours ? 'ours' : (s.project?.issue ?? '?')}`);
