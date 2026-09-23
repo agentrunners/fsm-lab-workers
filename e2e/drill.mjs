@@ -680,6 +680,13 @@ async function runOverflow() {
     t.ok(!!aRun && aRun.repo === 'local/fsm-lab', "OV-A's run lives on the main lane");
     // the bucket-2 worker reported to the MAIN fsm-state (the TARGET_REPO geometry)
     t.ok((await readState()).state?.tasks?.['OV-A']?.status === 'done', 'the report routed to the MAIN fsm-state (mkTwoRepos geometry)');
+    // (s23 assert-tune — the seed-23 flake: a ONE-SHOT read of the hang
+    // worker's log races its dispatch latency + the stdout pipe delivery —
+    // OV-A's done-resolve can beat OV-B's START line by a few hundred ms
+    // (seeded ±20% latency jitter), and the empty log failed the assert on
+    // working machinery. Poll the run's OWN log for the start line — the
+    // s22 PREFLIGHT phase's pattern — then assert.)
+    await until(() => /WORKER-START task=OV-B behavior=hang/.test(sched.runLogText(bRun.id)), { timeoutMs: 30_000, label: "OV-B's hang-worker start line (WORKER-START task=OV-B behavior=hang)" });
     const wlogB = sched.runLogText(bRun.id);
     t.ok(/WORKER-START/.test(wlogB) && /behavior=hang/.test(wlogB), 'OV-B ran the hang behavior (silent — the lease deadline is the handler)');
   });
