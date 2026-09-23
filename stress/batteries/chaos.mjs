@@ -28,17 +28,24 @@
 //
 // Asserts the invariants that matter (NOT the interleavings):
 //   * every task reaches EXACTLY ONE terminal state (final status terminal +
-//     exactly one applied terminal-arrival journal record, one distinct `to`);
+//     exactly one applied terminal-arrival journal record, one distinct `to`;
+//     the PR-stamp pointer records — kind REPORT, note 'pr-opened' — are NOT
+//     task-arrivals and are excluded);
 //   * ZERO lost reports and ZERO double-applied reports — the report ledger
 //     diff: every worker-confirmed emission is accounted (applied, or
 //     rejected-duplicate = a re-delivery absorbed, or rejected-orphan = a
 //     superseded attempt accounted); no event id applied twice; every applied
-//     report attributes to a real dispatched worker run;
+//     report attributes to a dispatched worker run (the LOSS class — an
+//     orphan report from a run the runner never created; killed-before-report
+//     runs are the healthy complement);
 //   * the WEDGED shapes recover: every assigned-but-never-dispatched attempt
 //     (the killed-post-commit-pre-dispatch class) is later lease-reaped (a
 //     TIMEOUT record after the wedge) — no lease lives forever;
 //   * the final halt is reachable (chain.halted, phase done, queue drained)
-//     inside the wall budget.
+//     inside the wall budget;
+//   * every done declared-artifacts task is PR-stamped IN THE JOURNAL — the
+//     B5 reuse-lane recovery (the live state's pr pointer is NOT the evidence:
+//     the W-C1 §5b compaction prunes it 20 ticks past terminal).
 //
 // Process-level so not byte-deterministic, but SEED-REPRODUCIBLE: the kill
 // schedule (the (boundary, skip, delay) list below) is a pure function of the
@@ -98,6 +105,33 @@
 //
 // quick = 12 tasks / 12 seeded kills; full = 18 tasks / 50 seeded kills (the
 // registry contract). Linux-only (/proc — stress/lib/kill-proc.mjs).
+//
+// ---------------------------------------------------------------------------
+// s23-chaos2 RECOVERY NOTES (the deltas that made it green):
+//   * DUD RE-ARMING: a kill whose victim exits before the delayed SIGKILL (or
+//     whose immediate victim is already gone) is RE-QUEUED at the boundary's
+//     head and retries on the next matching event — the SCHEDULE is the
+//     contract (seed-pure), duds are schedule-waste that moves to the next
+//     candidate. Terminal duds = event-supply exhaustion (more entries than
+//     the boundary's events: e.g. report-push entries beyond the dup tasks'
+//     pushes); the kill floor is calibrated to the honest supply and the
+//     coverage requirement is EVERY BOUNDARY FIRED.
+//   * B3 arms on dup-task pushes when the cohort has dup tasks (the 1500ms
+//     inter-enqueue gap is the kill class; a plain task's worker exits
+//     ~200-500ms after its push — a delayed kill there is a guaranteed dud).
+//   * THE PRUNED POINTER: prune_tasks_after_ticks=20 compacts terminal task
+//     records to {id,status,attempts,done_at,pruned} — the pr field drops BY
+//     DESIGN (live-proven: stamps e24/e80/e81 in the journal, pruned records
+//     in the final state). The settle gate and the PR asserts read the
+//     JOURNAL stamp records; !t.pr alone spun the settle loop forever
+//     ('settle budget exhausted' with every PR long since stamped).
+//   * THE REAL-CLOCK LEASE: lease_minutes=3 is the s22/B-1 production floor —
+//     NOT compressible (a virtual clock cannot reach the real child
+//     processes' Date.now, and a sub-floor lease is the work-destroying trap
+//     the floor exists to prevent). Every wedge therefore costs up to 180s
+//     of REAL wall (the lease's remaining lifetime); the wall is the honest
+//     price of process-level chaos: ~5-7min quick, ~12-18min full (the
+//     wall budgets are 10/25min).
 
 import { Store } from '../../lib/store.mjs';
 import { genesis, TERMINAL } from '../../lib/fsm.mjs';
@@ -224,7 +258,12 @@ class KillScheduler {
     this.eventCounts = new Map(BOUNDARIES.map((b) => [b, 0]));
     this.pending = [];          // delayed kills awaiting their dueMs
     this.kills = [];            // the fired records
-    this.duds = [];             // entries that never fired (epoch ended / victim gone)
+    this.duds = [];             // waste records: {rearmed:true} transient, 'epoch-ended' terminal
+    // B3's target preference: the dup-report tasks (the cohort's 1500ms
+    // inter-enqueue gap hosts the mid-gap kill class). null when the cohort
+    // has none (every push is then a legal arm target).
+    const dupIds = [...(byId?.values() || [])].filter((t) => String(t.title || '').includes('dup-report')).map((t) => t.id);
+    this.dupTaskIds = dupIds.length ? new Set(dupIds) : null;
     this.tip = null;
     this.tasksRefs = new Map();
     this.ledgerSeen = 0;
@@ -326,6 +365,12 @@ class KillScheduler {
 
   onEvent(boundary, info) {
     this.eventCounts.set(boundary, (this.eventCounts.get(boundary) || 0) + 1);
+    // B3 target preference: when the cohort HAS dup-report tasks, the
+    // report-push boundary's KILL CLASS is the dup task's 1500ms inter-enqueue
+    // gap (a plain task's worker exits ~200-500ms after its push — a delayed
+    // kill there is a guaranteed dud). The event still counts (honest tally);
+    // the entry only CONSUMES/arms on a push that can actually host the kill.
+    if (boundary === 'worker-report-push' && this.dupTaskIds && info.task && !this.dupTaskIds.has(info.task)) return;
     const q = this.queues.get(boundary);
     if (!q || !q.length) return;
     const since = this.sinceFire.get(boundary) + 1;
@@ -337,6 +382,19 @@ class KillScheduler {
     this.arm(head, boundary, info);
   }
 
+  // a dud is schedule-waste, not a dead entry: RE-ARM at the queue head so
+  // the NEXT matching event retries the kill (the design's "50 seeded kills
+  // across one epoch" — the SCHEDULE is the contract; a victim that exited
+  // before its delayed kill just moves the kill to the next candidate).
+  // rearm counts ride the entry for the honest waste tally; the entries still
+  // unfired at stop() flush as 'epoch-ended' duds.
+  rearm(entry, boundary, reason) {
+    entry.rearms = (entry.rearms || 0) + 1;
+    this.queues.get(boundary).unshift(entry);
+    this.sinceFire.set(boundary, 0);
+    this.duds.push({ entry, reason: `${reason} (re-armed x${entry.rearms})`, rearmed: true, boundary });
+  }
+
   arm(entry, boundary, info) {
     if (boundary === 'worker-pre-report' || boundary === 'worker-report-push') {
       this.pending.push({ entry, boundary, runId: info.runId, task: info.task, dueMs: Date.now() + entry.delayMs, ts: Date.now() });
@@ -345,13 +403,13 @@ class KillScheduler {
     // immediate boundaries: resolve the victim run now
     if (boundary === 'conductor-post-commit' || boundary === 'conductor-mid-pr') {
       const run = this.sched.runs.find((r) => r.workflow === 'conductor' && r.status === 'in_progress');
-      if (!run) { this.duds.push({ entry, reason: 'no-conductor-in-flight' }); return; }
+      if (!run) { this.rearm(entry, boundary, 'no-conductor-in-flight'); return; }
       this.execute({ entry, boundary, runId: run.id, task: null, ts: Date.now() });
       return;
     }
     if (boundary === 'worker-post-taskbranch') {
       const run = this.sched.runs.find((r) => r.workflow === 'worker' && r.status === 'in_progress' && r.taskRef === info.task);
-      if (!run) { this.duds.push({ entry, reason: 'no-worker-in-flight' }); return; }
+      if (!run) { this.rearm(entry, boundary, 'no-worker-in-flight'); return; }
       this.execute({ entry, boundary, runId: run.id, task: info.task, ts: Date.now() });
     }
   }
@@ -362,7 +420,7 @@ class KillScheduler {
       p.done = true;
       const run = this.sched.runById(p.runId);
       if (!run || run.status !== 'in_progress') {
-        this.duds.push({ entry: p.entry, reason: 'victim-exited', boundary: p.boundary });
+        this.rearm(p.entry, p.boundary, 'victim-exited');
         continue;
       }
       this.execute(p);
@@ -372,9 +430,6 @@ class KillScheduler {
 
   execute(p) {
     const procs = killRunTree({ runId: p.runId, taskId: p.task ?? null, cloneDir: null });
-    let cloneDir = null;
-    const r = this.sched.runById(p.runId);
-    if (r) cloneDir = `clone-${r.workflow}-`;   // marker only; the full tree kill below sweeps by run id + task
     this.seq += 1;
     const rec = {
       seq: this.seq, boundary: p.boundary, victimRunId: p.runId, victimTask: p.task ?? null,
@@ -383,7 +438,6 @@ class KillScheduler {
     };
     this.kills.push(rec);
     console.log(`  ⚡ [chaos] KILL #${rec.seq} ${p.boundary} run=${p.runId} task=${p.task ?? '-'} (${procs.length} group${procs.length === 1 ? '' : 's'}${p.entry.delayMs ? `, delayed ${p.entry.delayMs}ms` : ''})`);
-    void cloneDir;
   }
 }
 
@@ -509,14 +563,32 @@ export async function run({ quick, seed } = {}) {
       }
 
       // ---- SETTLE: halted — drain the queue, stamp the PRs -----------------
+      // pendPr reads the LIVE pointer: a task done + declared-artifacts +
+      // unpruned + pr-less still needs its stamp (the prFlow runs on every
+      // tick — quiesced ticks included — so a kick or two lands it). A PRUNED
+      // record ({id,status,attempts,done_at,pruned} — the W-C1 §5b compaction,
+      // prune_tasks_after_ticks=20) has dropped its pr field BY DESIGN: the
+      // durable PR evidence is the journal's stamp record + the API ledger,
+      // and the un-pruned !t.pr read that spun this loop forever on pruned
+      // records ('settle budget exhausted' with every PR long since stamped —
+      // the s23-chaos2 root cause, live-proven on the kept world: stamps
+      // e24/e80/e81 in the journal, pruned compact records in the final state).
       const lines = await queueLines();
-      const pendPr = st && Object.entries(st.tasks || {}).some(([id, t]) => t && t.status === 'done' && !t.pr && (byId.get(id)?.spec?.artifacts?.length));
+      const pendPr = st && Object.entries(st.tasks || {}).some(([id, t]) => t && t.status === 'done' && !t.pruned && !t.pr && (byId.get(id)?.spec?.artifacts?.length));
       if (lines.length === 0 && !pendPr && settleKicks >= 2) break;
       if (settleKicks >= 16) { budgetNote = 'settle budget exhausted (queue/PRs not settled)'; break; }
       settleKicks += 1;
       await kick();
       await sleep(2500);
       if (Date.now() - t0 > wallBudgetMs) { budgetNote = `wall budget exhausted during settle`; break; }
+    }
+    // post-settle drain: the last settle kick's conductor run may still be
+    // mid-flight (its stamp commit lands as it exits) — wait for the conductor
+    // queue to go idle (bounded: 20s) before the final reads.
+    for (let i = 0; i < 20; i++) {
+      const cInflight = sched.runs.some((r) => r.workflow === 'conductor' && ['queued', 'group-pending', 'repo-queued', 'in_progress'].includes(r.status));
+      if (!cInflight) break;
+      await sleep(1000);
     }
     await sleep(1200);   // let the last tick's run land its commits
     killer.stop();
@@ -717,11 +789,18 @@ export async function run({ quick, seed } = {}) {
       }
       slot.achieved[cls] = (slot.achieved[cls] || 0) + 1;
     }
-    for (const b of BOUNDARIES) killsByBoundary[b].duds = (killer.duds || []).filter((d) => d.entry.boundary === b).length;
+    for (const b of BOUNDARIES) {
+      const bd = (killer.duds || []).filter((d) => d.entry.boundary === b);
+      killsByBoundary[b].duds = bd.filter((d) => !d.rearmed).length;          // terminal (never fired)
+      killsByBoundary[b].rearmed = bd.filter((d) => d.rearmed).length;        // transient waste (fired later or flushed)
+    }
+    const terminalDuds = killer.duds.filter((d) => !d.rearmed);
+    const rearmedWaste = killer.duds.filter((d) => d.rearmed);
     rec.metric('killScheduleFingerprint', plan.fingerprint);
     rec.metric('killsScheduled', plan.entries.length);
     rec.metric('killsFired', killer.kills.length);
-    rec.metric('killsDud', killer.duds.length);
+    rec.metric('killsDud', terminalDuds.length);
+    rec.metric('killsRearmed', rearmedWaste.length);
     rec.metric('killsByBoundary', killsByBoundary);
     rec.metric('boundaryEvents', Object.fromEntries(killer.eventCounts));
     rec.metric('tasks', { total: taskIds.length, byStatus: Object.fromEntries([...finalStatus].map(([id, s]) => [id, s])) });
@@ -733,9 +812,22 @@ export async function run({ quick, seed } = {}) {
       finalQueueLines: finalQueue.length,
     });
     rec.metric('wedges', { assignedNeverDispatched: wedges.length, recoveredViaLeaseReap: wedgesRecovered.length });
+    // the PR evidence: OPENED from the API ledger (the POSTs), STAMPED from
+    // the JOURNAL stamp records (the durable pointer) ∪ the live pr fields —
+    // the W-C1 §5b compaction prunes the pr field out of the state 20 ticks
+    // past terminal, so the live-field read alone under-counts to zero on
+    // any epoch that ran >20 post-terminal ticks (the s23-chaos2 finding).
+    const stampByTask = new Map();    // task -> prn (journal stamp records)
+    for (const j of journal) {
+      if (isPrStamp(j) && j.task) stampByTask.set(j.task, j.pr);
+    }
+    const artifactsIds = taskIds.filter((id) => (byId.get(id)?.spec?.artifacts?.length || 0) > 0);
     rec.metric('prs', {
       opened: ghapi.ledger().filter((e) => e.method === 'POST' && /\/pulls$/.test(String(e.path)) && e.status === 201).length,
-      stamped: taskIds.filter((id) => finalState?.tasks?.[id]?.pr != null).length,
+      stamped: artifactsIds.filter((id) => stampByTask.has(id) || finalState?.tasks?.[id]?.pr != null).length,
+      stampedViaJournal: artifactsIds.filter((id) => stampByTask.has(id)).length,
+      livePointer: artifactsIds.filter((id) => finalState?.tasks?.[id]?.pr != null).length,
+      pruned: artifactsIds.filter((id) => finalState?.tasks?.[id]?.pruned).length,
     });
     rec.metric('totalRuns', totalRuns);
 
@@ -795,11 +887,30 @@ export async function run({ quick, seed } = {}) {
       budgetNote ? `budget note: ${budgetNote}; halted=${!!finalState?.chain?.halted}` : `halted at ${Math.round(wallMs / 1000)}s, ${conductorRuns} conductor runs, ${kicks} ticks`);
     rec.check('final report queue drained at halt', finalQueue.length === 0, `${finalQueue.length} lines remain`);
 
-    // 6. the kill floor + every boundary class exercised
-    const firedFloor = quick ? 10 : 40;
+    // 5b. the B5 recovery invariant: every done declared-artifacts task is
+    // PR-stamped IN THE JOURNAL (the durable pointer). A B5 kill lands between
+    // the PR-open POST and the stamp commit — the reuse lane must re-nominate
+    // (prFlowCandidates re-scans every tick, quiesced ticks included) and
+    // re-stamp via the reuse probe. The live state's pr field is NOT the
+    // evidence (the §5b compaction prunes it 20 ticks past terminal); the
+    // journal stamp record is. (A NON-done artifacts task — e.g. a
+    // chaos-quarantined one — expects NO PR: the work never completed.)
+    const doneArtifacts = artifactsIds.filter((id) => finalStatus.get(id) === 'done');
+    const unstamped = doneArtifacts.filter((id) => !stampByTask.has(id) && finalState?.tasks?.[id]?.pr == null);
+    rec.check('every done artifacts task is PR-stamped (journal stamp record — the B5 reuse-lane recovery)', unstamped.length === 0,
+      unstamped.length ? `unstamped: ${unstamped.join(', ')}` : `${doneArtifacts.length}/${doneArtifacts.length} stamped (${doneArtifacts.filter((id) => finalState?.tasks?.[id]?.pruned).length} pruned pointers — journal evidence)`);
+
+    // 6. the kill floor + every boundary class exercised. The SCHEDULE is the
+    // design contract (seed-pure, all entries seeded); FIRED is the coverage
+    // contract. A dud entry is schedule-waste, not a coverage hole — with
+    // re-arming, a terminal dud means the boundary's event SUPPLY ran out
+    // (e.g. more report-push entries than dup-task pushes exist), so the
+    // floor is calibrated to the honest quick/full supply, and the REAL
+    // coverage requirement is: every boundary class FIRED at least once.
+    const firedFloor = quick ? 10 : 32;
     const unexercised = BOUNDARIES.filter((b) => (killsByBoundary[b]?.fired || 0) === 0);
     rec.check(`kill floor (>=${firedFloor} fired) and all five boundaries exercised`, killer.kills.length >= firedFloor && unexercised.length === 0,
-      `${killer.kills.length}/${plan.entries.length} fired (${killer.duds.length} duds); unexercised: ${unexercised.join(', ') || 'none'}`);
+      `${killer.kills.length}/${plan.entries.length} fired (${terminalDuds.length} terminal duds = event-supply exhaustion, ${rearmedWaste.length} re-armed waste events); unexercised: ${unexercised.join(', ') || 'none'}`);
 
     // 7. seed purity — the schedule is a function of the seed (re-derived, compared)
     const recheck = killPlanFor(seed, quick);
