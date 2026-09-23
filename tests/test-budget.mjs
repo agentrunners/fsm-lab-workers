@@ -678,3 +678,112 @@ test('s22/B-1 commit 3: the capacity carry — max_parallel:16 + overflow_at:1 l
   assert.equal(onlyMp.state.config.max_parallel, 2, 'max_parallel alone carries');
   assert.equal(onlyMp.state.config.overflow_at, undefined, 'overflow_at stays absent');
 });
+
+// ---------------------------------------------------------------------------
+// s23/X27 — the genesis budget_window init + REJECTED-never-arms (EVIDENCE
+// §X27 quirk 7: the fresh post-reset epoch re-paused 3s later — genesis did
+// NOT initialize the window, and the dead epoch's straggler reports (REJECTED
+// unknown-task, lane-429 details) armed the fresh chain's window). Two
+// changes, five pins:
+//   1. genesis initializes budget_window: [] + budget_window_cleared_at ===
+//      the genesis now (an epoch boundary is a window-CLEAR boundary — the
+//      same semantics as the resume control).
+//   2. a report whose apply() produced a REJECTED journal record NEVER arms
+//      the window or the backstop (the dead epoch's straggler traffic).
+//   4. the C-3 straggler gate extends to the genesis boundary: a report
+//      whose task EXISTS but whose lease predates the genesis stamp is
+//      straggler-marked — excluded from the count-trigger.
+//   5. rebuild parity: the reset replay + the pause/resume pair yield the
+//      SAME window fields live produced (F8 additive safety).
+// ---------------------------------------------------------------------------
+
+test('s23/X27 pin 1: genesis initializes the window fields — budget_window:[] + budget_window_cleared_at === the genesis now', () => {
+  const g = boot();
+  assert.deepEqual(g.budget_window, [], 'the window is initialized EMPTY (absent-key "inherit whatever lands" is dead)');
+  assert.ok(Number.isFinite(Date.parse(g.budget_window_cleared_at)), 'the clear stamp is a parseable timestamp');
+  assert.equal(g.budget_window_cleared_at, iso(T0), 'the stamp === the genesis now (the epoch boundary IS a window-clear boundary)');
+  assert.deepEqual(invariants(g), []);
+  // the injected makeGenesis lane (the reset/rollover shape) carries it too
+  const mg = makeGenesis({ config: { ...CFG } });
+  assert.deepEqual(mg.state.budget_window, []);
+  assert.ok(Number.isFinite(Date.parse(mg.state.budget_window_cleared_at)), 'the rollover genesis stamps too');
+});
+
+test('s23/X27 pin 4: the C-3 straggler gate extends to the GENESIS boundary — pre-genesis leases are stragglers, never count-trigger', () => {
+  // The X27 v1-wipe shape at unit level: the fresh genesis stamps
+  // budget_window_cleared_at = T0; the PREDECESSOR epoch's in-flight workers
+  // carry leases issued BEFORE the stamp (the same task ids existing in both
+  // epochs is the reset/rollover reality — mockProject M1 is stable). Their
+  // quota reports are stragglers of the DEAD epoch: journaled for operator
+  // audit, excluded from the fresh epoch's count-trigger.
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned tasks');
+  const st = structuredClone(s);
+  assert.equal(st.budget_window_cleared_at, iso(T0), 'fixture: the genesis stamp is in force (pin 1)');
+  for (const id of ids) st.tasks[id].lease.issued_at = iso(T0 - 60_000);   // the predecessor cohort
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: st, queue: ids.map((id, i) => quotaReport(st, id, `gx${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gx'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.budget_window.length, 3, 'the stragglers are journaled (operator audit)');
+  assert.ok(out.state.budget_window.every(e => e.straggler === true), 'every entry carries straggler: true (the genesis stamp gates)');
+  assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), '3 DISTINCT pre-genesis reports NEVER count-trigger (the genesis-boundary false re-pause is dead)');
+  assert.deepEqual(invariants(out.state), []);
+});
+
+test('s23/X27 pin 5: rebuild parity — the reset replay + the pause/resume pair yield the SAME window fields live minted (F8 additive)', () => {
+  // (a) the reset replay: a journaled CONTROL reset (genesisSpec.now) re-runs
+  // genesis — the replayed fresh epoch carries the same EMPTY window + the
+  // same stamp the live rollover minted (rebuild-DERIVED, never invented).
+  const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  let pre = genesis({ config: CFG, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-x27-rb', now: iso(T0) });
+  pre = apply(pre, tickEv('rb1'), iso(T0), nextMilestoneFactory(ONE)).state;
+  pre = apply(pre, { kind: 'REPORT', event_id: 'rep-rb1', task: 'X', lease: pre.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, iso(T0 + 1000), nextMilestoneFactory(ONE)).state;
+  assert.equal(pre.project.phase, 'done');
+  const GNOW = iso(T0 + 60_000);   // the rollover instant = the fresh epoch's genesis now
+  const FRESH_TASKS = [{ id: 'task-i71', title: 'parity pin', behavior: 'real', work_ms: 4000, deps: [], spec: { accept: 'x', issue: 71 } }];
+  const qline = { issue: 71, body_sha8: 'x27abcd12', spec: { title: 'parity pin', accept: 'x' }, enqueued_at: iso(T0), author: 'op' };
+  const out = conductorTick({
+    cur: structuredClone(pre), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('rb2'), now: () => GNOW, nextMilestone: nextMilestoneFactory(ONE), recover: noRecover,
+    makeGenesis: ({ config, issue }) => {
+      const g = genesis({ config, project: { tasks: FRESH_TASKS, milestones: 1 }, chainId: 'c-x27-fresh', now: GNOW, issue: issue ?? null });
+      return { state: g, spec: { tasks: FRESH_TASKS, milestones: 1, chainId: 'c-x27-fresh', mode: 'mock' } };
+    },
+  });
+  assert.deepEqual(out.state.budget_window, [], 'live rollover: the fresh epoch starts with an EMPTY window');
+  assert.equal(out.state.budget_window_cleared_at, GNOW, 'live rollover: the genesis stamp === the rollover instant');
+  const rb = rebuild(pre, out.journal);
+  assert.equal(rb.chain.id, 'c-x27-fresh', 'rebuild: the reset replayed into the fresh epoch');
+  assert.deepEqual(rb.budget_window, [], 'rebuild: the reset replay carries the empty window');
+  assert.equal(rb.budget_window_cleared_at, GNOW, 'rebuild: the stamp derives from the journaled genesisSpec.now (replay === live)');
+  // (b) the pause/resume pair: live vs rebuild converge on BOTH fields.
+  const s2 = assignedState({ max_parallel: 4 });
+  const n2 = makeNow(T0 + 120_000);
+  const p = conductorTick({
+    cur: structuredClone(s2), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    ev: { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: 'ctl-x27-p', ts: iso(T0 + 120_000) }, now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  const r = conductorTick({
+    cur: structuredClone(p.state), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    ev: { kind: 'CONTROL', command: 'resume', event_id: 'ctl-x27-r', ts: iso(T0 + 180_000) }, now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.deepEqual(r.state.budget_window, [], 'live resume: the window cleared');
+  const rb2 = rebuild(boot(), [...p.journal, ...r.journal]);
+  assert.deepEqual(rb2.budget_window, [], 'rebuild: the resume replay clears the window');
+  assert.equal(rb2.budget_window_cleared_at, r.state.budget_window_cleared_at, 'rebuild: the clear stamp === the live stamp (the journaled resume ts)');
+  // (c) legacy neutrality: a pre-s23 genesis state (no window fields) + a
+  // journal that never touches the window rebuilds WITHOUT inventing them
+  // (absent stays absent — the F8 rebuild-neutral half).
+  const legacy = structuredClone(boot());
+  delete legacy.budget_window;
+  delete legacy.budget_window_cleared_at;
+  const t1 = apply(legacy, tickEv('lg'), iso(T0), NM);
+  const rb3 = rebuild(legacy, t1.journal);
+  assert.equal(rb3.budget_window, undefined, 'no window field invented from a legacy journal');
+  assert.equal(rb3.budget_window_cleared_at, undefined, 'no stamp invented either');
+});
