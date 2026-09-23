@@ -787,3 +787,65 @@ test('s23/X27 pin 5: rebuild parity — the reset replay + the pause/resume pair
   assert.equal(rb3.budget_window, undefined, 'no window field invented from a legacy journal');
   assert.equal(rb3.budget_window_cleared_at, undefined, 'no stamp invented either');
 });
+
+test('s23/X27 pin 2: REJECTED reports never arm the budget window — 3 quota-shaped unknown-task reports leave it EMPTY (the immediate false re-pause is dead)', () => {
+  // The X27 arc at unit level: the wiped epoch's mirror workers' quota-shaped
+  // infra reports landed REJECTED (unknown-task) on the fresh epoch but —
+  // pre-s23 — STILL armed the window (the push was gated ONLY on the quota
+  // shape), and 3 distinct ghost ids count-triggered the false re-pause
+  // within seconds of the reset. The X27 live arc, reproduced at unit level,
+  // now green.
+  const s = assignedState({ max_parallel: 4 });
+  const ghosts = ['GHOST-1', 'GHOST-2', 'GHOST-3'];
+  const ghostLine = (id, i) => ({
+    kind: 'REPORT', event_id: `rep-ghost-${i}`, task: id, lease: `lease-ghost-${i}`,
+    outcome: { status: 'infra_failed', error: 'lane-429' }, run_id: `run-ghost-${i}`,
+  });
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: ghosts.map(ghostLine),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gh'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.stats.rejected_events, 3, 'every ghost report was REJECTED (unknown-task)');
+  const rejRecs = out.journal.filter(j => j.kind === 'REJECTED' && j.origKind === 'REPORT');
+  assert.equal(rejRecs.length, 3, 'the REJECTED audit records landed');
+  assert.ok(rejRecs.every(j => j.reason === 'unknown-task'), 'the reject reason is unknown-task');
+  assert.ok(rejRecs.every(j => j.outcome && j.outcome.status === 'infra_failed' && j.outcome.error === 'lane-429'), 'the audit trail preserves the sliced quota outcome (what the straggler said)');
+  assert.deepEqual(out.state.budget_window, [], 'THE WINDOW STAYS EMPTY — the dead epoch\'s straggler traffic never arms it');
+  assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'NO alert EVEN at 3 distinct unknown task ids inside the window (the X27 false re-pause is dead)');
+  assert.deepEqual(invariants(out.state), []);
+  // the F11 re-delivery shape (a network retry of the same POSTs): the
+  // duplicate rejects are the SAME straggler class — still no arming.
+  const n2 = makeNow(T0 + 90_000);
+  const out2 = conductorTick({
+    cur: structuredClone(out.state), queue: ghosts.map(ghostLine),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gh2'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out2.state.stats.rejected_events, 6, 'the re-delivered ghosts all rejected as duplicates');
+  assert.deepEqual(out2.state.budget_window, [], 'the window is STILL empty after the duplicate re-delivery');
+  assert.ok(!out2.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'still no alert');
+});
+
+test('s23/X27 pin 3: the negative control — the SAME quota-shaped report for a KNOWN task still arms the window (F-6 unchanged)', () => {
+  // The F-6 contract is untouched by the REJECTED gate: a quota-shaped
+  // infra_failed report for a task the epoch KNOWS (lease matches, apply
+  // succeeds) still pushes its window entry and still count-triggers at 3
+  // distinct tasks.
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned (known) tasks');
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: ids.map((id, i) => quotaReport(s, id, `kx${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('kx'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.budget_window.length, 3, 'KNOWN-task quota reports still push the window entries');
+  assert.ok(out.state.budget_window.every(e => !e.straggler), 'post-genesis leases are NOT stragglers (the honest storm counts)');
+  const alert = out.actions.find(a => a.type === 'BUDGET_PAUSE_ALERT');
+  assert.ok(alert, 'the F-6 count-trigger still fires (the contract unchanged)');
+  assert.deepEqual(new Set(alert.tasks), new Set(ids), 'the distinct task list is the KNOWN cohort');
+  assert.deepEqual(invariants(out.state), []);
+});
