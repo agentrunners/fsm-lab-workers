@@ -437,3 +437,46 @@ reports drain, or accept the double-resume as operator routine.
 - The m-8 fail-closed console gate live: a command on the wrong issue is silently ignored (no queue burn, no false epoch).
 
 **The residual recorded honestly:** the write-invitation acceptance was a one-time operator action; the LAB_PAT identity now holds write on both buckets (its blast radius grew — noted for the PAT-scope-audit duty). The mirror's OWN conductor/consumer duties woke on my two probe dispatches and quiesced harmlessly (its own fsm-state is a halted chain — no cross-talk).
+
+## W1 — the key-jump live verification + THE SINGLE-FUNDED-KEY FINDING (2026-09-22, session 22)
+
+**The setup:** main @ the s22 fold merge (CI green #6), the chain halted+quiescent (the X26 close), the CC lane deployed [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2]. The drill: swap the primary to the dead-401 or-027, run single-task mode:cc epochs (T-W1 via intake issue #16, T-W2 via #17 — the rollover consumed each on the halt), watch the lane ladder.
+
+**The arc (three worker runs, all live):**
+1. Lane 1 (k1 = or-027, dead): the CC CLI's bridge calls 401 ("User not found") ×12 retries → `CC-LANE-EXIT rc=1 api_error_status=401`.
+2. **THE KEY-JUMP FIRED** (the s21/W1 fix's first live proof): lane 2 = k2 — NOT k1's next model. The pre-fix key-major flatten would have burned every lane on the dead key (the designed-but-unreachable failover); the observed ladder rotated the KEY exactly as designed.
+3. Lane 2 (k2 = or-075, the deployed KEY_2): **402** ("This request requires more credits... You requested up to 32000 tokens") — THE FINDING: the landing key was DRAINED (~$0.002 left). Lane 3 (k2 + glm-5.3-flash): 402 again (the ladder's second model is ALSO paid).
+4. `WORKER-DONE outcome=infra_failed` — the lane-exhaustion class, NET-ZERO (attempts stayed 1 through three runs: the infra-retry ladder re-dispatched twice, then the infra-exhaustion QUARANTINE landed with the distinct audit detail `lane-exhausted(3/6 lanes, last lane-402)`). The task never burned a work attempt; the chain never stopped.
+5. **The telemetry**: every report carries `key_index: 1, pool_size: 2` — the O-3 carry renders the SERVING key's index; the jump is VISIBLE on the console's LANE line without reading run logs.
+
+**The remediation live (mid-drill):** KEY_2 or-075 → or-082 (probe-verified 200 on deepseek) — but T-W2 (the complete-arc attempt, fired after the swap) STILL 402'd: **OpenRouter's pre-flight is max_tokens-proportional** — the CC CLI requests max_tokens=32000 (~$0.019 max cost at deepseek completion pricing); or-082's account holds ~$0.01 (passes at max_tokens=16, 402s at 4000). The probe matrix: or-074 32000→200 (the ONLY funded key, ~$8.8); or-082 32000→402, 4000→402, 16→200; or-075 hard-402.
+
+**What W1 proves:**
+- The KEY-JUMP mechanism END-TO-END: 401 on lane 1 → the key rotation → lane 2 on the SECOND key (the report's key_index=1). The W1 fix is live-green.
+- The infra-failure machinery: net-zero retries (attempts 1 through 3 runs), the infra-exhaustion quarantine with the distinct audit detail — zero work-attempt burn, the chain never halted mid-drill.
+- The O-3 key/pool telemetry renders the failover from the journal alone.
+
+**THE OPERATOR FINDING (the drill's real catch):** the fleet has exactly ONE funded paid key (or-074, ~$8.8 — the CC lane's only servable lane). The 2-key failover is mechanically real but economically SINGLE-POINT: or-075 (~$0.002) and or-082 (~$0.01) both fail the 32000-token pre-flight. The redundancy needs a FUNDED second key (a top-up — the operator's action, recorded in OPERATOR-ACTIONS). Candidate code improvement noted in PLAN: the CC ladder's free-model tail (a last-resort lane ANY key can serve — the pre-flight is $0 at free models).
+
+**The residual recorded honestly:** the drills ran with the primary swapped dead for ~50 minutes (14:49-15:45Z); the swap + restore are both 204-verified; the T-W1/T-W2 epochs are quarantined-terminal on the chain (the failure-machinery's own design); the EPOCH_MODE var stayed `mock` (the envelope's per-task mode:cc drove the CC lane — the per-spec mode precedence working as designed).
+
+## X27 — the capacity soak at the retuned ceiling + THE LAB_PAT EXPIRY CRACK (2026-09-22, session 22)
+
+**The setup:** main @ the B-1 merge (the multi-task door + the spec-level capacity knobs — CI green #6+), the mirror synced to the same tree (37adf91), `WORKER_OVERFLOW_AT` retuned 1→13 (the a7 verdict's posture), the chain halted+quiescent (the W2 close). The drill: the multi-task spec (24 tasks — 16 fast + 4 infra-flaky + 2 dup-report + 2 tail) carrying **`max_parallel: 16` + `overflow_at: 13` + `lease_minutes: 45`** — the B-1 spec-level knobs' FIRST live use (the door accepted the tasks: form; the v1 attempt's `work_ms` keys were correctly REJECTED by the door — the durations are the shim's own vocabulary, not operator-settable).
+
+**The arc (chain c-1790096866488 v1 → c-1790097396865 v2):**
+1. The rollover consumed the spec (issue #19); the genesis carried the knobs verbatim (config: max_parallel 16, overflow_at 13, lease 45 — the specCapacity carry's live proof).
+2. **THE SATURATION**: the first multi-assign ticks drove 16 concurrent worker runs on the MAIN bucket + **6 overflow runs on the MIRROR** (T-X27-14/15/16/21/22/23 — the pre-flight overflow arm firing at in-flight ≥ 13 exactly as retuned). 22 concurrent worker runs across 2 buckets — the ~5x ceiling LIVE (the X21-era posture was 4).
+3. The 4 infra-flaky tasks' first reports (lane-429 details) armed the F-6 budget window → **the budget-pause fired mid-saturation** (alert issue #12 opened, alert-first, the epoch parked cleanly) — the pacing machinery working at the new posture.
+4. **THE OPERATOR INCIDENT (recorded honestly)**: the orchestrator misfired a `reset from_queue` (a stale helper default) at 17:12 — it WIPED the v1 epoch at its saturation peak (the plain reset births the mockProject M1). The v1 evidence survives in journal-16 (the 16+6 concurrent runs + the overflow dispatch ledger). A v2 refire (issue #20 + a deliberate reset from_queue) rebuilt the epoch with the same knobs.
+5. **THE CRACK (the drill's real catch): THE MIRROR LANE'S LAB_PAT DIED** — the mirror workers' TARGET_REPO checkout failed `Bad credentials` (the zikomolapoutl classic PAT, secret-set 2026-09-06, expired/revoked between the X26 proof 09-21 and now). The main-side dispatch PAT still works (the overflow dispatches landed); the mirror-side checkout token is the broken half. The stuck tasks ran the full machinery: law-4 verification → infra-retry (net-zero) ×N → the ladder exhausted → 4 QUARANTINED (the fail-loud terminus) + the budget-pause re-cycling on the churn.
+6. **The interim live fix**: the mirror's `LAB_PAT` re-set to the working org-admin PAT (204) — the overflow lane restored; the re-dispatched tasks drain post-fix. **The operator residual: re-mint the minimal-scope zikomolapoutl PAT and revert the mirror's secret** (the admin PAT on the runtime lane is the documented blast-radius trade — acceptable for the drill's completion, rotation debt recorded).
+7. **A machinery quirk characterized**: the fresh post-reset epoch re-paused 3s later — genesis does NOT initialize `budget_window`, and the dead epoch's straggler reports (REJECTED unknown-task, lane-429 details) armed the fresh chain's window. The pause inherited the predecessor's quota noise (the safe direction, but a candidate fix: REJECTED unknown-task records never arm the window).
+
+**What X27 proves:**
+- The retuned posture LIVE: 16-parallel on the main bucket + the pre-flight overflow at 13 to the mirror — the capacity multiplier at its characterized ceiling.
+- The B-1 door + knobs END-TO-END: the 24-task spec accepted, the capacity carried into the genesis config, the epoch ran at the spec's own posture while the repo var moved independently.
+- The CAS storm at 16-parallel: the dup-report tasks' double reports absorbed; the report queue drained cleanly through the saturation.
+- The failure machinery under real lane death: law-4 → net-zero infra-retry → quarantine (4 tasks), the budget-pause cycling on the churn — every safety layer fired as designed, the chain never wedged.
+
+**The residual recorded honestly:** the epoch ends DEGRADED (the 4 quarantined tasks were the infra-flaky quartet × the dead mirror lane — the quarantine is the correct verdict for a dead lane). The v1 wipe was operator error (the orchestrator's misfire — the reset command's blast radius is real; the twin-guard/dedup machinery absorbed the report storm, and the REJECTED unknown-task records prove the fresh chain's fail-closed door).

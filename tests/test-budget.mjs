@@ -617,3 +617,235 @@ test('s22/B-1 + R2-4a: the carry lands lease_minutes in the genesis config — t
   const rNone = carry({});
   assert.equal(rNone.state.config.lease_minutes, CFG.lease_minutes, 'absent lease_minutes: the chain config stands (15)');
 });
+
+// ---------------------------------------------------------------------------
+// s22/B-1 commit 3 (the s22/Q1 adjudication): the CAPACITY-KNOB CARRY —
+// the exact A4-F1 pattern, second knob pair. The spec's door-validated
+// max_parallel/overflow_at land in the genesis config at BOTH carry sites
+// (the rollover and the reset from_queue); absent/garbage -> the knob is
+// absent -> the chain's standing config governs. Inverts cleanly: remove
+// the carry and the =16/=1 pins fail (mutation check).
+// ---------------------------------------------------------------------------
+
+test('s22/B-1 commit 3: the capacity carry — max_parallel:16 + overflow_at:1 land in the genesis config at the ROLLOVER and the RESET from_queue', () => {
+  const carry = (spec, { lane = 'rollover' } = {}) => {
+    // a DONE+HALTED epoch (the rollover shape) + one queued spec line
+    const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+    let s = genesis({ config: CFG, project: { tasks: ONE.m1, milestones: 1 }, chainId: `c-cap-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:00.000Z' });
+    s = apply(s, { kind: 'TICK', event_id: 'tk-cap', ts: '2026-09-06T10:00:00.000Z', actor: 'chain' }, '2026-09-06T10:00:00.000Z', nextMilestoneFactory(ONE)).state;
+    s = apply(s, { kind: 'REPORT', event_id: 'rep-cap', task: 'X', lease: s.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, '2026-09-06T10:00:01.000Z', nextMilestoneFactory(ONE)).state;
+    assert.equal(s.project.phase, 'done');
+    const qline = { issue: 61, body_sha8: 'capabcd12', spec: { title: 'capacity carry pin', accept: 'x', ...spec }, enqueued_at: '2026-09-06T10:00:02.000Z', author: 'op' };
+    const ctl = lane === 'direct-reset'
+      ? [{ cmd: 'reset', id: 'ctl-cap-rq', ts: '2026-09-06T10:00:03.000Z', sender: 'op', note: 'capacity carry pin', patch: { from_queue: true } }]
+      : [];
+    const out = conductorTick({
+      cur: structuredClone(s), queue: [], controlQueue: ctl, queueBad: [], ctlBad: [],
+      intakeQueue: [qline], intakeBad: [],
+      ev: lane === 'direct-reset' ? { kind: 'CONTROL', command: 'reset', event_id: 'ctl-cap-direct', ts: '2026-09-06T10:00:03.000Z', patch: { from_queue: true } } : { kind: 'TICK', event_id: 'tk-cap2', ts: '2026-09-06T10:00:04.000Z', actor: 'chain' },
+      now: () => '2026-09-06T10:00:05.000Z', nextMilestone: nextMilestoneFactory(ONE), recover: () => null,
+      makeGenesis: ({ config, spec, issue }) => {
+        const g = genesis({
+          config, project: { tasks: [{ id: spec?.id || `task-i${issue}`, title: spec?.title || `intake ${issue}`, behavior: spec?.behavior || 'real', work_ms: 4000, deps: [], spec: { accept: spec?.accept, issue } }], milestones: 1 },
+          chainId: `c-cap-g-${Math.random().toString(36).slice(2, 8)}`, now: '2026-09-06T10:00:05.000Z', issue: issue ?? null,
+        });
+        return { state: g, spec: { tasks: [], milestones: 1, chainId: 'c-cap-g', mode: 'mock' } };
+      },
+    });
+    return out;
+  };
+  // the rollover lane: BOTH knobs ride the genesis config
+  const r = carry({ max_parallel: '16', overflow_at: '1' });
+  assert.equal(r.state.config.max_parallel, 16, 'ROLLOVER: the spec max_parallel 16 rides the genesis config');
+  assert.equal(r.state.config.overflow_at, 1, 'ROLLOVER: the spec overflow_at 1 rides the genesis config (a NEW config member — the pre-flight consumes it via the state.config precedence)');
+  const rj = r.journal.find(j => j.kind === 'CONTROL' && j.command === 'reset');
+  assert.equal(rj?.genesisSpec?.config?.max_parallel, 16, 'the journal genesisSpec carries 16 (rebuild replays the same posture)');
+  assert.equal(rj?.genesisSpec?.config?.overflow_at, 1, 'the journal genesisSpec carries the overflow posture too');
+  // the reset from_queue lane: the SAME two pins
+  const d = carry({ max_parallel: '16', overflow_at: '1' }, { lane: 'direct-reset' });
+  assert.equal(d.state.config.max_parallel, 16, 'RESET from_queue: the spec max_parallel 16 rides the genesis config');
+  assert.equal(d.state.config.overflow_at, 1, 'RESET from_queue: the spec overflow_at 1 rides the genesis config');
+  // absent knobs -> the chain's standing config governs (the null path)
+  const none = carry({});
+  assert.equal(none.state.config.max_parallel, CFG.max_parallel, 'absent max_parallel: the chain config stands (4)');
+  assert.equal(none.state.config.overflow_at, undefined, 'absent overflow_at: the env lane stands (no config member minted)');
+  // garbage (a pre-door queue line) -> null -> the standing posture, never a wide epoch
+  const garbage = carry({ max_parallel: 'garbage', overflow_at: '99' });
+  assert.equal(garbage.state.config.max_parallel, CFG.max_parallel, 'garbage max_parallel: the chain config stands');
+  assert.equal(garbage.state.config.overflow_at, undefined, 'out-of-bounds overflow_at (99): no config member — the env lane stands');
+  // ONE knob alone carries (the independent pair)
+  const onlyMp = carry({ max_parallel: '2' });
+  assert.equal(onlyMp.state.config.max_parallel, 2, 'max_parallel alone carries');
+  assert.equal(onlyMp.state.config.overflow_at, undefined, 'overflow_at stays absent');
+});
+
+// ---------------------------------------------------------------------------
+// s23/X27 — the genesis budget_window init + REJECTED-never-arms (EVIDENCE
+// §X27 quirk 7: the fresh post-reset epoch re-paused 3s later — genesis did
+// NOT initialize the window, and the dead epoch's straggler reports (REJECTED
+// unknown-task, lane-429 details) armed the fresh chain's window). Two
+// changes, five pins:
+//   1. genesis initializes budget_window: [] + budget_window_cleared_at ===
+//      the genesis now (an epoch boundary is a window-CLEAR boundary — the
+//      same semantics as the resume control).
+//   2. a report whose apply() produced a REJECTED journal record NEVER arms
+//      the window or the backstop (the dead epoch's straggler traffic).
+//   4. the C-3 straggler gate extends to the genesis boundary: a report
+//      whose task EXISTS but whose lease predates the genesis stamp is
+//      straggler-marked — excluded from the count-trigger.
+//   5. rebuild parity: the reset replay + the pause/resume pair yield the
+//      SAME window fields live produced (F8 additive safety).
+// ---------------------------------------------------------------------------
+
+test('s23/X27 pin 1: genesis initializes the window fields — budget_window:[] + budget_window_cleared_at === the genesis now', () => {
+  const g = boot();
+  assert.deepEqual(g.budget_window, [], 'the window is initialized EMPTY (absent-key "inherit whatever lands" is dead)');
+  assert.ok(Number.isFinite(Date.parse(g.budget_window_cleared_at)), 'the clear stamp is a parseable timestamp');
+  assert.equal(g.budget_window_cleared_at, iso(T0), 'the stamp === the genesis now (the epoch boundary IS a window-clear boundary)');
+  assert.deepEqual(invariants(g), []);
+  // the injected makeGenesis lane (the reset/rollover shape) carries it too
+  const mg = makeGenesis({ config: { ...CFG } });
+  assert.deepEqual(mg.state.budget_window, []);
+  assert.ok(Number.isFinite(Date.parse(mg.state.budget_window_cleared_at)), 'the rollover genesis stamps too');
+});
+
+test('s23/X27 pin 4: the C-3 straggler gate extends to the GENESIS boundary — pre-genesis leases are stragglers, never count-trigger', () => {
+  // The X27 v1-wipe shape at unit level: the fresh genesis stamps
+  // budget_window_cleared_at = T0; the PREDECESSOR epoch's in-flight workers
+  // carry leases issued BEFORE the stamp (the same task ids existing in both
+  // epochs is the reset/rollover reality — mockProject M1 is stable). Their
+  // quota reports are stragglers of the DEAD epoch: journaled for operator
+  // audit, excluded from the fresh epoch's count-trigger.
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned tasks');
+  const st = structuredClone(s);
+  assert.equal(st.budget_window_cleared_at, iso(T0), 'fixture: the genesis stamp is in force (pin 1)');
+  for (const id of ids) st.tasks[id].lease.issued_at = iso(T0 - 60_000);   // the predecessor cohort
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: st, queue: ids.map((id, i) => quotaReport(st, id, `gx${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gx'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.budget_window.length, 3, 'the stragglers are journaled (operator audit)');
+  assert.ok(out.state.budget_window.every(e => e.straggler === true), 'every entry carries straggler: true (the genesis stamp gates)');
+  assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), '3 DISTINCT pre-genesis reports NEVER count-trigger (the genesis-boundary false re-pause is dead)');
+  assert.deepEqual(invariants(out.state), []);
+});
+
+test('s23/X27 pin 5: rebuild parity — the reset replay + the pause/resume pair yield the SAME window fields live minted (F8 additive)', () => {
+  // (a) the reset replay: a journaled CONTROL reset (genesisSpec.now) re-runs
+  // genesis — the replayed fresh epoch carries the same EMPTY window + the
+  // same stamp the live rollover minted (rebuild-DERIVED, never invented).
+  const ONE = { milestones: 1, m1: [{ id: 'X', title: 'x', behavior: 'succeed', work_ms: 1 }] };
+  let pre = genesis({ config: CFG, project: { tasks: ONE.m1, milestones: 1 }, chainId: 'c-x27-rb', now: iso(T0) });
+  pre = apply(pre, tickEv('rb1'), iso(T0), nextMilestoneFactory(ONE)).state;
+  pre = apply(pre, { kind: 'REPORT', event_id: 'rep-rb1', task: 'X', lease: pre.tasks.X.lease.token, outcome: { status: 'done', artifact: 'a' }, run_id: 'r' }, iso(T0 + 1000), nextMilestoneFactory(ONE)).state;
+  assert.equal(pre.project.phase, 'done');
+  const GNOW = iso(T0 + 60_000);   // the rollover instant = the fresh epoch's genesis now
+  const FRESH_TASKS = [{ id: 'task-i71', title: 'parity pin', behavior: 'real', work_ms: 4000, deps: [], spec: { accept: 'x', issue: 71 } }];
+  const qline = { issue: 71, body_sha8: 'x27abcd12', spec: { title: 'parity pin', accept: 'x' }, enqueued_at: iso(T0), author: 'op' };
+  const out = conductorTick({
+    cur: structuredClone(pre), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    intakeQueue: [qline], intakeBad: [],
+    ev: tickEv('rb2'), now: () => GNOW, nextMilestone: nextMilestoneFactory(ONE), recover: noRecover,
+    makeGenesis: ({ config, issue }) => {
+      const g = genesis({ config, project: { tasks: FRESH_TASKS, milestones: 1 }, chainId: 'c-x27-fresh', now: GNOW, issue: issue ?? null });
+      return { state: g, spec: { tasks: FRESH_TASKS, milestones: 1, chainId: 'c-x27-fresh', mode: 'mock' } };
+    },
+  });
+  assert.deepEqual(out.state.budget_window, [], 'live rollover: the fresh epoch starts with an EMPTY window');
+  assert.equal(out.state.budget_window_cleared_at, GNOW, 'live rollover: the genesis stamp === the rollover instant');
+  const rb = rebuild(pre, out.journal);
+  assert.equal(rb.chain.id, 'c-x27-fresh', 'rebuild: the reset replayed into the fresh epoch');
+  assert.deepEqual(rb.budget_window, [], 'rebuild: the reset replay carries the empty window');
+  assert.equal(rb.budget_window_cleared_at, GNOW, 'rebuild: the stamp derives from the journaled genesisSpec.now (replay === live)');
+  // (b) the pause/resume pair: live vs rebuild converge on BOTH fields.
+  const s2 = assignedState({ max_parallel: 4 });
+  const n2 = makeNow(T0 + 120_000);
+  const p = conductorTick({
+    cur: structuredClone(s2), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    ev: { kind: 'CONTROL', command: 'pause', payload: { reason: 'lane-budget-exhausted' }, event_id: 'ctl-x27-p', ts: iso(T0 + 120_000) }, now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  const r = conductorTick({
+    cur: structuredClone(p.state), queue: [], controlQueue: [], queueBad: [], ctlBad: [],
+    ev: { kind: 'CONTROL', command: 'resume', event_id: 'ctl-x27-r', ts: iso(T0 + 180_000) }, now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.deepEqual(r.state.budget_window, [], 'live resume: the window cleared');
+  const rb2 = rebuild(boot(), [...p.journal, ...r.journal]);
+  assert.deepEqual(rb2.budget_window, [], 'rebuild: the resume replay clears the window');
+  assert.equal(rb2.budget_window_cleared_at, r.state.budget_window_cleared_at, 'rebuild: the clear stamp === the live stamp (the journaled resume ts)');
+  // (c) legacy neutrality: a pre-s23 genesis state (no window fields) + a
+  // journal that never touches the window rebuilds WITHOUT inventing them
+  // (absent stays absent — the F8 rebuild-neutral half).
+  const legacy = structuredClone(boot());
+  delete legacy.budget_window;
+  delete legacy.budget_window_cleared_at;
+  const t1 = apply(legacy, tickEv('lg'), iso(T0), NM);
+  const rb3 = rebuild(legacy, t1.journal);
+  assert.equal(rb3.budget_window, undefined, 'no window field invented from a legacy journal');
+  assert.equal(rb3.budget_window_cleared_at, undefined, 'no stamp invented either');
+});
+
+test('s23/X27 pin 2: REJECTED reports never arm the budget window — 3 quota-shaped unknown-task reports leave it EMPTY (the immediate false re-pause is dead)', () => {
+  // The X27 arc at unit level: the wiped epoch's mirror workers' quota-shaped
+  // infra reports landed REJECTED (unknown-task) on the fresh epoch but —
+  // pre-s23 — STILL armed the window (the push was gated ONLY on the quota
+  // shape), and 3 distinct ghost ids count-triggered the false re-pause
+  // within seconds of the reset. The X27 live arc, reproduced at unit level,
+  // now green.
+  const s = assignedState({ max_parallel: 4 });
+  const ghosts = ['GHOST-1', 'GHOST-2', 'GHOST-3'];
+  const ghostLine = (id, i) => ({
+    kind: 'REPORT', event_id: `rep-ghost-${i}`, task: id, lease: `lease-ghost-${i}`,
+    outcome: { status: 'infra_failed', error: 'lane-429' }, run_id: `run-ghost-${i}`,
+  });
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: ghosts.map(ghostLine),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gh'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.stats.rejected_events, 3, 'every ghost report was REJECTED (unknown-task)');
+  const rejRecs = out.journal.filter(j => j.kind === 'REJECTED' && j.origKind === 'REPORT');
+  assert.equal(rejRecs.length, 3, 'the REJECTED audit records landed');
+  assert.ok(rejRecs.every(j => j.reason === 'unknown-task'), 'the reject reason is unknown-task');
+  assert.ok(rejRecs.every(j => j.outcome && j.outcome.status === 'infra_failed' && j.outcome.error === 'lane-429'), 'the audit trail preserves the sliced quota outcome (what the straggler said)');
+  assert.deepEqual(out.state.budget_window, [], 'THE WINDOW STAYS EMPTY — the dead epoch\'s straggler traffic never arms it');
+  assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'NO alert EVEN at 3 distinct unknown task ids inside the window (the X27 false re-pause is dead)');
+  assert.deepEqual(invariants(out.state), []);
+  // the F11 re-delivery shape (a network retry of the same POSTs): the
+  // duplicate rejects are the SAME straggler class — still no arming.
+  const n2 = makeNow(T0 + 90_000);
+  const out2 = conductorTick({
+    cur: structuredClone(out.state), queue: ghosts.map(ghostLine),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('gh2'), now: n2.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out2.state.stats.rejected_events, 6, 'the re-delivered ghosts all rejected as duplicates');
+  assert.deepEqual(out2.state.budget_window, [], 'the window is STILL empty after the duplicate re-delivery');
+  assert.ok(!out2.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), 'still no alert');
+});
+
+test('s23/X27 pin 3: the negative control — the SAME quota-shaped report for a KNOWN task still arms the window (F-6 unchanged)', () => {
+  // The F-6 contract is untouched by the REJECTED gate: a quota-shaped
+  // infra_failed report for a task the epoch KNOWS (lease matches, apply
+  // succeeds) still pushes its window entry and still count-triggers at 3
+  // distinct tasks.
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned (known) tasks');
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s), queue: ids.map((id, i) => quotaReport(s, id, `kx${i}`)),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('kx'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  assert.equal(out.state.budget_window.length, 3, 'KNOWN-task quota reports still push the window entries');
+  assert.ok(out.state.budget_window.every(e => !e.straggler), 'post-genesis leases are NOT stragglers (the honest storm counts)');
+  const alert = out.actions.find(a => a.type === 'BUDGET_PAUSE_ALERT');
+  assert.ok(alert, 'the F-6 count-trigger still fires (the contract unchanged)');
+  assert.deepEqual(new Set(alert.tasks), new Set(ids), 'the distinct task list is the KNOWN cohort');
+  assert.deepEqual(invariants(out.state), []);
+});

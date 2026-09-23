@@ -33,10 +33,10 @@ import { genesis, apply } from '../lib/fsm.mjs';
 import { mockProject, nextMilestoneFactory } from '../lib/mock-project.mjs';
 import {
   conductorTick, makeBudget, assembleDispatchPayload, dispatchVerificationEvents,
-  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specToTask, dispatchBudgetFromWall,
+  DISPATCH_COST_MS, VERIFY_WINDOW_MS, specEpoch, dispatchBudgetFromWall,
   verifyScanRunsPath, seenKeysFromRuns, verifyScanRepoList, VERIFY_SCAN_PER_PAGE, VERIFY_SCAN_SLACK_MS,
   dispatchLadder, workerOverflowDecision, overflowPreFlight, priorInFlightCount, WORKER_OVERFLOW_AT_DEFAULT,
-  chainContinuationDecision,
+  overflowThreshold, chainContinuationDecision,
 } from '../lib/conductor-core.mjs';
 import { buildEvent, mintEventId } from '../lib/event-ingest.mjs';
 import { prFlow, prFlowCandidates } from '../lib/task-pr.mjs';
@@ -200,18 +200,26 @@ async function main() {
     const cfg = config || DEFAULT_CFG();
     const chainId = `c-${Date.now()}`;
     if (spec) {
-      // specToTask (conductor-core) is the CANONICAL mapper — the door's
-      // pure half parity-pins the same shape at integration.
+      // specEpoch (conductor-core) is the CANONICAL mapper — the door's
+      // pure half parity-pins the same shape at integration. s22/B-1: a
+      // spec carrying a `tasks` array (the door's multi-task form) maps
+      // EVERY entry through specToTask; a plain spec maps its single task —
+      // ONE mapper for both lanes.
       // T46/W-C1-R (lens-1 BLOCKING-1 adapter half): spec epochs carry
       // milestones_total=1 — the task IS the project; the clock's
       // milestones_total bound (fsm.mjs pass 5) then NEVER consults the
       // mock drill's generator for an intake epoch (the live sprout bug:
       // every intake epoch ran the mock M2+M3 — ~10 phantom dispatches —
-      // before the rollover could fire). The spec's `milestone` key stays
-      // door-validated metadata for W-D's multi-task epochs (inert here).
-      const task = specToTask(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
-      const g = genesis({ config: cfg, project: { tasks: [task], milestones: 1 }, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
-      return { state: g, spec: { tasks: [task], milestones: 1, chainId, mode: g.project.mode } };
+      // before the rollover could fire). s22/B-1 keeps milestones_total=1
+      // for the MULTI-task form too ("the task SET is the project") —
+      // B-1's `milestones_total = tasks.length` formula would fire the
+      // generator at milestone 1 < N and re-sprout the exact bug the
+      // bound killed (see specEpoch's comment + the no-sprout pin). The
+      // spec's (and each entry's) `milestone` key stays door-validated
+      // metadata for W-D's milestone-aware epochs (inert here).
+      const ep = specEpoch(spec, { issue, bodySha8: bodySha8 || `i${issue}` });
+      const g = genesis({ config: cfg, project: ep, chainId, now: now(), mode: spec.mode || EPOCH_MODE, issue: issue ?? null });
+      return { state: g, spec: { tasks: ep.tasks, milestones: ep.milestones, chainId, mode: g.project.mode } };
     }
     const mp = mockProject();
     const g = genesis({ config: cfg, project: { tasks: mp.m1, milestones: 3 }, chainId, now: now(), mode: EPOCH_MODE });
@@ -409,7 +417,7 @@ async function main() {
       );
       // T46/s21 C-2 (audit a1, MAJOR — the double-dispatch): the target is
       // decided BEFORE any wire attempt. The occupancy arm (in-flight >=
-      // WORKER_OVERFLOW_AT) is PRE-FLIGHT: this dispatch goes STRAIGHT to
+      // overflow threshold) is PRE-FLIGHT: this dispatch goes STRAIGHT to
       // WORKER_REPO_2 and the same-repo attempt is SKIPPED — the old shape
       // ran the main ladder first (204) and then re-sent the SAME payload to
       // the second bucket: two workers grinding one task, 2x paid-key burn,
@@ -422,9 +430,17 @@ async function main() {
       // Store rides the checkout's origin), so the report lands on the MAIN
       // fsm-state. Unset WORKER_REPO_2 -> both decisions return false for
       // any input (byte-identical today path).
+      // s22/B-1 (the s22/Q1 adjudication): the threshold's PRECEDENCE — the
+      // STATE view wins (overflowThreshold: config.overflow_at ?? the
+      // env-parsed lane value ?? DEFAULT folded in the env parse): a drill
+      // epoch carries its own capacity posture (the spec's door-validated
+      // overflow_at, carried into the genesis config at the rollover /
+      // reset from_queue) while the repo var stays at whatever posture
+      // production wants. Absent in the config -> the env lane stands,
+      // byte-identical to the pre-B-1 wiring.
       const pre = overflowPreFlight({
         inFlightNow: priorInFlight + dispatchIndex - 1,
-        repo2: WORKER_REPO_2, pat: PAT, overflowAt: WORKER_OVERFLOW_AT,
+        repo2: WORKER_REPO_2, pat: PAT, overflowAt: overflowThreshold(state.config, WORKER_OVERFLOW_AT),
       });
       let d;
       if (pre.overflow) {
@@ -518,7 +534,13 @@ async function main() {
     // advice). The twin journals REJECTED + the log line; that is the whole
     // visible trace it needs.
     if (j.kind === 'REJECTED' && j.origKind === 'CONTROL' && j.reason !== 'duplicate' && j.reason !== 'reset-duplicate') {
-      await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
+      // s22/m-4: the O-4 alert POST is CHECKED — a non-201 logs LOUDLY (the
+      // same law-5 shape every other alert lane carries). The operator's
+      // broken-knob feedback loop breaks TWICE if the rejection alert itself
+      // dies silently: the console ack said queued, the drain rejected, and
+      // the tell-the-operator comment vanished — the knob looks landed.
+      const okRejected = await postIssueComment(`**[fsm-alert]** control REJECTED — ${j.command || 'control'}: ${j.reason} (journal ${j.id}${j.event_id ? ` · event ${j.event_id}` : ''}) — the console ack did NOT land; fix the patch and re-send.`);
+      if (!okRejected) console.log(`CONTROL-REJECTED-ALERT-FAILED journal=${j.id} command=${j.command || 'control'} (law 5: visible, non-fatal — the REJECTED record is the durable signal; the next rejected control re-attempts the comment)`);
     }
     if (j.kind === 'BUDGET') {
       // F-10: the observable pacing signal — one log line per exhausted tick
