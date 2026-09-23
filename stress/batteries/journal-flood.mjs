@@ -63,6 +63,9 @@
 // latch. Pinned as the characterization number (the a6 discipline — the
 // number drives the fix, the battery does not silently repair).
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+const REPO_ROOT = join(dirname(import.meta.url.replace('file://', '')), '..', '..');
 import { Store } from '../../lib/store.mjs';
 import { genesis } from '../../lib/fsm.mjs';
 import { conductorTick } from '../../lib/conductor-core.mjs';
@@ -72,7 +75,6 @@ import { LANE_JOURNAL_WINDOW } from '../../ops/console.mjs';
 import { createGhapi } from '../../e2e/lib/ghapi.mjs';
 import { mulberry32, makeClock, setupRepo, Recorder, T0, MIN, HOUR } from '../lib/common.mjs';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 const ROTATE_AT = 500;
@@ -512,7 +514,13 @@ async function alertPagination(rec, seed, { scans }) {
     // '[fsm-watchdog]' filter (the characterization target). The LATCHED
     // body (lane C below) does not match — a divergence the battery surfaces.
     const corruptBody = '**[fsm-watchdog]** state.json is UNREADABLE on fsm-state. The conductor self-heals via git-history recovery on its next tick.';
-    const latchedBody = '**[fsm-watchdog LATCHED]** 3 consecutive re-primes with NO chain progress (seq frozen) — re-priming is DISABLED until a tick lands.';
+    // s23/latch update: the production body was FIXED (class-first) — the
+    // battery now sources the CURRENT template from watchdog/scan.mjs and
+    // asserts the fix (the old divergent shape stays as the BEFORE record).
+    const OLD_LATCHED_BODY = '**[fsm-watchdog LATCHED]** 3 consecutive re-primes with NO chain progress (seq frozen) — re-priming is DISABLED until a tick lands.';
+    const scanSrc = readFileSync(join(REPO_ROOT, 'watchdog', 'scan.mjs'), 'utf8');
+    const latchedBody = (scanSrc.match(/const body = `([^`]*consecutive re-primes[^`]*)`/) || [])[1]
+      ?? OLD_LATCHED_BODY;
 
     // TWO alert issues evolve on ONE interleaved virtual clock at the 2h
     // scan cadence (the live X-series cadence): the FIX issue is fetched via
@@ -626,11 +634,20 @@ async function alertPagination(rec, seed, { scans }) {
       const nowMs = clock.ms;
       const recognized = api.comments(REPO, issueC.number).filter(c => (c.body || '').includes('[fsm-watchdog]'));
       const dedup = alertDedup({ comments: await fetchComments(alertCommentsPath(REPO, issueC.number, nowMs)), nowMs });
-      rec.check('pagination: CHARACTERIZED — the LATCHED body never matches the dedup marker filter (the skip cannot fire for the latch class; ~12/day even post-A-2)',
-        recognized.length === 0 && dedup.skip === false && dedup.reason === 'no-marker',
-        `recognizedMarkers=${recognized.length} skip=${dedup.skip} reason=${dedup.reason}`);
+      // s23/latch: the fix landed (main 2bac884) — the PRODUCTION template
+      // now carries the class token. Lane C runs the CURRENT body through
+      // the REAL filter: recognized + skip=true (the 24h dedup bounds the
+      // LATCH class). The OLD shape's divergence stays asserted below as
+      // the BEFORE record (the characterization that drove the fix).
+      const oldRecognized = api.comments(REPO, issueC.number).filter(c => (c.body || '').includes('[fsm-watchdog]') && c.body === OLD_LATCHED_BODY).length;
+      rec.check('pagination: s23/latch FIX — the production LATCHED body (sourced from watchdog/scan.mjs) matches the dedup marker filter (the skip fires for the latch class)',
+        recognized.length === 1 && dedup.skip === true && dedup.reason === 'trusted-marker-fresh',
+        `recognizedMarkers=${recognized.length} skip=${dedup.skip} reason=${dedup.reason} (production template: ${latchedBody.slice(0, 40)}...)`);
+      rec.check('pagination: BEFORE-record — the OLD LATCHED body shape never matched (the s22 divergence characterization, kept as the fixes evidence)',
+        OLD_LATCHED_BODY.includes('[fsm-watchdog]') === false,
+        'the old shape lacks the [fsm-watchdog] substring — alertDedup could never match it (the ~12/day sustained-latch class)');
       rec.metric('latched_body_marker_recognition', recognized.length);
-      rec.note(`LATCHED-body divergence (s22 finding): the adapter's latch comment body '**[fsm-watchdog LATCHED]**' (watchdog/scan.mjs) is not matched by alertDedup's '[fsm-watchdog]' filter (lib/watchdog-core.mjs) — the A-2 since= fix cannot bound the LATCH alert class. Fix site: the body or the filter; the number is pinned here.`);
+      rec.note(`s23/latch: the LATCHED-body divergence is FIXED on main (2bac884) — the production template (sourced live from watchdog/scan.mjs) carries the class token and the skip fires; the OLD shape's non-match stays pinned as the BEFORE record. The A-2 since= fix now bounds BOTH alert classes.`);
     }
     await api.close();
   } finally {
@@ -643,7 +660,7 @@ async function alertPagination(rec, seed, { scans }) {
 // ---------------------------------------------------------------------------
 export async function run({ quick, seed } = {}) {
   const rec = new Recorder('journal-flood');
-  const cycles = quick ? 27 : 98;              // ~100 records/cycle -> ~2.9k / ~10k events
+  const cycles = quick ? 27 : 105;             // ~100 records/cycle -> ~2.9k / ~10.5k events (s23: 98 undershot the >=20-rotation boundary at 19 — the per-cycle record count runs ~99, not 100)
   const minRotations = quick ? 5 : 20;
   const markerCount = quick ? 675 : 2880;      // 7d / 30d at the nominal 15-min cadence
   const scans = quick ? 24 : 60;               // 2 / 5 virtual days at the 2h scan cadence
