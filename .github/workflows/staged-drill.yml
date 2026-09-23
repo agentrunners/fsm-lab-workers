@@ -199,7 +199,12 @@ jobs:
 
   # --------------------------------------------------------------- teardown --
   teardown:
-    needs: [verify]
+    # s23 fix: [gate, run, verify] — GHA job outputs are ONLY readable for
+    # DIRECT needs members; the old [verify] left needs.run.outputs.seeded
+    # EMPTY in the teardown (RUN_SEEDED='' — the seed-no-output
+    # misclassification on a seed that ACTUALLY ran, which then skipped the
+    # §4.2 stuck-recovery reset on a live epoch).
+    needs: [gate, run, verify]
     # always(): cleanup + the page-once RED lane must run on a failed verify
     # AND on a failed GATE (the read-RED class pages HERE — §1.3 "it pages").
     if: >-
