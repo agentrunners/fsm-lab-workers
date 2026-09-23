@@ -91,7 +91,11 @@ export function epochSpend(journalRecords) {
     const r = recs[i];
     if (!r || typeof r !== 'object') continue;
     if (r.kind === 'CONTROL' && r.command === 'reset' && r.applied !== false) break;   // the epoch boundary
-    if (r.kind !== 'REPORT') continue;
+    // s22/m-1: only TERMINAL reports count — a to:'in_progress' REPORT (the
+    // worker's mid-flight start report, fsm.mjs:251) carries the SAME
+    // ...lane spread, so counting it double-bills the turn (once at
+    // in_progress, once at done) and inflates `turns`.
+    if (r.kind !== 'REPORT' || r.to === 'in_progress') continue;
     turns += 1;
     const ls = r.lane_stats;
     if (ls && typeof ls === 'object' && !Array.isArray(ls)) {
@@ -596,7 +600,13 @@ async function postComment(api, repo, issueNumber, body) {
 // return on the FIRST attempt — no retry delay on the stranger path.
 async function permissionCheck(api, repo, author) {
   const path = `/repos/${repo}/collaborators/${encodeURIComponent(author)}/permission`;
-  const isTransient = (r) => !r || typeof r.status !== 'number' || (r.status >= 500 && r.status < 600);
+  // s22/m-5: 429 + the GH secondary-rate-limit shape (403 WITH a
+  // Retry-After header — the api seam now carries it) are TRANSIENT: the
+  // old isTransient returned them definitive, so a rate-limited permission
+  // GET read as 'unverified' and the console went CONSOLE-SILENT on a
+  // healthy operator command (the fail-closed path firing on a transient).
+  const isTransient = (r) => !r || typeof r.status !== 'number' || (r.status >= 500 && r.status < 600)
+    || r.status === 429 || (r.status === 403 && r.retryAfter);
   let r = null;
   try { r = await api(path); } catch { r = null; }   // network-level throw: DNS / socket / AbortSignal timeout
   if (!isTransient(r)) return r;
@@ -650,7 +660,11 @@ async function main() {
     const text = await r.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON error bodies */ }
-    return { status: r.status, data };
+    // s22/m-5: the Retry-After header rides the return (GH's secondary rate
+    // limit is 403 + Retry-After — the shape permissionCheck retries on;
+    // absent on 2xx and on injected fakes — falsy, the old behavior stands)
+    const retryAfter = typeof r.headers?.get === 'function' ? r.headers.get('retry-after') : null;
+    return { status: r.status, data, ...(retryAfter ? { retryAfter } : {}) };
   };
   const r = await runConsole({ event, env, api, store });
   if (r.exitCode) process.exitCode = r.exitCode;

@@ -1,0 +1,245 @@
+# fsm-staged-drill — THE STAGED DRILL (s22 design §1.1, build item B-0):
+# the scheduled, self-verifying, self-cleaning nightly epoch. Runs the REAL
+# five-workflow composition (conductor + worker + watchdog + intake + ops) on
+# REAL GitHub runners against the REAL `fsm-state` CAS with mock economics
+# (the drill spec pins `mode: mock` — zero paid API spend, zero real CC turns).
+#
+# This workflow is a DRIVER, not a machine-plane member (the F-2 per-workflow
+# form for PAT-holding workflows): dispatch/schedule/manual triggers ONLY,
+# never hostile-input surfaces — it reads `secrets.LAB_PAT`.
+#
+# Four jobs (the design's wiring):
+#   gate     §1.2/§1.3 — read-only halted-clean check (G1–G6); refuses unless
+#            the chain is resting. A SKIP is GREEN (exit 0, one log line
+#            `STAGED-DRILL-SKIP <reason>`): a busy real epoch is healthy
+#            behavior, not a drill failure. Only a gate that CANNOT READ the
+#            state after 3 attempts goes RED — teardown then pages (§3.4).
+#   run      §2      — seed (PATCH body + PAT REOPEN of the pinned drill
+#            issue → the REAL intake door → rollover) + the monitor poll to
+#            halt. timeout-minutes: 70 is the ALARM line (§7 F2); the monitor
+#            itself exits 1 at 55 min.
+#   verify   §3      — the A1–A12 assertion pass (read-only: Store git reads +
+#            the two run ledgers + watchdog runs + the drill issue thread).
+#            `if: always()` — it must run on a stuck drill too (it IS the
+#            stuck-detector). Emits the DRILL-REPORT artifact.
+#   teardown §4      — close the drill issue + the GREEN marker / RED
+#            page-once + auto-close of stale `fsm-staged-red` + the
+#            stuck-recovery reset dispatch. `if: always()` (also on gate-RED,
+#            where it is the pager).
+#
+# OPERATOR ONE-TIME SETUP (design §8 B-0 item 4 — REQUIRED before any drill
+# can run; until then the gate SKIPs green with `config-missing-drill-issue`):
+#   1. Create the pinned drill issue ONCE (any write-class collaborator — the
+#      door gates the ISSUE's AUTHOR, `it.user.login`, whose standing
+#      permission every nightly reopen rides on; whoever performs the reopen
+#      is irrelevant). Close it after creation — the seed reopens it nightly.
+#      Body: any text; the seed PATCHes tonight's spec block in each night.
+#   2. Set the repo variable `DRILL_ISSUE` to that issue number (mapped below
+#      exactly like OPS_ISSUE — if the drill issue ever moves, the variable
+#      moves, the workflow does not).
+#   3. Cadence ladder (§1.2): leave `STAGED_DRILL_ENABLED` UNSET for stage 0
+#      (= `manual`: schedule events SKIP; only workflow_dispatch proceeds).
+#      `weekly` = Mondays UTC only; `nightly` = every fire. Promotion is an
+#      operator's one-line variable flip — no re-merge.
+#
+# NOT enabled by this build (B-0 ships the machinery, not the flip): with
+# STAGED_DRILL_ENABLED absent the cron fires but the gate SKIPs green — manual
+# workflow_dispatch is the only path that proceeds.
+name: fsm-staged-drill
+
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('drill · manual{0}', github.event.inputs.note && format(' · {0}', github.event.inputs.note) || '') || 'drill · nightly' }}
+
+on:
+  workflow_dispatch:        # stage 0: the ONLY way it fires
+    inputs:
+      note:
+        description: 'manual drill reason (logged only)'
+        required: false
+        default: ''
+  schedule:
+    - cron: "37 1 * * *"    # nightly 01:37 UTC — off the :00/:30 high-load
+                            # hotspot (the conductor.yml:41 discipline) and
+                            # ~90 min after the OpenRouter free-tier ~UTC-midnight
+                            # rollover, so a late real epoch has drained first
+
+concurrency:
+  group: fsm-staged-drill   # OWN group — never contends with the hot conductor chain
+  cancel-in-progress: false # (the live discovery, ops.yml:1-4)
+
+permissions:
+  contents: write   # checkout + read-only fsm-state fetch + the reset/nudge dispatch POSTs (X1a, conductor.yml:48-49)
+  issues: write     # the drill issue PATCH/reopen/close, the marker, the RED page
+  actions: read     # the bucket-2 runs query + the watchdog-runs assert (law-4 pattern, conductor.yml:51)
+
+env:
+  # The PAT lane: the seed's issue PATCH + REOPEN must be REAL-USER-authored
+  # (a GITHUB_TOKEN-authored issue event fires no workflows — the
+  # anti-recursion law; only a PAT reopen wakes the intake door, §1.6). Also
+  # the cross-repo runs reads (the mirror bucket).
+  LAB_PAT: ${{ secrets.LAB_PAT }}
+  # m-8 LOAD-BEARING-VARIABLE pattern (mapped exactly like OPS_ISSUE,
+  # ops-console.yml:60-63): the pinned drill issue number. UNSET = the gate
+  # SKIPs green (the operator one-time setup above has not happened).
+  DRILL_ISSUE: ${{ vars.DRILL_ISSUE || '' }}
+  # The cadence knob (§1.2): manual (default) | weekly | nightly.
+  STAGED_DRILL_ENABLED: ${{ vars.STAGED_DRILL_ENABLED || 'manual' }}
+
+jobs:
+  # ------------------------------------------------------------------ gate --
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.gate.outputs.proceed }}
+      skipReason: ${{ steps.gate.outputs.skipReason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24   # match the local dev major (ci.yml)
+
+      - name: Gate (the halted-clean check, G1–G6)
+        id: gate
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          WORKER_REPO_2: ${{ vars.WORKER_REPO_2 || '' }}
+        run: node e2e/staged/gate.mjs
+
+  # ------------------------------------------------------------------- run --
+  run:
+    needs: gate
+    if: needs.gate.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70   # §7 F2: the ALARM line — the monitor exits 1 at 55 min
+    outputs:
+      seeded: ${{ steps.seed.outputs.seeded }}
+      enqueued: ${{ steps.seed.outputs.enqueued }}
+      mmdd: ${{ steps.seed.outputs.mmdd }}
+      halted: ${{ steps.monitor.outputs.halted }}
+      wallMin: ${{ steps.monitor.outputs.wallMin }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Seed (PATCH the dated spec body + PAT REOPEN the drill issue)
+        id: seed
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+          DRILL_MIX: ${{ vars.STAGED_DRILL_MIX || 'stage0' }}
+        run: node e2e/staged/seed.mjs
+
+      - name: Monitor (poll fsm-state to the halt)
+        id: monitor
+        # only when the door actually enqueued (a failed/timeout seed leaves
+        # nothing to monitor — verify takes the no-epoch path instead)
+        if: steps.seed.outputs.enqueued == 'true'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: node e2e/staged/monitor.mjs
+
+  # ---------------------------------------------------------------- verify --
+  verify:
+    needs: [run]
+    # always(): the stuck-detector — it must run on a failed/timed-out run
+    # job too. Skipped entirely when the gate skipped or the seed never
+    # landed a reopen (nothing to assert; teardown takes the F3 green-skip).
+    if: >-
+      always()
+      && needs.gate.outputs.proceed == 'true'
+      && needs.run.outputs.seeded == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      verdict: ${{ steps.verify.outputs.verdict }}
+      deferred: ${{ steps.verify.outputs.deferred }}
+      stuck: ${{ steps.verify.outputs.stuck }}
+      redClass: ${{ steps.verify.outputs.redClass }}
+      failed: ${{ steps.verify.outputs.failed }}
+      wallMin: ${{ steps.verify.outputs.wallMin }}
+      tasks: ${{ steps.verify.outputs.tasks }}
+      assertsPassed: ${{ steps.verify.outputs.assertsPassed }}
+      assertsTotal: ${{ steps.verify.outputs.assertsTotal }}
+      watchdogGreen: ${{ steps.verify.outputs.watchdogGreen }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify (the A1–A12 assertion pass)
+        id: verify
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_STARTED_AT: ${{ github.run_started_at }}
+          WORKER_REPO_2: ${{ vars.WORKER_REPO_2 || '' }}
+          DRILL_MMDD: ${{ needs.run.outputs.mmdd || '' }}
+        run: node e2e/staged/verify.mjs
+
+      - name: Upload the drill report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staged-drill-report-${{ github.run_id }}
+          path: e2e/staged/last-staged-report.json
+          if-no-files-found: ignore   # a hard reader crash still uploads nothing — the RED page carries that
+
+  # --------------------------------------------------------------- teardown --
+  teardown:
+    # s23 fix: [gate, run, verify] — GHA job outputs are ONLY readable for
+    # DIRECT needs members; the old [verify] left needs.run.outputs.seeded
+    # EMPTY in the teardown (RUN_SEEDED='' — the seed-no-output
+    # misclassification on a seed that ACTUALLY ran, which then skipped the
+    # §4.2 stuck-recovery reset on a live epoch).
+    needs: [gate, run, verify]
+    # always(): cleanup + the page-once RED lane must run on a failed verify
+    # AND on a failed GATE (the read-RED class pages HERE — §1.3 "it pages").
+    if: >-
+      always()
+      && (needs.gate.outputs.proceed == 'true' || needs.gate.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Teardown (close + marker/RED page + stuck-recovery)
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GH_TOKEN: ${{ github.token }}
+          WORKER_REPO_2: ${{ vars.WORKER_REPO_2 || '' }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          GATE_SKIP_REASON: ${{ needs.gate.outputs.skipReason || '' }}
+          RUN_RESULT: ${{ needs.run.result }}
+          RUN_SEEDED: ${{ needs.run.outputs.seeded || '' }}
+          RUN_HALTED: ${{ needs.run.outputs.halted || '' }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          VERIFY_VERDICT: ${{ needs.verify.outputs.verdict || '' }}
+          VERIFY_DEFERRED: ${{ needs.verify.outputs.deferred || '' }}
+          VERIFY_STUCK: ${{ needs.verify.outputs.stuck || '' }}
+          VERIFY_RED_CLASS: ${{ needs.verify.outputs.redClass || '' }}
+          VERIFY_FAILED: ${{ needs.verify.outputs.failed || '' }}
+          VERIFY_WALL_MIN: ${{ needs.verify.outputs.wallMin || '' }}
+          VERIFY_TASKS: ${{ needs.verify.outputs.tasks || '' }}
+          VERIFY_ASSERTS_PASSED: ${{ needs.verify.outputs.assertsPassed || '' }}
+          VERIFY_ASSERTS_TOTAL: ${{ needs.verify.outputs.assertsTotal || '' }}
+          VERIFY_WATCHDOG: ${{ needs.verify.outputs.watchdogGreen || '' }}
+          DRILL_MMDD: ${{ needs.run.outputs.mmdd || '' }}
+        run: node e2e/staged/teardown.mjs

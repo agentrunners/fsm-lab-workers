@@ -33,9 +33,10 @@
 //                 -> exactly ONE dispatch per task (the C-2 pin) -> the
 //                 mirror run in bucket 2 -> the union verify scan sees it
 //                 (the C-1 pin).
-//   recovery      corrupt tip -> watchdog alert -> law-20 >20-comments
-//                 pagination break characterized (the a3/A2 duplicate alert)
-//                 -> history-walk heal -> healthy scan.
+//   recovery      corrupt tip -> watchdog alert -> the A-2 law-20 residual
+//                 characterized at its >100-in-window boundary (bounded
+//                 one-extra-alert; the <=100 zone protected — s22/M-2) ->
+//                 history-walk heal -> healthy scan.
 //
 // The DRILL-REPORT: per-phase PASS/FAIL + per-hop latencies (dispatch->run
 // start, run wall) + scheduler capacity metrics (criterion 4's cadence
@@ -87,6 +88,11 @@ const { createWorld } = await import('./lib/world.mjs');
 const { createScheduler } = await import('./lib/scheduler.mjs');
 const { genesis } = await import('../lib/fsm.mjs');
 const { Store } = await import('../lib/store.mjs');
+// s22/M-2: the watchdog's REAL comments-fetch path — the LAW20-PAGINATION
+// phase fetches through the EXACT path the live scan builds (per_page=100 +
+// since=<window floor>), imported from the module under test, never a
+// re-derived twin.
+const { alertCommentsPath } = await import('../lib/watchdog-core.mjs');
 
 const log = (msg) => console.log(`[drill] ${msg}`);
 
@@ -264,13 +270,6 @@ async function watchdogScan() {
   const run = sched.runWatchdogScan();
   await until(() => run.status === 'completed', { timeoutMs: 30_000, label: `watchdog run ${run.id}` });
   return sched.runLogText(run.id);
-}
-
-async function fetchCommentsPage(issueN) {
-  const r = await fetch(`${apiBase}/repos/local/fsm-lab/issues/${issueN}/comments?per_page=20&sort=created&direction=desc`, {
-    headers: { Authorization: 'token drill-job-token', Accept: 'application/vnd.github+json' },
-  });
-  return r.status === 200 ? await r.json() : [];
 }
 
 // =====================================================================================
@@ -493,8 +492,15 @@ async function runBudgetPause() {
   // the quota-storm shape). tick_min_interval_s=0 keeps the drill's ticks
   // unpaced (the >=25s rollover floor is an intake-epoch rule; a seeded epoch
   // keeps its own config).
+  // (s23 fix — the seed's lease: 2 was THE s22/B-1 trap value: the envelope
+  // deadline = min(2,48)min − 120s is ≤0 at mint, EVERY worker start-gate
+  // rejects 'late-start' (WORKER-GATE-REJECT in every run log), the reports
+  // carry error 'late-start' — NOT quota-shaped — so the F-6 window never
+  // populates, the pause never fires, and the chain burns its infra ladder
+  // to a degraded halt. The overflow scenario's seed was already floored to
+  // 3 for the same reason; this seed now matches it: floor 3.)
   const g = genesis({
-    config: { max_parallel: 4, lease_minutes: 2, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 4, lease_minutes: 3, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
     project: { tasks: TASKS.map((id) => ({ id, title: `quota storm ${id}`, behavior: 'infra', work_ms: 200, deps: [] })), milestones: 1 },
     chainId: 'c-drill-x23', now: new Date().toISOString(), mode: 'mock',
   });
@@ -585,8 +591,15 @@ async function runBudgetPause() {
     // THE C-3 PIN: the drained stragglers did NOT re-pause the chain
     await sleep(1500);
     t.ok((await readState()).state?.chain?.paused === false, 'NO RE-PAUSE: the straggler cohort does not re-trigger (the C-3 regression pin, live-observed 3x pre-fix)');
-    const alertPosts = ghapi.ledger().filter((e) => e.method === 'POST' && (/\/issues$/.test(e.path) || /\/comments$/.test(e.path)) && (e.req || '').includes('fsm-alert'));
-    t.ok(alertPosts.length <= 1, 'no second alert fired around the resume', `n=${alertPosts.length}`);
+    // (s23 assert-tune, the M-2 discipline: the old filter matched ANY
+    // '[fsm-alert]' body — which counts the POST-RESUME TAIL's quarantine +
+    // degraded-halt comments (the documented out-of-gates residual: round-3
+    // infra exhaustion after the C-3 gate, NOT-MODELED below) as "second
+    // alerts". The honest pin: the BUDGET alert's distinctive body — a
+    // re-pause would open/comment a SECOND 'Lane budget exhausted' alert;
+    // the round-3 quarantine comments are not budget alerts.)
+    const budgetAlertPosts = ghapi.ledger().filter((e) => e.method === 'POST' && (/\/issues$/.test(e.path) || /\/comments$/.test(e.path)) && /Lane budget exhausted/.test(String(e.req || '')));
+    t.ok(budgetAlertPosts.length <= 1, 'no second BUDGET alert fired around the resume (the C-3 gate holds)', `n=${budgetAlertPosts.length}`);
   });
 
   // teardown note: the post-resume grind (round-3 infra exhaustion ->
@@ -604,8 +617,12 @@ async function runOverflow() {
   // (done); OV-B runs 'hang' (silent by design — its lease stays outstanding
   // so the law-4 UNION scan has a live subject).
   sched.setVars({ WORKER_REPO_2: world.repo2, WORKER_OVERFLOW_AT: 1 });
+  // (s22/B-1 consequence — the seed's lease: 1 was THE trap value: the
+  // envelope deadline = min(1min,48) − 120s is −60s at mint, every worker
+  // start-gate rejects 'late-start', the epoch loops re-dispatch — the exact
+  // live verification lens-1 cited. The drill seeds a SANE chain: floor 3.)
   const g = genesis({
-    config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
+    config: { max_parallel: 2, lease_minutes: 3, max_attempts: 3, tick_min_interval_s: 0, dedup_window: 300 },
     project: { tasks: [
       { id: 'OV-A', title: 'main-lane task', behavior: 'fast', work_ms: 100, deps: [] },
       { id: 'OV-B', title: 'bucket-2 task', behavior: 'hang', work_ms: 100, deps: [] },
@@ -628,20 +645,30 @@ async function runOverflow() {
     const dispatchLedger = ghapi.ledger().filter((e) => e.method === 'POST' && /\/dispatches$/.test(e.path) && (e.req || '').includes('"fsm-task"'));
     t.ok(dispatchLedger.length === 2, 'exactly TWO worker dispatches (one per task)', `n=${dispatchLedger.length}`);
     // C-2: EXACTLY ONE dispatch per task — the same-payload double fire is dead
+    // (s22 assert-tune: the repo regex must match the TWO-SEGMENT slug —
+    // [^/]+ truncated 'local/fsm-lab' to 'local' and both lane asserts failed;
+    // the same class the orchestrator fixed in the stand-in's routes)
     const perTask = {};
     for (const d of dispatchLedger) {
       const task = /"task":"([^"]+)"/.exec(d.req || '')?.[1];
-      const repo = /\/repos\/([^/]+)\/dispatches/.exec(d.path)?.[1];
+      const repo = /\/repos\/([^/]+\/+[^/]+)\/dispatches/.exec(d.path)?.[1];
       perTask[task] = [...(perTask[task] || []), repo];
     }
     t.ok(Object.keys(perTask).length === 2 && Object.values(perTask).every((v) => v.length === 1),
       'C-2 PIN: exactly ONE dispatch per task (the double-dispatch is dead)', JSON.stringify(perTask));
     t.ok(perTask['OV-A']?.[0] === 'local/fsm-lab', 'OV-A dispatched on the MAIN lane');
     t.ok(perTask['OV-B']?.[0] === world.repo2, `OV-B dispatched PRE-FLIGHT to the SECOND bucket (${world.repo2})`);
-    const cRuns = sched.runs.filter((r) => r.workflow === 'conductor');
-    const lastLog = sched.runLogText(cRuns[cRuns.length - 1].id);
-    t.ok(/DISPATCH-OVERFLOW-PREFLIGHT task=OV-B/.test(lastLog), 'the pre-flight overflow decision logged');
-    t.ok(!/DISPATCH-OVERFLOW task=OV-B /.test(lastLog), 'NOT the saturated-ladder fallback (the pre-flight arm decided)');
+    // (s22 assert-tune: the decision line lives in the MANUAL tick's log — a
+    // one-shot read of the LAST conductor run races both the log's pipe
+    // delivery and the self-tick chain replacing "last"; poll ALL conductor
+    // logs for the line, and assert the saturated-ladder fallback appears in
+    // NONE of them)
+    const preflightLogged = await until(() => sched.runs.filter((r) => r.workflow === 'conductor')
+      .some((r) => /DISPATCH-OVERFLOW-PREFLIGHT task=OV-B/.test(sched.runLogText(r.id))), { timeoutMs: 30_000, label: 'the pre-flight decision log' });
+    t.ok(preflightLogged, 'the pre-flight overflow decision logged (DISPATCH-OVERFLOW-PREFLIGHT task=OV-B)');
+    const ladderFallback = sched.runs.filter((r) => r.workflow === 'conductor')
+      .some((r) => /DISPATCH-OVERFLOW task=OV-B /.test(sched.runLogText(r.id)));
+    t.ok(!ladderFallback, 'NOT the saturated-ladder fallback (the pre-flight arm decided)');
   });
 
   await phase('MIRROR-RUN', async (t) => {
@@ -653,33 +680,62 @@ async function runOverflow() {
     t.ok(!!aRun && aRun.repo === 'local/fsm-lab', "OV-A's run lives on the main lane");
     // the bucket-2 worker reported to the MAIN fsm-state (the TARGET_REPO geometry)
     t.ok((await readState()).state?.tasks?.['OV-A']?.status === 'done', 'the report routed to the MAIN fsm-state (mkTwoRepos geometry)');
+    // (s23 assert-tune — the seed-23 flake: a ONE-SHOT read of the hang
+    // worker's log races its dispatch latency + the stdout pipe delivery —
+    // OV-A's done-resolve can beat OV-B's START line by a few hundred ms
+    // (seeded ±20% latency jitter), and the empty log failed the assert on
+    // working machinery. Poll the run's OWN log for the start line — the
+    // s22 PREFLIGHT phase's pattern — then assert.)
+    await until(() => /WORKER-START task=OV-B behavior=hang/.test(sched.runLogText(bRun.id)), { timeoutMs: 30_000, label: "OV-B's hang-worker start line (WORKER-START task=OV-B behavior=hang)" });
     const wlogB = sched.runLogText(bRun.id);
     t.ok(/WORKER-START/.test(wlogB) && /behavior=hang/.test(wlogB), 'OV-B ran the hang behavior (silent — the lease deadline is the handler)');
   });
 
   await phase('UNION-VERIFY', async (t) => {
-    // law-4's verify scan: OV-B's lease is aged PAST the 360s pre-window via
-    // a drill fixture commit (a 6-minute REAL wall wait would price the drill
-    // out of CI; the scan path, the union fetch, and the key match are
-    // otherwise fully real — the documented simplification).
+    // law-4's verify scan: OV-B's lease is aged PAST the 360s pre-window AND
+    // past its deadline via a drill fixture commit (a 6-minute REAL wall wait
+    // would price the drill out of CI; the scan path, the union fetch, and
+    // the key match are otherwise fully real — the documented simplification).
+    // (s23 fix — the FAITHFUL aged lease: issued_at AND expires move
+    // together, expires = issued_at + lease_minutes. The old fixture
+    // backdated ONLY issued_at — an impossible lease state whose FRESH
+    // expires kept the deadline ~3min in the future, so the asserted
+    // TIMEOUT reap could never land inside the drill's window.)
     const st = new Store({ cwd: world.probeClone });
     await st.commit({
-      message: 'drill fixture: backdate OV-B lease issued_at (the law-4 pre-window)',
+      message: 'drill fixture: backdate OV-B lease issued_at+expires (the law-4 pre-window + the deadline)',
       mutate: (cur) => {
         const s = cur;
-        s.tasks['OV-B'].lease.issued_at = new Date(Date.now() - 400_000).toISOString();
+        const agedMs = Date.now() - 400_000;
+        s.tasks['OV-B'].lease.issued_at = new Date(agedMs).toISOString();
+        s.tasks['OV-B'].lease.expires = new Date(agedMs + (Number(s.config.lease_minutes) || 3) * 60_000).toISOString();
         s.version += 1;
         return { state: s, journal: [] };
       },
     });
     await postDispatch('fsm-tick', { reason: 'manual' });
-    await until(() => {
-      const cRuns = sched.runs.filter((r) => r.workflow === 'conductor');
-      return cRuns.length && cRuns[cRuns.length - 1].status === 'completed';
-    }, { timeoutMs: 60_000, label: 'the verify tick' });
-    const log = sched.runLogText(sched.runs.filter((r) => r.workflow === 'conductor').slice(-1)[0].id);
+    // (s23 fix — the s21-class permanently-falsy gate: "the LAST conductor
+    // run is completed" NEVER holds on a LIVE chain. The conductor POSTs its
+    // next self-tick dispatch BEFORE exiting, so the newest conductor run is
+    // queued/pending/in_progress from the moment the current run mints its
+    // continuation — the repro waited 60s while 30+ conductor runs completed
+    // (their END lines are in the drill log) and the predicate always read
+    // the PENDING successor. The honest gate — the PREFLIGHT phase's own
+    // pattern: the verify tick is the conductor run whose LOG carries the
+    // VERIFY-SCAN line; poll ALL conductor logs for it.)
+    const verifyRun = await until(() => sched.runs.filter((r) => r.workflow === 'conductor')
+      .find((r) => /VERIFY-SCAN repos=/.test(sched.runLogText(r.id))), { timeoutMs: 60_000, label: 'the verify tick (a conductor log carrying VERIFY-SCAN)' });
+    const log = sched.runLogText(verifyRun.id);
     t.ok(/VERIFY-SCAN repos=2/.test(log), 'C-1 PIN: the verify scan fetched BOTH buckets (the UNION)', (log.match(/VERIFY-SCAN.*/g) || []).join(' | '));
-    t.ok(/keys=1/.test(log) && !/VERIFY-FLIP task=OV-B/.test(log), 'the mirror run was SEEN (OV-B not flipped dispatch-unverified)');
+    // (s23 assert-tune: the union's honest page is runs=2 keys=2 — OV-A#a1
+    // from the MAIN bucket + OV-B#a1 from the MIRROR. The old keys=1
+    // encoded a main-only scan's view; the union exists precisely so BOTH
+    // buckets' run keys are seen.)
+    t.ok(/runs=2 keys=2/.test(log) && !/VERIFY-FLIP task=OV-B/.test(log), 'the mirror run was SEEN (both buckets\' keys on the page; OV-B not flipped dispatch-unverified)', (log.match(/VERIFY-SCAN.*/g) || []).join(' | '));
+    // the VERIFY-SCAN line prints PRE-COMMIT; the reap's TIMEOUT record
+    // lands with the SAME run's commit — wait for it explicitly (an
+    // immediate journal read raced the commit).
+    await until(async () => (await journalTail(40)).some((j) => j.kind === 'TIMEOUT' && j.task === 'OV-B'), { timeoutMs: 30_000, label: 'the reaped lease (TIMEOUT journal record)' });
     const jr = await journalTail(40);
     t.ok(!jr.some((j) => j.reason === 'dispatch-unverified' && j.task === 'OV-B'), 'no dispatch-unverified flip for the bucket-2 task');
     t.ok(jr.some((j) => j.kind === 'TIMEOUT' && j.task === 'OV-B'), 'the backdated lease was reaped by the clock (the documented backstop — the scan correctly did NOT flip)');
@@ -727,6 +783,19 @@ async function runRecovery() {
 
   let alertIssueN = null;
   await phase('LAW20-PAGINATION', async (t) => {
+    // s22/M-2: the phase now points at the A-2 RESIDUAL, not the fixed bug.
+    // The watchdog's marker fetch is per_page=100 + since=<now-24h>
+    // (alertCommentsPath — the s21/A-2 fix): the OLD phase flooded 21
+    // comments and asserted the duplicate alert the OLD per_page=20 fetch
+    // produced — asserting the PRE-fix bug against POST-fix machinery (the
+    // scan now SKIPS and the phase failed). The honest residual (documented
+    // at lib/watchdog-core.mjs alertCommentsPath): a >100-comments-updated-
+    // in-24h burst can still page the marker out of the single newest-100
+    // page — the fail direction is ONE extra alert comment, bounded and
+    // loud. The phase pins BOTH sides of that boundary on the watchdog's
+    // EXACT fetch path (alertCommentsPath imported from the real module —
+    // never a re-derived twin): <=100 in-window -> no dup; >100 -> exactly
+    // ONE extra alert; the next scan re-latches (bounded, no loop).
     alertIssueN = ghapi.issues('local/fsm-lab').find((it) => (it.labels || []).some((l) => l.name === 'fsm-watchdog-alert'))?.number;
     // scan #2: no marker exists yet -> this scan POSTS the marker comment (the
     // watchdog's own trusted marker)
@@ -735,21 +804,44 @@ async function runRecovery() {
     t.ok(/WATCHDOG-DONE mode=corrupt-state/.test(wlog2), 'scan #2 still sees the corrupt state');
     const after2 = ghapi.comments('local/fsm-lab', alertIssueN).length;
     t.ok(after2 === before + 1, 'scan #2 posted the marker comment (the first trusted marker)');
-    // the flood: 21 stranger comments AFTER the marker — law-20's page-1
-    // window (per_page=20, newest first) now HIDES the marker
-    for (let i = 1; i <= 21; i++) {
+    // the watchdog's OWN fetch path: per_page=100 + since=<now-24h>
+    const wdPage = async () => {
+      const r = await fetch(`${apiBase}${alertCommentsPath('local/fsm-lab', alertIssueN, Date.now())}`, {
+        headers: { Authorization: 'token drill-job-token', Accept: 'application/vnd.github+json' },
+      });
+      return r.status === 200 ? await r.json() : [];
+    };
+    // ---- the PROTECTED side of the boundary: 100 in-window (marker + 99) ----
+    // flood to JUST under the page size: the marker stays inside the newest-100
+    for (let i = 1; i <= 99; i++) {
       ghapi.addComment('local/fsm-lab', alertIssueN, { body: `+1 seeing this too (#${i})`, token: ghapi.addStrangerToken(`stranger-${i}`) });
     }
-    const page1 = await fetchCommentsPage(alertIssueN);
-    t.ok(page1.length === 20 && page1.every((c) => c.user.login.startsWith('stranger-')),
-      'law-20 REPRODUCED: the newest 20 hide the marker (single-page fetch, no Link walk)');
-    // scan #3: the dedup CANNOT see the trusted marker -> the characterized
-    // duplicate alert (a3/A2 — pinned-as-accepted at test-watchdog-core.mjs:179;
-    // this drill is its e2e regression pin)
+    const pageAt100 = await wdPage();
+    t.ok(pageAt100.length === 100 && pageAt100.some((c) => (c.body || '').includes('[fsm-watchdog]')),
+      'A-2 PROTECTED: at exactly 100 in-window comments the trusted marker is STILL on the fetched page (since= filters nothing fresh; per_page=100 holds it)');
+    const wlog25 = await watchdogScan();
+    t.ok(/WATCHDOG-ALERT-SKIP/.test(wlog25), 'scan #2.5 SKIPS: no duplicate alert at <=100 in-window comments (the fixed law-20 break)');
+    t.ok(ghapi.comments('local/fsm-lab', alertIssueN).length === 100, 'the skip posted NOTHING (the comment count holds at 100)');
+    // ---- the RESIDUAL side: >100 in-window pages the OLDEST (the marker) out ----
+    for (let i = 100; i <= 101; i++) {
+      ghapi.addComment('local/fsm-lab', alertIssueN, { body: `+1 seeing this too (#${i})`, token: ghapi.addStrangerToken(`stranger-${i}`) });
+    }
+    const pageAt102 = await wdPage();
+    t.ok(pageAt102.length === 100 && pageAt102.every((c) => !((c.body || '').includes('[fsm-watchdog]'))),
+      'A-2 RESIDUAL REPRODUCED: at 102 in-window comments the newest-100 page EXCLUDES the marker (single-page fetch, no Link walk)');
+    // scan #3: the dedup CANNOT see the trusted marker -> the documented
+    // ONE-extra-alert (fail-noisy, bounded; pinned-as-accepted at
+    // lib/watchdog-core.mjs alertCommentsPath's comment — this drill is its
+    // e2e regression pin)
     const wlog3 = await watchdogScan();
-    t.ok(!/WATCHDOG-ALERT-SKIP/.test(wlog3), 'scan #3 did NOT skip (the marker is past page 1 — the law-20 break)');
+    t.ok(!/WATCHDOG-ALERT-SKIP/.test(wlog3), 'scan #3 did NOT skip (the marker is past the newest-100 page — the >100 residual)');
     const after3 = ghapi.comments('local/fsm-lab', alertIssueN).length;
-    t.ok(after3 === 23, 'the DUPLICATE alert comment landed (the characterized bug, now drillable)', `comments=${after3}`);
+    t.ok(after3 === 103, 'the ONE extra alert comment landed (102 + 1 — the bounded residual, not a loop)', `comments=${after3}`);
+    // ---- BOUNDEDNESS: the fresh scan-3 marker is the NEWEST comment -> the
+    // next scan re-latches; the residual costs ONE alert, not one per scan
+    const wlog4 = await watchdogScan();
+    t.ok(/WATCHDOG-ALERT-SKIP/.test(wlog4), 'scan #4 SKIPS again (the new marker is fresh + on-page — the residual is BOUNDED)');
+    t.ok(ghapi.comments('local/fsm-lab', alertIssueN).length === 103, 'the count HOLDS at 103 (no second extra alert)');
   });
 
   await phase('HEAL', async (t) => {
@@ -809,9 +901,9 @@ const NOT_MODELED = [
   'runner cold-start, minute quotas, and cross-repo contention beyond the modeled repo-wide ParallelCap(5)',
   'real authn/authz (the stand-in trusts its minted tokens; the door\'s permission classes are scenario data, not GitHub\'s)',
   'the paid LLM lane (the cc lane runs the real adapter + bridge + spawn boundary against the deterministic fake CLI; no OpenRouter bytes move)',
-  'law-4\'s 360s pre-window is backdated by a drill fixture commit in the overflow scenario (a 6-minute real wait is priced out of CI; the scan path, the union fetch and the key match are fully real)',
+  'law-4\'s 360s pre-window (and the lease deadline) is backdated by a drill fixture commit in the overflow scenario — issued_at AND expires move together, the faithful aged-lease shape (a 6-minute real wait is priced out of CI; the scan path, the union fetch and the key match are fully real)',
   'the budget-pause post-resume tail (round-3 infra exhaustion -> degraded halt or backstop re-pause) is timing-dependent across ticks; the drill\'s gates end at the C-3 characterization — that tail is pinned deterministically by sim4/test-budget',
-  'pagination beyond law-20\'s single newest-20 page (no Link headers; the adapters never walk them either — that IS the characterized bug)',
+  'pagination beyond the A-2 fetch contract: the stand-in implements since= (server semantics) but serves ONE newest-per_page page, no Link headers — a >100-comments-updated-in-24h burst pages the trusted marker out and costs ONE extra alert comment (bounded, fail-noisy; the recovery drill pins both sides of the boundary)',
   'issue/PR webhooks, check-runs, artifacts API, merge/close flows (the pull stand-in opens and stamps; nobody merges)',
 ];
 

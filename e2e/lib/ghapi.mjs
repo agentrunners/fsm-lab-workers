@@ -192,7 +192,16 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
       const repo = decodeURIComponent(m[1]);
       const wf = decodeURIComponent(m[2]);
       if (!/^(conductor|worker)\.yml$/.test(wf)) return send(404, { message: 'Not Found' });
-      let runs = runsProvider ? runsProvider(repo, wf) : [];
+      // (s23 fix — the workflow-name vocabulary: the URL carries the workflow
+      // FILE id ('worker.yml' — GitHub's API shape), but the scheduler's run
+      // ledger keys runs by the bare workflow NAME ('worker'). The old pass-
+      // through matched NOTHING: every runs page served an EMPTY array, so
+      // the law-4 union scan fetched "both buckets" and saw ZERO runs
+      // forever (runs=0 keys=0 — the fail-open design masked it: no flips,
+      // green-looking no-flip asserts on an empty scan). Normalize here —
+      // the ROUTE knows the URL shape; the provider contract stays
+      // "ledger runs for workflow <name>".)
+      let runs = runsProvider ? runsProvider(repo, wf.replace(/\.yml$/, '')) : [];
       const created = q.get('created');
       if (created) {
         // the law-4 created>= floor (encoded '>=<ISO>')
@@ -244,17 +253,32 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
     }
 
     // GET /repos/:repo/issues/:n/comments — LAW-20: one page, newest first.
-    // s22/journal-flood (stress battery 4): `since=<ISO>` — the s21/A-2
-    // fix's SERVER half — filters by updated_at BEFORE the page slice, so a
-    // fresh marker can never fall off the page while >20 comments
-    // accumulate (the paginated dedup break). Unparseable since leaves the
-    // list unfiltered (fail-open, server tolerance). The no-since fetch is
-    // UNCHANGED — the recovery drill's law-20 reproduction stays intact.
+    // s22/M-2(a) + s22/journal-flood (stress battery 4): `since=<ISO>` is
+    // IMPLEMENTED (the s21/A-2 fix's SERVER half) — comments with
+    // updated_at < since are filtered OUT server-side BEFORE the
+    // newest-per_page slice, exactly what the watchdog's alertCommentsPath
+    // (per_page=100 + since=<now-24h>) relies on: a fresh marker can never
+    // fall off the page while >20 comments accumulate (the paginated dedup
+    // break). Unparseable since leaves the list unfiltered (fail-open,
+    // server tolerance). The stand-in's comments are never edited, so
+    // updated_at === created_at; the filter reads the internal created_at.
+    // The no-since fetch is UNCHANGED — the recovery drill's law-20
+    // reproduction stays intact.
     m = /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/.exec(path);
     if (m && req.method === 'GET') {
       const st = repoState(decodeURIComponent(m[1]));
       const n = parseInt(m[2], 10);
-      const all = st.comments.get(n) || [];
+      let all = st.comments.get(n) || [];
+      const sinceRaw = q.get('since');
+      if (sinceRaw) {
+        const sinceMs = Date.parse(sinceRaw);
+        if (Number.isFinite(sinceMs)) {
+          all = all.filter((c) => {
+            const upd = Date.parse(c.updated_at ?? c.created_at);
+            return !Number.isFinite(upd) || upd >= sinceMs;   // unparseable stays (fail-open, the seenKeys convention)
+          });
+        }
+      }
       const perPage = Math.max(1, parseInt(q.get('per_page') || '30', 10) || 30);
       // sort=created&direction=desc: GitHub serves the NEWEST per_page first;
       // anything older is past page 1 — the pagination the adapters never walk.

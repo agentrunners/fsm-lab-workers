@@ -106,7 +106,7 @@ const commentEvent = ({ issue = 1, nodeId = 'IC_node_123456', body = 'pause', au
 // s21/O-5: `permissionStatuses` (consumed one per permission call — the
 // transient/verdict sequences) and `permissionThrows` (network-level throws
 // on the first N permission calls) joined the knobs.
-function mkApi({ permission = 'write', permissionStatus = 200, permissionStatuses = null, permissionThrows = 0, commentStatus = 201, dispatchStatus = 204 } = {}) {
+function mkApi({ permission = 'write', permissionStatus = 200, permissionStatuses = null, permissionThrows = 0, permissionRetryAfter = null, commentStatus = 201, dispatchStatus = 204 } = {}) {
   const calls = [];
   let permCall = 0;
   const api = async (path, method = 'GET', body = null) => {
@@ -115,7 +115,11 @@ function mkApi({ permission = 'write', permissionStatus = 200, permissionStatuse
       const n = permCall++;
       if (n < permissionThrows) throw new Error('network down (injected)');
       const st = permissionStatuses ? permissionStatuses[n] : permissionStatus;
-      return { status: st ?? permissionStatus, data: st === 200 ? { permission } : null };
+      // s22/m-5: the secondary-rate-limit shape — 403 WITH a Retry-After
+      // header rides the return ONLY when the knob opts in (the api seam
+      // carries it; a bare 403 stays the definitive stranger verdict)
+      const retryAfter = permissionRetryAfter != null ? String(permissionRetryAfter) : undefined;
+      return { status: st ?? permissionStatus, data: st === 200 ? { permission } : null, ...(retryAfter ? { retryAfter } : {}) };
     }
     if (path.endsWith('/comments') && method === 'POST') {
       return { status: commentStatus, data: { id: 555 } };
@@ -336,6 +340,53 @@ test('permission gate (s21/O-5): a transient 5xx retries ONCE — still failing 
   assert.equal(calls.filter(c => c.method === 'POST').length, 0, 'no reply burned on an unverified author');
   const permCalls = calls.filter(c => c.path.endsWith('/permission'));
   assert.equal(permCalls.length, 2, 'exactly ONE retry (the nudge\'s single-retry pattern)');
+});
+
+// s22/m-5: 429 and the GH secondary-rate-limit shape (403 + Retry-After)
+// are TRANSIENT — the old isTransient returned them definitive, so a
+// rate-limited permission GET read as 'unverified' and the console went
+// CONSOLE-SILENT on a healthy operator's command. A BARE 403 (no header)
+// stays the definitive stranger verdict — the retry knob opts in the shape.
+test('permission gate (s22/m-5): 429 and 403+Retry-After are TRANSIENT (retried); a bare 403 stays definitive', async () => {
+  // 429 twice → undecided red, two calls (the transient class)
+  {
+    const { api, calls } = mkApi({ permissionStatuses: [429, 429] });
+    const { store, writes } = mkStore();
+    const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+    assert.equal(r.outcome, 'permission-check-failed', 'a rate-limited GET is never a stranger verdict');
+    assert.equal(r.exitCode, 4);
+    assert.equal(writes.length, 0);
+    assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 2, 'the 429 retried once');
+  }
+  // 403 WITH Retry-After twice → transient (the secondary-limit shape)
+  {
+    const { api, calls } = mkApi({ permissionStatuses: [403, 403], permissionRetryAfter: 30 });
+    const { store, writes } = mkStore();
+    const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+    assert.equal(r.outcome, 'permission-check-failed', 'the secondary-rate-limit 403 retries, never silent-stranger');
+    assert.equal(r.exitCode, 4);
+    assert.equal(writes.length, 0);
+    assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 2, 'the 403+Retry-After retried once');
+  }
+  // a BARE 403 (no Retry-After) → the definitive stranger verdict, ONE call
+  {
+    const { api, calls } = mkApi({ permissionStatuses: [403, 403] });
+    const { store, writes } = mkStore();
+    const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+    assert.equal(r.outcome, 'silent-permission', 'a bare 403 is still the stranger path — fail-closed, no retry burn');
+    assert.equal(r.exitCode, 0);
+    assert.equal(writes.length, 0);
+    assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 1, 'definitive — exactly ONE call');
+  }
+  // the transient shape that RECOVERS: 429 then 200 → the command proceeds
+  {
+    const { api, calls } = mkApi({ permissionStatuses: [429, 200] });
+    const { store, writes } = mkStore();
+    const r = await runConsole({ event: commentEvent({ body: 'pause' }), env: ENV, api, store, now: NOW });
+    assert.equal(r.outcome, 'queued', 'the recovered rate-limit does not eat the command');
+    assert.equal(r.exitCode, 0);
+    assert.equal(calls.filter(c => c.path.endsWith('/permission')).length, 2);
+  }
 });
 
 test('permission gate (s21/O-5): a transient 5xx that RECOVERS on the retry → the command proceeds normally (the retry is not a penalty)', async () => {
@@ -593,6 +644,18 @@ test('epochSpend (pure): the newest applied reset bounds the epoch — pre-reset
   assert.equal(notBounded.turns, 1);
   // non-array input → the zero epoch (never a crash)
   assert.deepEqual(epochSpend(null), { cost: 0, tokens: 0, turns: 0, withTelemetry: 0 });
+  // s22/m-1: a to:'in_progress' REPORT is the worker's MID-FLIGHT start
+  // report (fsm.mjs:251 — it carries the SAME ...lane spread) — it is NOT a
+  // terminal turn and must not bill the epoch twice (once at in_progress,
+  // once at done)
+  const doubleBill = epochSpend([
+    { kind: 'REPORT', task: 'T1', to: 'in_progress', lane_stats: { calls: 1, ok: 1, tokens: 100, cost: 0.05 } },
+    { kind: 'REPORT', task: 'T1', to: 'done', lane_stats: { calls: 1, ok: 1, tokens: 100, cost: 0.05 } },
+    { kind: 'REPORT', task: 'T2', to: 'done' },
+  ]);
+  assert.equal(doubleBill.turns, 2, 'the in_progress start-report is NOT a turn — only the two terminal reports count');
+  assert.equal(doubleBill.cost, 0.05, 'the turn bills ONCE (the in_progress lane_stats copy excluded — the double-bill is dead)');
+  assert.equal(doubleBill.withTelemetry, 1);
 });
 
 test('status (s21/O-1): the EPOCH economics line renders from readJournals — read-only kept, the three ceiling states', async () => {
