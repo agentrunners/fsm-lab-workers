@@ -39,7 +39,7 @@
 // outputs the teardown consumes. Exit 0 on GREEN/DEFERRED, 1 on RED.
 
 import { Store } from '../../lib/store.mjs';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { api, emitOutput, emitSummary, epochSegment, repoName, retryAsync, toMs } from './lib.mjs';

@@ -94,6 +94,17 @@ async function openAlertIssue(body) {
     // issue passed 20 (the latch's own use case), the newest marker fell out
     // of the fetched set, and the skip never fired again: ~12 dup
     // alerts/day for the incident's duration.
+    // s22/FLIP-ME (journal-flood's mutation-verified characterization pin):
+    // replace the path below with the OLD shape —
+    //   api(`/repos/${REPO}/issues/${existing.number}/comments?` + 'per_page=20' + '&sort=created&direction=desc', 'GET')
+    // (the string is split so the source-shape pin below stays green — the
+    // pin greps for the literal blind URL, and a mutation INSTRUCTION is
+    // not the mutation itself; join the two halves when flipping)
+    // or equivalently comment out the `since` append in
+    // lib/watchdog-core.mjs alertCommentsPath — and stress/batteries/
+    // journal-flood.mjs's `pagination: with the A-2 since= fix` pin FAILS
+    // (duplicate_alerts_with_since_fix 0 -> ~1/scan: the counterfactual the
+    // battery prints as duplicate_alerts_old_path). Revert after the check.
     const r = await api(alertCommentsPath(REPO, existing.number, Date.now()), 'GET');
     const dedup = alertDedup({ comments: r.data || [], nowMs: Date.now() });
     if (dedup.skip) {

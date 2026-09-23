@@ -721,3 +721,78 @@ test('seed: the DORMANT full mix renders but today\'s single-task door rejects i
   assert.equal(verdict.ok, false, 'the dormant mix does NOT pass today\'s door');
   assert.ok(verdict.errors.some((e) => /duplicate key `id`/.test(e)));
 });
+
+// ---------------------------------------------------------------------------
+// s23 (the stage-0 first-green catch — the runner-only bug class): verify.mjs
+// used fileURLToPath at its report-writer path (line 527) without importing
+// it — the unit pins test the PURE functions, and the invokedAsMain guard
+// means the CLI-entry path never runs under `node --test`. The runner's
+// verify job died with "fileURLToPath is not defined". THE FAMILY GUARD:
+// every node:url built-in used in the staged driver family must be imported
+// in THAT file (a generic guard for the whole e2e/staged/ dir — the same
+// class would recur in any driver).
+// ---------------------------------------------------------------------------
+test('s23/url-imports (source shape): every fileURLToPath/pathToFileURL usage in e2e/staged/*.mjs carries its node:url import', async () => {
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const REPO_ROOT = join(import.meta.dirname, '..');
+  const dir = join(REPO_ROOT, 'e2e', 'staged');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.mjs'));
+  assert.ok(files.length >= 6, `the staged driver family is present (${files.length} files)`);
+  for (const f of files) {
+    const src = fs.readFileSync(join(dir, f), 'utf8');
+    const usesFileURL = /\bfileURLToPath\s*\(/.test(src);
+    const usesPathToFile = /\bpathToFileURL\s*\(/.test(src);
+    if (!usesFileURL && !usesPathToFile) continue;
+    const m = src.match(/import\s*\{([^}]*)\}\s*from\s*'node:url'/);
+    assert.ok(m, `${f} uses node:url builtins but has no node:url import`);
+    const imported = m[1].split(',').map(s => s.trim()).filter(Boolean);
+    if (usesFileURL) assert.ok(imported.includes('fileURLToPath'), `${f} uses fileURLToPath without importing it (the stage-0 runner catch)`);
+    if (usesPathToFile) assert.ok(imported.includes('pathToFileURL'), `${f} uses pathToFileURL without importing it`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// s23 (the stage-0 first-green catch #2 — the needs-chain + red-family gaps):
+// the teardown job read needs.run.outputs.seeded EMPTY (GHA outputs are only
+// readable for DIRECT needs members — the old needs:[verify] hid run's
+// outputs) → the seed-no-output misclassification on a seed that ACTUALLY
+// ran → the §4.2 stuck-recovery reset SKIPPED on a live epoch. Two pins:
+// the workflow's needs array carries run (source-shape on the YAML), and
+// the red-family arm condition (the pure composition).
+// ---------------------------------------------------------------------------
+test('s23/stage-0 catch #2 (source shape): the teardown job NEEDS the run job (needs.run.outputs.* readable)', async () => {
+  const fs = await import('node:fs');
+  const { join } = await import('node:path');
+  const REPO_ROOT = join(import.meta.dirname, '..');
+  const yamlSrc = fs.readFileSync(join(REPO_ROOT, '.github', 'workflows', 'staged-drill.yml'), 'utf8');
+  const m = yamlSrc.match(/^  teardown:\n(?:    #.*\n)*    needs:\s*\[([^\]]+)\]/m);
+  assert.ok(m, 'the teardown job has a needs array');
+  const needs = m[1].split(',').map(s => s.trim());
+  assert.ok(needs.includes('run'), `the teardown needs run (GHA outputs are direct-needs-only; got [${needs.join(', ')}])`);
+  assert.ok(needs.includes('gate') && needs.includes('verify'), 'the teardown still needs gate + verify (the page-once lanes)');
+});
+
+test('s23/stage-0 catch #2: the RED FAMILY fires the stuck-recovery — seed-no-output with a LIVE epoch is the stuck shape', async () => {
+  const { teardownDecision, RED_FAMILY_ACTIONS, nonTerminalState } = await import('../e2e/staged/teardown.mjs');
+  // the exact first-green shape: the seed RAN but RUN_SEEDED read empty
+  const dec = teardownDecision({ gateResult: 'success', seeded: '', verdict: 'RED' });
+  assert.equal(dec.action, 'seed-no-output');
+  assert.ok(RED_FAMILY_ACTIONS.has(dec.action), 'seed-no-output is in the red family (the stuck-recovery arm fires)');
+  // the live-epoch state (phase executing, 1 task assigned — the actual 02:54Z shape)
+  const liveState = {
+    chain: { halted: false },
+    project: { phase: 'executing' },
+    tasks: { 'T-STG-H-0923': { status: 'assigned' } },
+  };
+  assert.equal(nonTerminalState(liveState), true, 'a live mid-flight epoch is non-terminal');
+  // the composition: family + non-terminal => the reset dispatches
+  assert.ok(RED_FAMILY_ACTIONS.has(dec.action) && nonTerminalState(liveState),
+    'the §4.2 arm condition (family x non-terminal) is TRUE for the caught shape');
+  // the negative controls: green/deferred/seed-skip NEVER fire the arm
+  for (const a of ['green', 'deferred', 'seed-skip']) {
+    assert.ok(!RED_FAMILY_ACTIONS.has(a), `${a} never fires the stuck-recovery`);
+  }
+  // and a terminal chain under a red action does not either
+  assert.equal(nonTerminalState({ chain: { halted: true }, project: { phase: 'done' }, tasks: { t: { status: 'done' } } }), false);
+});

@@ -19,3 +19,8 @@ e2e/out/
 # durable evidence copies live in the worklog/EVIDENCE discipline, not git.
 e2e/last-drill-report.json
 stress/last-stress-report.json
+
+# s22/stress (batteries 4-6): the runner's --json output dir — run artifacts,
+# not source (the m-10 discipline; the durable evidence lives in the
+# worklog/report files).
+stress/out/

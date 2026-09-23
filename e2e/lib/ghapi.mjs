@@ -56,7 +56,7 @@ import { join } from 'node:path';
 // prompt cap + envelope overhead with room to spare.)
 const SLICE = 32_768;
 
-export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 'write', log = () => {} } = {}) {
+export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 'write', log = () => {}, now = null } = {}) {
   const ACTORS = new Map(Object.entries({
     'drill-job-token': { login: 'github-actions[bot]', type: 'Bot', assoc: 'NONE' },
     'drill-pat': { login: 'fsm-pat-bot', type: 'User', assoc: 'OWNER' },
@@ -103,7 +103,11 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
     return defaultPermissionClass;
   };
 
-  const nowIso = () => new Date().toISOString();
+  // s22/journal-flood (stress battery 4): the injected virtual clock — an
+  // iso-string fn. Unset = real wall clock (the drill's shape,
+  // byte-identical). Mirrors the T1 clock-injection discipline at the
+  // adapter boundaries.
+  const nowIso = typeof now === 'function' ? () => now() : () => new Date().toISOString();
 
   const recLedger = (entry) => {
     ledger.push(entry);
@@ -123,7 +127,7 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
   });
 
   const commentJson = (c) => ({
-    id: c.id, body: c.body, created_at: c.created_at, updated_at: c.created_at,
+    id: c.id, body: c.body, created_at: c.created_at, updated_at: c.updated_at || c.created_at,
     user: { login: c.user, type: c.userType },
     author_association: c.assoc,
     html_url: `https://github.test/x/issues/${c.id}`,
@@ -188,7 +192,16 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
       const repo = decodeURIComponent(m[1]);
       const wf = decodeURIComponent(m[2]);
       if (!/^(conductor|worker)\.yml$/.test(wf)) return send(404, { message: 'Not Found' });
-      let runs = runsProvider ? runsProvider(repo, wf) : [];
+      // (s23 fix — the workflow-name vocabulary: the URL carries the workflow
+      // FILE id ('worker.yml' — GitHub's API shape), but the scheduler's run
+      // ledger keys runs by the bare workflow NAME ('worker'). The old pass-
+      // through matched NOTHING: every runs page served an EMPTY array, so
+      // the law-4 union scan fetched "both buckets" and saw ZERO runs
+      // forever (runs=0 keys=0 — the fail-open design masked it: no flips,
+      // green-looking no-flip asserts on an empty scan). Normalize here —
+      // the ROUTE knows the URL shape; the provider contract stays
+      // "ledger runs for workflow <name>".)
+      let runs = runsProvider ? runsProvider(repo, wf.replace(/\.yml$/, '')) : [];
       const created = q.get('created');
       if (created) {
         // the law-4 created>= floor (encoded '>=<ISO>')
@@ -239,14 +252,18 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
       return send(201, issueJson(repo, it));
     }
 
-    // GET /repos/:repo/issues/:n/comments — LAW-20: one page, newest first
-    // s22/M-2(a): `since` is IMPLEMENTED (the A-2 server semantics): when the
-    // query param is present, comments with updated_at < since are filtered
-    // OUT server-side BEFORE the newest-per_page slice — exactly what the
-    // watchdog's alertCommentsPath (per_page=100 + since=<now-24h>) relies
-    // on. The stand-in's comments are never edited, so updated_at ===
-    // created_at (commentJson renders both); the filter reads the internal
-    // created_at.
+    // GET /repos/:repo/issues/:n/comments — LAW-20: one page, newest first.
+    // s22/M-2(a) + s22/journal-flood (stress battery 4): `since=<ISO>` is
+    // IMPLEMENTED (the s21/A-2 fix's SERVER half) — comments with
+    // updated_at < since are filtered OUT server-side BEFORE the
+    // newest-per_page slice, exactly what the watchdog's alertCommentsPath
+    // (per_page=100 + since=<now-24h>) relies on: a fresh marker can never
+    // fall off the page while >20 comments accumulate (the paginated dedup
+    // break). Unparseable since leaves the list unfiltered (fail-open,
+    // server tolerance). The stand-in's comments are never edited, so
+    // updated_at === created_at; the filter reads the internal created_at.
+    // The no-since fetch is UNCHANGED — the recovery drill's law-20
+    // reproduction stays intact.
     m = /^\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)\/comments$/.exec(path);
     if (m && req.method === 'GET') {
       const st = repoState(decodeURIComponent(m[1]));
@@ -265,7 +282,18 @@ export function createGhapi({ scratchDir, tokens = {}, defaultPermissionClass = 
       const perPage = Math.max(1, parseInt(q.get('per_page') || '30', 10) || 30);
       // sort=created&direction=desc: GitHub serves the NEWEST per_page first;
       // anything older is past page 1 — the pagination the adapters never walk.
-      const sorted = [...all].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+      const since = q.get('since');
+      let filtered = all;
+      if (since) {
+        const sinceMs = Date.parse(since);
+        if (Number.isFinite(sinceMs)) {
+          filtered = all.filter((c) => {
+            const u = Date.parse(c.updated_at || c.created_at || '');
+            return !Number.isFinite(u) || u >= sinceMs;
+          });
+        }
+      }
+      const sorted = [...filtered].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
       return send(200, sorted.slice(0, perPage).map(commentJson));
     }
 
