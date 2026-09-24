@@ -1,0 +1,28 @@
+{
+  "deepseek/deepseek-v4.1-flash": {
+    "ctx": 1000000,
+    "retries_req": 2,
+    "retries_stream": 2,
+    "idle_ms": 90000,
+    "price_in": 0.15,
+    "price_out": 0.60,
+    "price_cache_read": 0.003,
+    "peak": {
+      "multiplier": 2,
+      "hours_utc": [1, 2, 3, 4, 6, 7, 8, 9, 10],
+      "days_utc": [1, 2, 3, 4, 5],
+      "note": "VERIFIED live rates 0.15/0.60 $/1M in/out double on weekdays (Mon-Fri) in the 01-04 and 06-10 UTC windows; the cache-read rate (0.003) is NOT doubled (the addendum's verified-price note — the codex-harness config/models.json still carries the known-stale 0.10/0.50 entry; THIS table is the corrected single source)"
+    },
+    "fallback": "z-ai/glm-5.3-flash"
+  },
+  "z-ai/glm-5.3-flash": {
+    "ctx": 1310720,
+    "retries_req": 4,
+    "retries_stream": 5,
+    "idle_ms": 300000,
+    "price_in": 0.15,
+    "price_out": 0.50,
+    "price_cache_read": 0.05,
+    "fallback": "deepseek/deepseek-v4.1-flash"
+  }
+}
