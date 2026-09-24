@@ -9,7 +9,11 @@
 //         tasks + detail); the pause does NOT land in the trigger tick;
 //         aged-out window entries trimmed → no trigger; ONE task's repeats
 //         do not count-trigger; infra-exhausted backstop fires on the
-//         quota-detailed quarantine.
+//         quota-detailed quarantine. s25/A2-M1: the codex quota vocabulary
+//         (the bare codex-<class> lane details + the lane-exhausted terminus
+//         forms) arms BOTH the :758 window and the OR-backstop — and the
+//         codex dead-key/upstream classes deliberately do NOT (the lens-1
+//         F2 narrowing stands on the second engine).
 //   F-8   the alert action is the ADAPTER's to execute (here: its shape);
 //         the paused chain never re-triggers.
 //   F-7   pause payload.reason → paused_reason + budget_pauses; resume
@@ -251,6 +255,36 @@ test('F-6: a NON-quota infra report never touches the window (the classifier bou
   assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last dead-model-404)'), 'config (dead-model) exhaustion does not');
 });
 
+// s25/A2-M1 (the codex quota arm, unit boundary): the second engine's quota
+// vocabulary at the matcher itself. The codex lane detail is `codex-<class>`
+// (codexLaneOutcome's rotate detail, worker/codex-adapter.mjs:378) and the
+// lane-exhaustion terminus embeds the last class verbatim
+// (`lane-exhausted(n/m lanes, last codex-<class>)`, :867) — so the two
+// RATE/QUOTA classes must match in BOTH forms. The dead-key classes
+// (error_credits/error_auth) deliberately do NOT: the W-D lens-1 F2
+// narrowing was CORRECT for them (a 401/402-quarantined key's remedy is a
+// pool-secret SWAP, not a quota wait — the key-class JUMP + the turn-side
+// rotation recover within the turn); upstream (network), config
+// (model-400) and transient (in-flight-budget) stay out for the same
+// reason as their CC twins above.
+test('F-6 codex (s25/A2-M1): the codex quota classes match in BOTH forms; the dead-key/upstream classes do NOT', () => {
+  // the two quota classes — the bare lane-detail form (codex-adapter.mjs:378)
+  assert.ok(isQuotaDetail('codex-error_rate_limit'), 'the bare rate-limit lane detail arms');
+  assert.ok(isQuotaDetail('codex-error_quota_daily'), 'the bare daily-quota lane detail arms');
+  // ...and the lane-exhaustion terminus form (:867 embeds the last class verbatim)
+  assert.ok(isQuotaDetail('lane-exhausted(3/3 lanes, last codex-error_rate_limit)'), 'the rate-limit terminus arms (substring embedding, the lane-429 precedent)');
+  assert.ok(isQuotaDetail('lane-exhausted(2/4 lanes, last codex-error_quota_daily)'), 'the daily-quota terminus arms');
+  // the deliberate exclusions — dead-key (the lens-1 F2 narrowing stands on codex)
+  assert.ok(!isQuotaDetail('codex-error_credits'), 'credits-death (402) is a pool-secret swap, not a quota wait');
+  assert.ok(!isQuotaDetail('codex-error_auth'), 'dead-key auth (401) does NOT arm the budget window');
+  assert.ok(!isQuotaDetail('lane-exhausted(3/3 lanes, last codex-error_auth)'), 'a codex dead-key exhaustion terminus does not either');
+  assert.ok(!isQuotaDetail('lane-exhausted(2/4 lanes, last codex-error_credits)'), 'nor a credits-death terminus (the test-codex-adapter :188 shape)');
+  // ...and the rest of the codex rotatable vocabulary (upstream/config/transient)
+  assert.ok(!isQuotaDetail('codex-error_network'), 'upstream/transport stays infra-retry territory');
+  assert.ok(!isQuotaDetail('codex-error_model_400'), 'config (provider 400) does not arm');
+  assert.ok(!isQuotaDetail('codex-error_in_flight_budget'), 'the in-flight-budget transient does not arm');
+});
+
 // T46/W-D review fold (lens-1 F2) — the FALSE-PAUSE integration negative:
 // the full dead-key ladder (3 infra reports, detail = the 401 exhaustion
 // shape) parks the task infra-exhausted WITHOUT firing the OR-backstop or
@@ -274,6 +308,88 @@ test('F-6 false-pause (the fold, lens-1 F2): a 401-quarantined dead-key task doe
   assert.equal(st.tasks[id].status, 'quarantined', 'the infra ladder itself is flavor-agnostic — the task still parks');
   assert.equal(st.tasks[id].infra_attempts, 3);
   assert.ok(!Array.isArray(st.budget_window) || st.budget_window.length === 0, 'the budget window stayed EMPTY (no false quota entry)');
+});
+
+// s25/A2-M1 (the codex integration pins): the REAL trigger path driven with
+// codex-shaped infra reports — exactly how a codex epoch's quota wall would
+// arrive (the worker enqueues outcome.error = the codexTurn detail; the
+// quotaReport helper carries it in the same field). Both arms key through
+// isQuotaDetail in the live code: the window/count trigger at
+// conductor-core.mjs:758 (`oc.status === 'infra_failed' && isQuotaDetail(oc.error
+// ?? oc.detail)`) and the infra-exhausted OR-backstop at :769-770
+// (`exRec && isQuotaDetail(exRec.error)`). Until the s25 fix these codex
+// details never matched: the burn ran 3 full infra-retry re-turns per task
+// into infra-exhausted quarantine with NO pause and NO alert-first.
+test('F-6 codex (s25/A2-M1): 3 DISTINCT tasks with codex quota reports -> BUDGET_PAUSE_ALERT (the :758 window arm)', () => {
+  const s = assignedState({ max_parallel: 4 });
+  const ids = Object.values(s.tasks).filter(t => t.status === 'assigned').slice(0, 3).map(t => t.id);
+  assert.equal(ids.length, 3, 'fixture: 3 assigned tasks');
+  const n = makeNow(T0 + 60_000);
+  const out = conductorTick({
+    cur: structuredClone(s),
+    queue: ids.map((id, i) => quotaReport(s, id, i, 'codex-error_rate_limit')),
+    controlQueue: [], queueBad: [], ctlBad: [],
+    ev: tickEv('cx3'), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+  });
+  const alert = out.actions.find(a => a.type === 'BUDGET_PAUSE_ALERT');
+  assert.ok(alert, 'the codex quota wall arms the count-trigger (was: silent pre-s25)');
+  assert.deepEqual(new Set(alert.tasks), new Set(ids), 'the distinct task list');
+  assert.equal(alert.detail, 'codex-error_rate_limit', 'the codex detail rides the alert verbatim');
+  assert.equal(alert.backstop, false, 'count-trigger, not backstop');
+  assert.equal(out.state.budget_window.length, 3, 'the window persisted all three codex entries');
+  assert.deepEqual(invariants(out.state), []);
+});
+
+test('F-6 codex backstop (s25/A2-M1): the infra-exhausted quarantine with a codex lane-exhausted terminus fires the OR-backstop', () => {
+  // the terminus form `lane-exhausted(n/m lanes, last codex-error_quota_daily)`
+  // (codex-adapter.mjs:867) through the FULL ladder: 3 same-task reports →
+  // infra-exhausted quarantine → the :769-770 backstop fires IMMEDIATELY.
+  const s = assignedState({ max_parallel: 1 });
+  const id = Object.values(s.tasks).find(t => t.status === 'assigned').id;
+  const n = makeNow(T0 + 60_000);
+  let st = structuredClone(s);
+  let alert = null;
+  for (let i = 1; i <= 3; i++) {
+    const out = conductorTick({
+      cur: st,
+      queue: [quotaReport(st, id, `cx${i}`, 'lane-exhausted(4/4 lanes, last codex-error_quota_daily)')],
+      controlQueue: [], queueBad: [], ctlBad: [],
+      ev: tickEv(`cxb${i}`), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+    });
+    alert = out.actions.find(a => a.type === 'BUDGET_PAUSE_ALERT') || null;
+    st = out.state;
+    if (alert) break;
+  }
+  assert.ok(alert, 'the codex backstop fired (was: quarantine with no alert pre-s25)');
+  assert.equal(alert.backstop, true, 'labeled backstop');
+  assert.equal(st.tasks[id].status, 'quarantined', 'the ladder burned (infra-exhausted)');
+  assert.equal(st.tasks[id].infra_attempts, 3);
+  assert.equal(st.stats.budget_pauses, undefined, 'the pause stat lands with the SECOND commit (not the trigger)');
+});
+
+// s25/A2-M1 (the codex false-pause negative — the lens-1 F2 fold stands on
+// the second engine): a codex DEAD-KEY exhaustion terminus (last
+// codex-error_auth) parks the task infra-exhausted WITHOUT arming the
+// window or the OR-backstop — the operator remedy is a pool-secret swap,
+// not a quota wait.
+test('F-6 codex false-pause (s25/A2-M1): a codex dead-key terminus does NOT arm the window or the OR-backstop', () => {
+  const s = assignedState({ max_parallel: 1 });
+  const id = Object.values(s.tasks).find(t => t.status === 'assigned').id;
+  const n = makeNow(T0 + 60_000);
+  let st = structuredClone(s);
+  for (let i = 1; i <= 3; i++) {
+    const out = conductorTick({
+      cur: st,
+      queue: [quotaReport(st, id, `cxa${i}`, 'lane-exhausted(4/4 lanes, last codex-error_auth)')],
+      controlQueue: [], queueBad: [], ctlBad: [],
+      ev: tickEv(`cxa${i}`), now: n.now, nextMilestone: NM, recover: noRecover, makeGenesis,
+    });
+    assert.ok(!out.actions.some(a => a.type === 'BUDGET_PAUSE_ALERT'), `round ${i}: NO alert on the codex dead-key class`);
+    st = out.state;
+  }
+  assert.equal(st.tasks[id].status, 'quarantined', 'the infra ladder itself is flavor-agnostic — the task still parks');
+  assert.equal(st.tasks[id].infra_attempts, 3);
+  assert.ok(!Array.isArray(st.budget_window) || st.budget_window.length === 0, 'the budget window stayed EMPTY (no false codex quota entry)');
 });
 
 test('F-6/F-8: an already-PAUSED chain never re-triggers (idempotent under the hold)', () => {
