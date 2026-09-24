@@ -113,6 +113,17 @@ export function sessionsTokenFromEnv(env = process.env) {
   return legacy !== '' ? legacy : null;
 }
 
+// s25-r1/R4: the DEGRADED-note builder — extracted so BOTH adapters share
+// ONE pinned implementation (the cc lane's inline twin was unpinned: the
+// reviewer's mutation survived the whole suite). Pure; returns the new
+// summary string (typeof-guarded: undefined + ' += ' stringifies
+// 'undefined').
+export function appendTranscriptNote(summary, transcript) {
+  if (!transcript || transcript.mode !== 'degraded' || !Array.isArray(transcript.failures)) return typeof summary === 'string' ? summary : undefined;
+  const note = ` [transcript degraded: ${transcript.failures.length} file(s) unlanded @ ${transcript.repo}]`;
+  return (typeof summary === 'string' ? summary : '') + note;
+}
+
 // path segments get encodeURIComponent, '/' stays structural — a path with
 // spaces/percent/unicode lands at the literal path, not a 404.
 const encPath = (p) => String(p).split('/').map(encodeURIComponent).join('/');
@@ -141,13 +152,34 @@ async function ghJson(fetchImpl, url, method, token, body) {
   } catch (e) {
     return { status: -1, networkError: String(e?.message ?? e).slice(0, 120), data: null };
   }
-  const text = await res.text();
+  // s25-r1/R6: the text read rides INSIDE the try — a mid-body abort
+  // (connection reset mid-download) is the network class, never an escape
+  // from the ladder
+  let text = '';
+  try { text = await res.text(); } catch (e) {
+    return { status: -1, networkError: `body-read ${String(e?.message ?? e).slice(0, 80)}`, data: null };
+  }
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { /* non-JSON body — the status still classifies */ }
   return { status: res.status, data };
 }
 
-const retryable = (r) => r.status === -1 || r.status === 409 || r.status === 422 || r.status >= 500;
+// s25-r1/R1: 429 is ALWAYS retryable, and a 403 carrying a rate-limit body
+// is too (GitHub's secondary rate limits on burst content creation return
+// 403 + "rate limit" prose + a Retry-After — exactly the 16-worker shape
+// this module exists for; classifying them fatal would re-run COMPLETED
+// paid turns, the X30-condemned waste class). A plain 401/403 (auth/
+// permission) stays fatal — no retry theater before the same death.
+const retryable = (r) => r.status === -1 || r.status === 409 || r.status === 422 || r.status === 429
+  || r.status >= 500
+  || (r.status === 403 && /rate limit|too many requests|retry.?after/i.test(`${errText(r.data)} ${r.networkError || ''}`));
+
+// s25-r1/R2: the persistent-422 class — the target BRANCH is missing (the
+// manual-ops dependency: fsm-sessions is born once, by ops) — is FATAL,
+// never silently degraded: zero transcripts with no escalation and no alert
+// is the silent-hole class the s24 audits condemned. The transient 422s
+// (validation, a racing create) stay retryable.
+const branchMissing = (r) => (r.status === 422 || r.status === 404) && /branch|ref/i.test(errText(r.data)) && /not found|does not exist|no such|no ref|missing/i.test(errText(r.data));
 
 // compact per-file error strings: the STATUS must survive every downstream
 // slice (the X30 journal lesson — the aggregated error's 300-char slice + the
@@ -197,7 +229,9 @@ async function putSessionFile(ctx, file) {
         sha,
       });
       if (put.status === 201 || put.status === 200) return { path: file.path, ok: true, updated: true };
+      if (branchMissing(put)) { log(`SESSIONS-PUT-FATAL ${file.path}: the branch is missing — fail-loud`); return { path: file.path, ok: false, fatal: true, err: `PUT HTTP 422 (the fsm-sessions branch is missing — the ops-born dependency; fail-loud, never a silent zero-transcript degrade) ${errText(put.data).slice(0, 60)}` }; }
       if (retryable(put)) { last = compactErr('PUT', put); continue; }
+      log(`SESSIONS-PUT-FATAL ${file.path}: ${compactErr('PUT', put)} — no retry theater (the fatal class)`);
       return { path: file.path, ok: false, fatal: true, err: compactErr('PUT', put) };
     }
     if (get.status === 404) {
@@ -211,7 +245,9 @@ async function putSessionFile(ctx, file) {
         branch,
       });
       if (put.status === 201 || put.status === 200) return { path: file.path, ok: true, created: true };
+      if (branchMissing(put)) { log(`SESSIONS-PUT-FATAL ${file.path}: the branch is missing — fail-loud`); return { path: file.path, ok: false, fatal: true, err: `PUT(create) HTTP 422 (the fsm-sessions branch is missing — the ops-born dependency; fail-loud, never a silent zero-transcript degrade) ${errText(put.data).slice(0, 60)}` }; }
       if (retryable(put)) { last = compactErr('PUT(create)', put); continue; }
+      log(`SESSIONS-PUT-FATAL ${file.path}: ${compactErr('PUT(create)', put)} — no retry theater (the fatal class)`);
       return { path: file.path, ok: false, fatal: true, err: compactErr('PUT(create)', put) };
     }
     if (retryable(get)) { last = compactErr('GET', get); continue; }
