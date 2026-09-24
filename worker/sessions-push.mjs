@@ -1,6 +1,6 @@
-// sessions-push.mjs — the s25/b1 transcript-lane rebuild: session files via
-// the GitHub CONTENTS API, race-free by construction (the X29 F3 fix), on
-// the explicit custom-name repo/token seam (the X29 F2 fix).
+// sessions-push.mjs — the s25/b1 transcript-lane rebuild + the s25/X30
+// ladder correction: session files via the GitHub CONTENTS API on the
+// explicit custom-name repo/token seam (the X29 F2 fix).
 //
 // WHY CONTENTS-API (F3 — the X29 race, $0.005701 / 100,911 tokens / ~341
 // runner-seconds of re-turned work, 22.9% of the epoch's spend): the old
@@ -8,9 +8,27 @@
 // N parallel workers holding the SAME tip produce N−1 guaranteed non-FF
 // losers plus GitHub-side ref-lock rejections; the per-run file PATHS never
 // collided (codexTranscriptPaths/cc transcriptPaths are per-task/per-run)
-// — the shared BRANCH TIP was the contention. `PUT /repos/{repo}/contents/
-// {path}` is per-file server-side CAS: no branch fast-forward constraint,
-// no ref lock, no clone — 13-parallel (any parallel) never contends.
+// — the shared BRANCH TIP was the contention.
+//
+// THE X30 LIVE CORRECTION (s25 — the drill caught the design's own wrong
+// premise): "per-file server-side CAS, race-free by construction" was
+// HALF right. The file PATHS never contend — but every PUT still updates
+// the branch ref via a server-side read-tip→commit→CAS-ref cycle, and a
+// 16-worker × 2-file burst makes the ref move CONTINUOUSLY for ~10-20s:
+// every PUT whose internal tip-read predates a rival's landing 409s ("is
+// at X but expected Y" — X30 run 36064447619, 9/24 tasks exhausted the
+// 3-attempt/5s ladder while the storm outlasted it). The contents API
+// MOVES the contention server-side; it does not remove it. The absorber is
+// the STORE'S PROVEN PATTERN (lib/store.mjs commit()): a LONG jittered
+// ladder that de-synchronizes writers and outlasts the storm — hence
+// SESSIONS_PUT_ATTEMPTS=10 with the 250ms×i-capped-2s backoff below. The
+// terminal semantic changed with it: retryable exhaustion now DEGRADES
+// (the turn keeps its DONE status + the note rides the report summary)
+// instead of throwing — because the escalation re-runs a COMPLETED PAID
+// turn to recreate a record (the exact 22.9%-waste class X29's audit
+// condemned; a lost transcript is a degraded record, a re-run is burned
+// spend). PERSISTENT errors (auth/permission/malformed/oversize) still
+// THROW — those are lane breakage the operator must see, not contention.
 //
 // WHY THE CUSTOM ENV NAMES (F2 — the GITHUB_* override law): worker.yml's
 // old Work-step env mapped `GITHUB_REPOSITORY: ${{ vars.TARGET_REPO ||
@@ -55,17 +73,21 @@ const DEFAULT_API_BASE = 'https://api.github.com';
 // broken (a runaway prompt echo, a pasted binary) and must fail LOUD.
 export const SESSIONS_FILE_MAX_BYTES = 1024 * 1024;
 
-// the per-file GET+PUT budget: 3 attempts total (the X29 audit's tactical
-// complement named "3–4 attempts with exponential backoff + jitter"; with
-// the structural race GONE, retries only cover genuine API transients —
-// 5xx blips and the rare stale-sha 409 — not contention).
-export const SESSIONS_PUT_ATTEMPTS = 3;
+// the per-file GET+PUT budget: 10 attempts (the X30 correction — the
+// 3-attempt/5s ladder lost 9/24 tasks to a 409 storm that outlasted it;
+// the store's proven de-sync ladder shape: 250ms×(attempt−1), capped at
+// 2s, ±25% jitter — total sleep ~11s + ~10 server cycles ≈ a 15-20s
+// window that spans the burst's decay with margin. The turn is already
+// COMPLETE while this ladder runs (post-turn, parallel with the report):
+// the cost of the long tail is latency, never spend).
+export const SESSIONS_PUT_ATTEMPTS = 10;
 
-// the backoff ladder (±25% jitter): wait 250ms after failure 1, 1s after
-// failure 2 (the third tier, 4s, is the curve's documented ceiling — live
-// only if SESSIONS_PUT_ATTEMPTS is ever raised; the burst that motivated
-// the long tail no longer exists under per-file CAS).
-export const SESSIONS_RETRY_BACKOFF_MS = [250, 1000, 4000];
+// the backoff for attempt N (1-indexed): 250 × (N−1) capped at 2000, ±25%
+// jitter (the store's ladder verbatim — the jitter is load-bearing: the
+// tight-loop version starved 15/36 writers in the store's own 6-writer
+// probe; de-synchronized retries are what makes a moving-ref storm
+// converge instead of thundering).
+export const sessionsBackoffMs = (attempt) => Math.min(250 * Math.max(0, attempt - 1), 2000);
 
 const JITTER_LO = 0.75;   // backoff_ms * [0.75 .. 1.25]
 const JITTER_HI = 1.25;
@@ -127,6 +149,14 @@ async function ghJson(fetchImpl, url, method, token, body) {
 
 const retryable = (r) => r.status === -1 || r.status === 409 || r.status === 422 || r.status >= 500;
 
+// compact per-file error strings: the STATUS must survive every downstream
+// slice (the X30 journal lesson — the aggregated error's 300-char slice + the
+// adapter wrap's 120-char slice cut "HTTP 409" off the end, leaving the
+// diagnosis-less "PUT(create) ->" in the record). Cap the server message at
+// 60 chars: the status + the first clause carry the diagnosis; the full body
+// stays in the run log's SESSIONS-PUT-RETRY lines.
+const compactErr = (label, r) => `${label} HTTP ${r.status}${errText(r.data) ? ` (${errText(r.data).slice(0, 60)})` : ''}${r.networkError ? ` (${r.networkError.slice(0, 60)})` : ''}`;
+
 // the per-file PUT ladder: GET (404 create / 200 update+sha / retryable /
 // fatal) → PUT (201/200 landed / retryable / fatal). A retryable outcome
 // burns the attempt, sleeps the jittered ladder tier, and takes a FRESH
@@ -145,7 +175,7 @@ async function putSessionFile(ctx, file) {
   let last = 'no attempt recorded';
   for (let attempt = 1; attempt <= SESSIONS_PUT_ATTEMPTS; attempt++) {
     if (attempt > 1) {
-      const tier = SESSIONS_RETRY_BACKOFF_MS[Math.min(attempt - 2, SESSIONS_RETRY_BACKOFF_MS.length - 1)];
+      const tier = sessionsBackoffMs(attempt);
       const ms = Math.round(tier * (JITTER_LO + rand() * (JITTER_HI - JITTER_LO)));
       log(`SESSIONS-PUT-RETRY ${file.path} attempt ${attempt}/${SESSIONS_PUT_ATTEMPTS} after ${ms}ms (last: ${String(last).slice(0, 100)})`);
       await sleepImpl(ms);
@@ -158,7 +188,7 @@ async function putSessionFile(ctx, file) {
       if (sha === undefined) {
         // 200 without a blob sha = a malformed contents payload — fatal,
         // never retried (retrying a shape break just burns the ladder)
-        return { path: file.path, ok: false, err: `GET -> HTTP 200 without a sha (malformed contents payload)` };
+        return { path: file.path, ok: false, fatal: true, err: `GET -> HTTP 200 without a sha (malformed contents payload)` };
       }
       const put = await ghJson(fetchImpl, putUrl(), 'PUT', token, {
         message: file.message,
@@ -167,8 +197,8 @@ async function putSessionFile(ctx, file) {
         sha,
       });
       if (put.status === 201 || put.status === 200) return { path: file.path, ok: true, updated: true };
-      if (retryable(put)) { last = `PUT -> HTTP ${put.status}${errText(put.data) ? ` (${errText(put.data)})` : ''}`; continue; }
-      return { path: file.path, ok: false, err: `PUT -> HTTP ${put.status}${errText(put.data) ? ` (${errText(put.data)})` : ''}` };
+      if (retryable(put)) { last = compactErr('PUT', put); continue; }
+      return { path: file.path, ok: false, fatal: true, err: compactErr('PUT', put) };
     }
     if (get.status === 404) {
       // create path: the file is absent at the branch — the PUT carries NO
@@ -181,15 +211,18 @@ async function putSessionFile(ctx, file) {
         branch,
       });
       if (put.status === 201 || put.status === 200) return { path: file.path, ok: true, created: true };
-      if (retryable(put)) { last = `PUT(create) -> HTTP ${put.status}${errText(put.data) ? ` (${errText(put.data)})` : ''}`; continue; }
-      return { path: file.path, ok: false, err: `PUT(create) -> HTTP ${put.status}${errText(put.data) ? ` (${errText(put.data)})` : ''}` };
+      if (retryable(put)) { last = compactErr('PUT(create)', put); continue; }
+      return { path: file.path, ok: false, fatal: true, err: compactErr('PUT(create)', put) };
     }
-    if (retryable(get)) { last = `GET -> HTTP ${get.status}${get.networkError ? ` (${get.networkError})` : ''}`; continue; }
+    if (retryable(get)) { last = compactErr('GET', get); continue; }
     // 401/403 (auth/permission) and the other 4xx are fatal per file — a
-    // bad token retried 3× is 5 seconds of theater before the same death
-    return { path: file.path, ok: false, err: `GET -> HTTP ${get.status}${errText(get.data) ? ` (${errText(get.data)})` : ''}${get.networkError ? ` (${get.networkError})` : ''}` };
+    // bad token retried 10× is 20 seconds of theater before the same death
+    return { path: file.path, ok: false, fatal: true, err: compactErr('GET', get) };
   }
-  return { path: file.path, ok: false, err: `exhausted ${SESSIONS_PUT_ATTEMPTS} attempts — ${String(last).slice(0, 160)}` };
+  // retryable exhaustion (the 409-storm class): DEGRADED, never thrown —
+  // the caller keeps the turn's DONE status (the X30 correction; the
+  // `exhausted` marker is the classifier the adapters key on)
+  return { path: file.path, ok: false, err: `exhausted ${SESSIONS_PUT_ATTEMPTS} attempts — ${String(last).slice(0, 100)}` };
 }
 
 // THE ENTRY (both adapters' real-mode transcript lane): pushes every file
@@ -227,9 +260,22 @@ export async function pushSessionFiles({
   }
   const failures = outcomes.filter((o) => !o.ok);
   if (failures.length) {
-    // one throw, every file's error — the aggregate is the diagnosis the
-    // 120-char journal slice will keep: which paths, which statuses
-    throw new Error(`sessions contents push: ${failures.length}/${outcomes.length} file(s) failed — ${failures.map((f) => `${f.path}: ${f.err}`).join(' | ').slice(0, 300)}`);
+    // the PERSISTENT class (auth/permission/malformed/validation): the lane
+    // is broken — THROW, the operator must see it (the adapters escalate a
+    // done-turn to infra_failed 'transcript-push-failed' exactly as before)
+    const fatal = failures.filter((f) => f.fatal);
+    if (fatal.length) {
+      throw new Error(`sessions contents push: ${failures.length}/${outcomes.length} file(s) failed — ${failures.map((f) => `${f.path}: ${f.err}`).join(' | ').slice(0, 300)}`);
+    }
+    // the RETRYABLE-EXHAUSTION class (the 409 storm): DEGRADED — the landed
+    // files are recorded, the unlanded are named, and the turn KEEPS ITS
+    // DONE STATUS (re-running a completed paid turn to recreate a record is
+    // the 22.9%-waste class; the adapters attach the note to the report)
+    return {
+      mode: 'degraded', branch, repo,
+      files: outcomes.filter((o) => o.ok).map((o) => o.path),
+      failures: failures.map((f) => ({ path: f.path, err: String(f.err).slice(0, 120) })),
+    };
   }
   return { mode: 'pushed', branch, repo, files: outcomes.map((o) => o.path) };
 }

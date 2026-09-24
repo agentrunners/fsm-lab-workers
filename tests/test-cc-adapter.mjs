@@ -933,7 +933,9 @@ test('cc transcripts: push failure → retry once → infra_failed transcript-pu
     });
     assert.equal(result.status, 'infra_failed');
     assert.match(result.detail, /transcript-push-failed/);
-    assert.ok(logs.some(l => l.includes('CC-TRANSCRIPT-RETRY')), 'exactly one retry before the failure lane');
+    // s25/X30: the outer whole-set retry is GONE (it re-fed the storm); the
+    // fake-mode local write failure still wraps + escalates in ONE attempt
+    assert.ok(!logs.some(l => l.includes('CC-TRANSCRIPT-RETRY')), 'no outer whole-set retry (the X30 correction)');
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 

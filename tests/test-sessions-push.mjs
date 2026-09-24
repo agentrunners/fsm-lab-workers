@@ -27,9 +27,9 @@ import {
   pushSessionFiles,
   sessionsRepoFromEnv,
   sessionsTokenFromEnv,
+  sessionsBackoffMs,
   SESSIONS_FILE_MAX_BYTES,
   SESSIONS_PUT_ATTEMPTS,
-  SESSIONS_RETRY_BACKOFF_MS,
 } from '../worker/sessions-push.mjs';
 
 // the scripted fetch: every call is captured (url/method/headers/parsed
@@ -115,13 +115,13 @@ test('409 retry: PUT 409 → FRESH GET (a new sha) → PUT lands — the stale-s
   });
   const r = await pushSessionFiles({ ...BASE_ARGS, files: [FILE('sessions/T-3/run3-a1.txt')], fetchImpl, sleepImpl: noSleep(sleeps), rand: randMid });
   assert.equal(r.mode, 'pushed', 'the 409 was absorbed, not escalated');
-  assert.deepEqual(sleeps, [SESSIONS_RETRY_BACKOFF_MS[0]], 'one backoff tier between the two attempts (rand=0.5 → the tier unscaled)');
+  assert.deepEqual(sleeps, [sessionsBackoffMs(2)], 'one backoff tier between the two attempts (rand=0.5 → the tier unscaled)');
   assert.equal(calls.filter((c) => c.method === 'GET').length, 2, 'the retry took a FRESH GET');
   assert.equal(calls.filter((c) => c.method === 'PUT').length, 2);
   assert.equal(calls[3].body.sha, 'sha-fresh', 'the re-armed sha is the SECOND GET\'s — the stale one never rides the retry');
 });
 
-test('backoff ladder + jitter: two consecutive failures sleep tiers 250/1000 at factor 1.0; the ±25% bounds hold at rand extremes', async () => {
+test('backoff ladder + jitter (the X30 correction): 503s burn the 10-attempt ladder then DEGRADE — tiers 250×(i−1) capped 2s at factor 1.0; the ±25% bounds hold at rand extremes', async () => {
   const mk = async (rand) => {
     const sleeps = [];
     let putCount = 0;
@@ -130,48 +130,69 @@ test('backoff ladder + jitter: two consecutive failures sleep tiers 250/1000 at 
       putCount += 1;
       return { status: 503, data: { message: 'upstream unavailable' } };
     });
-    await assert.rejects(
-      () => pushSessionFiles({ ...BASE_ARGS, files: [FILE('p.txt')], fetchImpl, sleepImpl: noSleep(sleeps), rand }),
-      /sessions contents push: 1\/1 file\(s\) failed/,
-    );
+    const r = await pushSessionFiles({ ...BASE_ARGS, files: [FILE('p.txt')], fetchImpl, sleepImpl: noSleep(sleeps), rand });
+    assert.equal(r.mode, 'degraded', 'retryable exhaustion degrades — never throws (the s25/X30 law: no re-run of a completed paid turn)');
+    assert.equal(r.failures.length, 1, 'the unlanded file is named');
+    assert.match(r.failures[0].err, /exhausted 10 attempts — PUT\(create\) HTTP 503/, 'the compact error keeps the status visible through every downstream slice');
     return sleeps;
   };
-  // three 503s exhaust the ladder: sleeps land between attempts 1→2 and
-  // 2→3 — tiers 250 and 1000 at rand()=0.5 (factor exactly 1.0)
-  assert.deepEqual(await mk(randMid), [250, 1000], 'the live tiers under SESSIONS_PUT_ATTEMPTS=3');
+  // ten 503s exhaust the ladder: sleeps land between attempts i and i+1 —
+  // sessionsBackoffMs(2..10) at rand()=0.5 (factor exactly 1.0)
+  const expect = [2, 3, 4, 5, 6, 7, 8, 9, 10].map(sessionsBackoffMs);
+  assert.deepEqual(await mk(randMid), expect, 'the store-shaped de-sync ladder: 250,500,750,1000,1250,1500,1750,2000,2000');
   const lo = await mk(() => 0);
   const hi = await mk(() => 1);
-  assert.deepEqual(lo, [Math.round(250 * 0.75), Math.round(1000 * 0.75)], 'rand=0 → the −25% bound');
-  assert.deepEqual(hi, [Math.round(250 * 1.25), Math.round(1000 * 1.25)], 'rand=1 → the +25% bound');
-  assert.equal(SESSIONS_PUT_ATTEMPTS, 3, 'the documented ladder budget');
-  assert.deepEqual(SESSIONS_RETRY_BACKOFF_MS, [250, 1000, 4000], 'the documented curve (the 4s tier = the ceiling, live only if attempts rise)');
+  assert.deepEqual(lo, expect.map((ms) => Math.round(ms * 0.75)), 'rand=0 → the −25% bound');
+  assert.deepEqual(hi, expect.map((ms) => Math.round(ms * 1.25)), 'rand=1 → the +25% bound');
+  assert.equal(SESSIONS_PUT_ATTEMPTS, 10, 'the documented ladder budget (the X30 correction: 3 → 10)');
+  assert.equal(sessionsBackoffMs(1), 0, 'attempt 1 sleeps nothing');
+  assert.equal(sessionsBackoffMs(9), 2000, 'the 2s ceiling');
+  assert.equal(sessionsBackoffMs(20), 2000, 'the ceiling holds past the ladder (future raises)');
 });
 
 // ---------------------------------------------------------------------------
 // The aggregate failure — ONE throw, EVERY file's error.
 // ---------------------------------------------------------------------------
 
-test('aggregate failure: one file exhausts the ladder, one fails fatally → ONE throw carrying BOTH files\' errors', async () => {
+test('aggregate PERSISTENT failure: one file degrades (retryable), one fails fatally → ONE throw (the fatal class owns the escalation) carrying BOTH files\' errors', async () => {
   const perPath = { 'a.txt': 0, 'b.txt': 0 };
   const { fetchImpl, calls } = mockFetch((c) => {
     const path = c.url.split('/contents/')[1]?.split('?')[0];
     if (c.method === 'GET') return { status: 404, data: null };
     perPath[path] += 1;
     // a.txt: retryable 5xx every time (burns all SESSIONS_PUT_ATTEMPTS);
-    // b.txt: 401 (auth) — FATAL, one attempt, no 3× theater before the same death
+    // b.txt: 401 (auth) — FATAL, one attempt, no 10× theater before the same death
     return path === 'a.txt' ? { status: 503, data: { message: 'upstream unavailable' } } : { status: 401, data: { message: 'Bad credentials' } };
   });
   await assert.rejects(
     () => pushSessionFiles({ ...BASE_ARGS, files: [FILE('a.txt'), FILE('b.txt')], fetchImpl, sleepImpl: noSleep([]), rand: randMid }),
     (e) => {
       assert.match(e.message, /sessions contents push: 2\/2 file\(s\) failed/);
-      assert.match(e.message, /a\.txt: exhausted 3 attempts — PUT\(create\) -> HTTP 503/, 'the ladder-exhausted file names its last class');
-      assert.match(e.message, /b\.txt: PUT\(create\) -> HTTP 401/, 'the fatal file fails fast, its status in the aggregate');
+      assert.match(e.message, /a\.txt: exhausted 10 attempts — PUT\(create\) HTTP 503/, 'the ladder-exhausted file names its last class');
+      assert.match(e.message, /b\.txt: PUT\(create\) HTTP 401/, 'the fatal file fails fast, its status in the aggregate');
       return true;
     },
   );
   assert.equal(perPath['a.txt'], SESSIONS_PUT_ATTEMPTS, 'the retryable file burned the full ladder');
   assert.equal(perPath['b.txt'], 1, 'the 401 is fatal per file — no retry theater');
+});
+
+test('THE DEGRADED RETURN (the X30 law): pure retryable exhaustion NEVER throws — the landed files are recorded, the unlanded are named, the turn keeps its DONE status', async () => {
+  let putCount = 0;
+  const { fetchImpl, calls } = mockFetch((c) => {
+    if (c.method === 'GET') return { status: 404, data: null };
+    putCount += 1;
+    // the 409 storm shape: every PUT conflicts (the ref moved server-side)
+    return { status: 409, data: { message: 'is at 3865e67 but expected 6c2c182' } };
+  });
+  const r = await pushSessionFiles({ ...BASE_ARGS, files: [FILE('storm.txt')], fetchImpl, sleepImpl: noSleep([]), rand: randMid });
+  assert.equal(r.mode, 'degraded');
+  assert.equal(r.repo, BASE_ARGS.repo, 'the repo the push targeted rides the result (the F2 lesson)');
+  assert.deepEqual(r.files, [], 'nothing landed in the pure-storm case');
+  assert.equal(r.failures.length, 1);
+  assert.match(r.failures[0].err, /exhausted 10 attempts — PUT\(create\) HTTP 409/, 'the compact status survives');
+  assert.equal(putCount, SESSIONS_PUT_ATTEMPTS, 'the storm burned the full de-sync ladder');
+  assert.equal(calls.filter((c) => c.method === 'GET').length, SESSIONS_PUT_ATTEMPTS, 'a fresh GET per attempt — the sha re-arm discipline held');
 });
 
 test('network rejection is the retryable class: fetch throws → attempt 2 lands', async () => {
