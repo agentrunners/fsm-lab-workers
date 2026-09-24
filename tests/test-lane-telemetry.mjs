@@ -81,6 +81,26 @@ test('collectLaneStats: reads, aggregates, deletes the file', () => {
 
 // ---------------------------------------------------------------------------
 // 5. the M4 allowlist SEAM — lane_stats/key_index/pool_size/hop_telemetry survive the composer
+test('s25-r1/R3: the DEGRADED-transcript marker rides the outcome + the journal + last_result (the run-log note gains its durable surface)', () => {
+  // (a) the compose allowlist: the count rides the outcome from raw.transcript
+  const raw = { summary: 'ok', lane_stats: { calls: 1 }, transcript: { mode: 'degraded', repo: 'o/r', failures: [{ path: 'a.meta.json' }] } };
+  const o = composeReportOutcome({ status: 'done', detail: null }, raw, 1000, { mode: 'codex' });
+  assert.equal(o.transcript_degraded, 1, 'the count rides the outcome');
+  const clean = composeReportOutcome({ status: 'done', detail: null }, { summary: 'ok', transcript: { mode: 'pushed', files: ['a'] } }, 1000, { mode: 'codex' });
+  assert.equal(clean.transcript_degraded, undefined, 'absent on the clean path — the legacy shape is byte-identical');
+  // (b) the journal + last_result: laneOutcomeFields carries it through apply()
+  const s2 = world();
+  const rr = apply(s2, EV({ status: 'done', artifact: 'f', duration_ms: 5, lane_stats: { calls: 1, ok: 1 }, transcript_degraded: 2, mode: 'codex' }), '2026-09-24T23:00:00Z', NO_MILESTONE);
+  const rec = rr.journal.find(j => j.kind === 'REPORT');
+  assert.equal(rec.transcript_degraded, 2, 'the journal REPORT record carries the count (the durable surface)');
+  assert.equal(rr.state.tasks['T-1'].last_result.transcript_degraded, 2, 'and last_result (the console source)');
+  // (c) the legacy compat: absent = absent everywhere
+  const s3 = world();
+  const rr3 = apply(s3, EV({ status: 'done', artifact: 'f', duration_ms: 5 }), '2026-09-24T23:00:01Z', NO_MILESTONE);
+  const rec3 = rr3.journal.find(j => j.kind === 'REPORT');
+  assert.equal('transcript_degraded' in rec3, false, 'absent on legacy reports — byte-identical shape');
+});
+
 test('composeReportOutcome: lane telemetry passes the allowlist (the prCandidates lesson)', () => {
   const raw = { status: 'done', artifact: 'tasks/x/report.md', duration_ms: 5, lane_stats: { calls: 3, ok: 3, err429: 0, err5xx: 0, tokens: 900, cost: 0.001, p50_ms: 800, p95_ms: 1200, rate_classes: {}, models: { 'z-ai/glm-5.3-flash': { calls: 3 } } }, key_index: 4, pool_size: 82, hop_telemetry: [{ model: 'm', ms: 5, status: 200 }] };
   const out = composeReportOutcome({ status: 'done', artifact: 'tasks/x/report.md' }, raw, 5);
