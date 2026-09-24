@@ -932,6 +932,7 @@ test('s25/X30 THE DEGRADED PATH: a 409 storm exhausts the ladder — the DONE tu
     assert.equal(result.status, undefined, 'no escalation fired (a raw-shape return, not an infra_failed compose)');
     assert.match(result.summary, /\[transcript degraded: 2 file\(s\) unlanded @ /, 'the note rides the report summary (the journal-visible marker)');
     assert.ok(logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-DEGRADED')), 'the LOUD run-log line');
+    assert.ok(logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-PUSHED 0/2 file(s)') && l.includes('(degraded')), 'the X31 blemish fix: the PUSHED line reports the ACTUAL outcome (0/2 + degraded), never the contradictory full count');
     assert.ok(!logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-RETRY')), 'the outer whole-set retry is GONE (it re-fed the storm — the X30 correction)');
     assert.equal(calls.filter((c) => c.method === 'PUT').length, 2 * 10, 'both files burned the full 10-attempt ladder');
   } finally {

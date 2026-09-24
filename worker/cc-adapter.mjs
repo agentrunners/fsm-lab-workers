@@ -591,7 +591,14 @@ export async function pushSessionsContents({ env, files, log, fetchImpl, sleepIm
   // the pinned line SHAPE stays byte-compatible for the run-log consumers;
   // the repo the files LANDED on is APPENDED — the X29 lesson (the split
   // record was invisible in the log)
-  log(`CC-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions @ ${repo}`);
+  // s25/X31: the line reports the ACTUAL outcome — 'PUSHED n/m' on the
+  // degraded path (the X31 T-X31-03 lesson: the unconditional 'PUSHED 2'
+  // followed by 'DEGRADED 1/2' contradicted itself in the run log)
+  if (out && out.mode === 'degraded') {
+    log(`CC-TRANSCRIPT-PUSHED ${out.files.length}/${files.size} file(s) to fsm-sessions @ ${repo} (degraded — see the DEGRADED line)`);
+  } else {
+    log(`CC-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions @ ${repo}`);
+  }
   return out;
 }
 
