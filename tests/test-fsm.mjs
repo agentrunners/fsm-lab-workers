@@ -1016,6 +1016,11 @@ test('T46/F-B2: genesis mode — default mock rides project.mode; cc for the X21
   const cc = genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'c-x21', now: T0, mode: 'cc' });
   assert.equal(cc.project.mode, 'cc');
   ok(cc, 'genesis-cc');
+  // s24/B1: the codex engine epoch mints the same way (the receiver-side
+  // seam — the dispatch envelope carries the mode to the worker's lazy arm)
+  const cx = genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1, milestones: 2 }, chainId: 'c-x29', now: T0, mode: 'codex' });
+  assert.equal(cx.project.mode, 'codex');
+  ok(cx, 'genesis-codex');
   // bad mode fails closed at the boundary
   for (const mode of ['monk', '', 42, null]) {
     assert.throws(() => genesis({ config: { max_parallel: 2, lease_minutes: 1, max_attempts: 3 }, project: { tasks: fastProject().m1 }, chainId: 'x', now: T0, mode }),
@@ -1023,6 +1028,12 @@ test('T46/F-B2: genesis mode — default mock rides project.mode; cc for the X21
   }
   // ONE vocabulary: fsm's GENESIS_MODES === worker-contract's ENVELOPE_MODES
   assert.deepEqual(GENESIS_MODES, ENVELOPE_MODES, 'the receiver and the envelope speak the same mode vocabulary');
+  // s24/B1: the equality alone would pass two DRIFTED 3-member lists — the
+  // literal pin forces the 4-member set ('codex', the second engine, in
+  // BOTH vocabularies; the worker-contract gate + intake door carry the
+  // same members)
+  assert.deepEqual(ENVELOPE_MODES, ['mock', 'real', 'cc', 'codex'], 'the s24 4-member mode vocabulary (the codex engine seam)');
+  assert.equal(GENESIS_MODES.length, 4, 'exactly four members — a fifth needs a design decision, not a drift');
 });
 
 test('T46/F-B2: rebuild replays the mode from a reset genesisSpec (legacy specs default to mock)', () => {

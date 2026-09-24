@@ -27,6 +27,12 @@
 //               BEFORE the report, the door governance on artifacts.
 //               CC_FAKE_LLM=1 swaps the CLI for worker/fake-cc.mjs (same
 //               argv, deterministic fixtures) — tests never burn fuel.
+//        codex → worker/codex-adapter.mjs (s24/B1, multi-engine design
+//               D1/D13): the OpenAI Codex CLI harness turn — LAZY dynamic
+//               import at CALL time (the adapter ships in parallel as B2;
+//               until it lands every codex dispatch reports infra_failed
+//               'codex-adapter-missing' — LOUD, terminal at the TURN level:
+//               no lane rotation, the invocation is broken, not the lane).
 //   3. classifyOutcome — the ONE normalizer before report enqueue: every
 //      harness completion (shim return, real-lane raw, routing-level infra
 //      marker) flows through it exactly once; the five-class outcome plus
@@ -337,6 +343,40 @@ async function ccWork(envelope, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// MODE=codex — the OpenAI Codex CLI harness turn (s24/B1 — the SEAM).
+//
+// The adapter (worker/codex-adapter.mjs, exporting codexTurn(envelope,
+// opts) — the engineTurn contract) is built IN PARALLEL as B2; this routing
+// site resolves it LAZILY at call time, so the vocabulary extension is
+// deployable BEFORE the engine exists: a codex dispatch that arrives at a
+// worker without the adapter reports infra_failed 'codex-adapter-missing'
+// — TERMINAL at the turn level, NO lane rotation (design D13: the
+// invocation is broken, not the lane — rotating would burn
+// lane_attempts × INFRA_RETRY_MAX on a persistent checkout bug). The
+// default import specifier is the module-relative './codex-adapter.mjs'
+// (exactly the cc arm's shape); codexAdapterPath overrides it for the
+// routing pin (a temp dir — the forced-import-failure fixture).
+// ---------------------------------------------------------------------------
+
+async function codexWork(envelope, opts = {}) {
+  try {
+    const specifier = typeof opts.adapterPath === 'string' && opts.adapterPath !== ''
+      ? pathToFileURL(opts.adapterPath).href
+      : new URL('./codex-adapter.mjs', import.meta.url).href;
+    const mod = await import(specifier);
+    if (typeof mod.codexTurn !== 'function') {
+      throw new AdapterNotShipped('worker/codex-adapter.mjs has no codexTurn export — MODE=codex reports infra_failed codex-adapter-missing (the adapter ships with s24/B2)');
+    }
+    return await mod.codexTurn(envelope, opts);
+  } catch (e) {
+    if (e?.code === 'ERR_MODULE_NOT_FOUND' || /Cannot find module/i.test(String(e?.message ?? ''))) {
+      throw new AdapterNotShipped('worker/codex-adapter.mjs missing from the checkout — MODE=codex reports infra_failed codex-adapter-missing (the adapter ships with s24/B2)');
+    }
+    throw e;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The report payload composer — classifyOutcome's five-class result plus the
 // contract extras. The FSM receiver reads outcome.status / .artifact /
 // .error (journal text) / .duration_ms; telemetry + artifact_refs + models
@@ -406,7 +446,7 @@ function appendStepSummary(path, text) {
 export async function runTurn({
   cp, runId = 'local', runAttempt = '1',
   env = process.env, fetchImpl = fetch, enqueue, sleepImpl = sleep, now = Date.now,
-  log = console.log, stepSummaryPath = null, laneLogPath = null,
+  log = console.log, stepSummaryPath = null, laneLogPath = null, codexAdapterPath = null,
 }) {
   const t0 = now();
   const eventId = reportEventId({ runId, attempt: runAttempt });
@@ -472,6 +512,28 @@ export async function runTurn({
         // classifier has no slot for "harness not shipped"; minted here,
         // normalized by the same single classifyOutcome call below)
         raw = { status: 'infra_failed', detail: 'cc-adapter-missing', artifact_refs: [], summary: e.message, telemetry: { turns: 0, wall_ms: 0, lane_attempts_used: 0 } };
+      } else {
+        throw e;
+      }
+    }
+  } else if (envelope.mode === 'codex') {
+    try {
+      // s24/B1: the lazy codex arm — the adapter is resolved at CALL time
+      // (B2 lands in parallel); the declared-artifacts pass-through mirrors
+      // the cc arm (the write-back door + task-branch push consume them —
+      // the §4c seam stays engine-neutral). codexAdapterPath is the routing
+      // pin's forced-import-failure fixture (a temp dir without the module).
+      raw = await codexWork(envelope, {
+        env, runId, now, log,
+        allowRoot: Array.isArray(envelope.artifacts) ? envelope.artifacts : [],
+        ...(typeof codexAdapterPath === 'string' && codexAdapterPath !== '' ? { adapterPath: codexAdapterPath } : {}),
+      });
+    } catch (e) {
+      if (e instanceof AdapterNotShipped) {
+        // the D13 law: terminal at the TURN level — no lane rotation (the
+        // invocation is broken, not the lane). Same routing-level marker
+        // shape as the cc arm's cc-adapter-missing.
+        raw = { status: 'infra_failed', detail: 'codex-adapter-missing', artifact_refs: [], summary: e.message, telemetry: { turns: 0, wall_ms: 0, lane_attempts_used: 0 } };
       } else {
         throw e;
       }

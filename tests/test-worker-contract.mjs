@@ -129,7 +129,9 @@ test('envelope: wall_ms default — the remaining window with the 60s config flo
 test('envelope: explicit task_ref passes through when consistent; bounds stay enforced', () => {
   const ok = envelopeFromDispatch({ task: 'T9', attempt: 1, deadline_ms: NOW + 60_000, task_ref: { kind: 'state-task', id: 'T9' } }, NOW);
   assert.deepEqual(ok.envelope.task_ref, { kind: 'state-task', id: 'T9' });
-  assert.equal(ENVELOPE_MODES.join('|'), 'mock|real|cc');
+  // s24/B1: the 4-member vocabulary, pinned LITERALLY (mock | real | cc |
+  // codex — the second engine rides the same contract)
+  assert.equal(ENVELOPE_MODES.join('|'), 'mock|real|cc|codex');
   // (the genesis-mode vocabulary cross-check lives in test-fsm.mjs — the
   // fsm wave adds GENESIS_MODES; this file pins the CONTRACT surfaces only)
 });
@@ -164,6 +166,36 @@ test('envelope: FAIL-CLOSED — unknown mode (a typo\'d mode would run the wrong
     const r = envelopeFromDispatch({ task: 'T1', mode, deadline_ms: NOW + 60_000 }, NOW);
     assert.equal(r.ok, true, `mode=${JSON.stringify(mode)} is absent, not unknown`);
     assert.equal(r.envelope.mode, 'mock');
+  }
+});
+
+// s24/B1 (multi-engine design D1): the codex-mode envelope PASSES the gate —
+// the second engine rides the SAME worker-contract seam (no codex-specific
+// envelope fields; the routing arm in worker/turn.mjs is the engine seam).
+// The fail-closed arm is PRESERVED verbatim: unknown modes (a codex typo
+// included) still reject with the 4-member vocabulary named in the detail.
+test('envelope: s24/B1 — mode codex passes the gate (legacy + ox lanes); unknown-mode still fails closed with the 4-member vocabulary', () => {
+  // the legacy/top-level lane
+  const r = envelopeFromDispatch({ task: 'T1', mode: 'codex', deadline_ms: NOW + 60_000 }, NOW);
+  assert.equal(r.ok, true, 'codex is a vocabulary member — the gate mints the envelope');
+  assert.equal(r.envelope.mode, 'codex');
+  assert.equal(r.envelope.task_ref.id, 'T1');
+  // the ox lane (the epoch-mode carriage the conductor mints)
+  const ox = envelopeFromDispatch({
+    task: 'T2', attempt: 1,
+    ox: JSON.stringify({ mode: 'codex', deadline_ms: NOW + 60_000, prompt: 'research the seam' }),
+  }, NOW);
+  assert.equal(ox.ok, true);
+  assert.equal(ox.envelope.mode, 'codex');
+  assert.equal(ox.envelope.prompt, 'research the seam');
+  // the fail-closed arm: every codex TYPO still rejects (worker-contract's
+  // :146-148 behavior preserved — a typo'd mode must never run a harness)
+  for (const mode of ['codx', 'Codex', 'codex-mode', 'codex,']) {
+    const bad = envelopeFromDispatch({ task: 'T1', mode, deadline_ms: NOW + 60_000 }, NOW);
+    assert.equal(bad.ok, false, `mode=${JSON.stringify(mode)} must fail closed`);
+    assert.equal(bad.reason, 'unknown-mode');
+    assert.equal(bad.class, 'infra_failed');
+    assert.match(bad.detail, /must be one of mock\|real\|cc\|codex/, 'the rejection names the 4-member vocabulary');
   }
 });
 
