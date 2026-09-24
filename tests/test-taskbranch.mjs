@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 
 import { assembleDispatchPayload } from '../lib/conductor-core.mjs';
 import { envelopeFromDispatch } from '../lib/worker-contract.mjs';
-import { pushTaskBranch, verifyReadBack, parseLsTree, artifactPushEscalation } from '../worker/cc-adapter.mjs';
+import { pushTaskBranch, taskBranchOriginUrl, verifyReadBack, parseLsTree, artifactPushEscalation } from '../worker/cc-adapter.mjs';
 import { prFlowCandidates, buildPrBody, openTaskPr, stampPr, prFlow, PR_MAX_PER_TICK } from '../lib/task-pr.mjs';
 import { genesis, rebuild } from '../lib/fsm.mjs';
 import { conductorTick } from '../lib/conductor-core.mjs';
@@ -179,9 +179,40 @@ test('parseLsTree: the --long shape', () => {
 
 test('pushTaskBranch: URL construction + env contract (source-shape)', () => {
   const src = rfs(join(ROOT, 'worker/cc-adapter.mjs'), 'utf8');
-  assert.match(src, /x-access-token:\$\{token\}@github\.com\/\$\{repo\}\.git/, 'the same auth lane as pushSessionsBranch');
+  assert.match(src, /x-access-token:\$\{token\}@github\.com\/\$\{repo\}\.git/, 'the same auth lane the sessions seam feeds (taskBranchOriginUrl)');
   assert.match(src, /clone.*--branch.*main.*--single-branch/s, 'F-4: genesis clones MAIN, never the orphan');
   assert.match(src, /opts\.pushTaskBranchImpl \|\| pushTaskBranch/, 'the injectable seam');
+});
+
+// s25/b1 (the X29 F2 fix): the task-branch origin resolver — PURE, pinned
+// directly. The X29 mirror shape: the runner's GITHUB_REPOSITORY says
+// agentrunners/fsm-lab-workers while TARGET_REPO meant claudecode-headless/
+// fsm-lab — the old env read built the RUNNER's URL (tasks/T-X29-21 landed
+// on the mirror, run 35999041887); the custom FSM_SESSIONS_* names must win.
+test('s25/b1 taskBranchOriginUrl: FSM_SESSIONS_REPO builds the TARGET URL — not the runner repo; CC_TASKBRANCH_ORIGIN still wins; the legacy pair backs compat; neither → null', () => {
+  // THE F2 PIN — both names present, the custom one wins:
+  const url = taskBranchOriginUrl({
+    FSM_SESSIONS_REPO: 'claudecode-headless/fsm-lab',
+    FSM_SESSIONS_TOKEN: 'pat-lane',
+    GITHUB_REPOSITORY: 'agentrunners/fsm-lab-workers',
+    GH_TOKEN: 'runner-job-token',
+  });
+  assert.equal(url, 'https://x-access-token:pat-lane@github.com/claudecode-headless/fsm-lab.git');
+  assert.ok(!url.includes('agentrunners'), 'the TARGET repo, never the runner repo (the X29 split)');
+  // the tests/ops override still wins outright (the existing mechanism):
+  assert.equal(taskBranchOriginUrl({
+    FSM_SESSIONS_REPO: 'o/target', FSM_SESSIONS_TOKEN: 't',
+    CC_TASKBRANCH_ORIGIN: 'file:///tmp/bare.git',
+  }), 'file:///tmp/bare.git');
+  // the legacy pair backs compat (tests/sims that set the old vocabulary):
+  assert.equal(taskBranchOriginUrl({ GITHUB_REPOSITORY: 'o/legacy', GH_TOKEN: 'legacy-tok' }), 'https://x-access-token:legacy-tok@github.com/o/legacy.git');
+  // repo without token (or neither) → null → pushTaskBranch's loud guard:
+  assert.equal(taskBranchOriginUrl({ FSM_SESSIONS_REPO: 'o/target' }), null);
+  assert.equal(taskBranchOriginUrl({}), null);
+  assert.throws(
+    () => pushTaskBranch({ env: {}, branch: 'tasks/T-999', allowed: ['tasks/T-999/a.md'], workdir: '/nonexistent', log: () => {} }),
+    /artifact-push: needs FSM_SESSIONS_REPO \+ FSM_SESSIONS_TOKEN/,
+  );
 });
 
 // ---------------------------------------------------------------------------

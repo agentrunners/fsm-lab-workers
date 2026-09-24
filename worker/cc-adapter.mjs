@@ -82,8 +82,12 @@
 // BEFORE ccTurn returns — the report (enqueued by runTurn afterwards)
 // references the transcript path, so the ordering is structural. Push failure
 // → retry once, then the turn reports infra_failed 'transcript-push-failed'.
-// Real mode: git push to the fsm-sessions branch (GH_TOKEN); fake mode: a
-// LOCAL directory (env.CC_FAKE_TRANSCRIPTS_DIR, default <tmp>/fsm-sessions-
+// Real mode (s25/b1 — the X29 F3/F2 rebuild): per-file CONTENTS-API pushes
+// via the shared worker/sessions-push.mjs engine (race-free by construction;
+// the repo/token seam is FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN — the custom
+// names that REACH the process — with the GITHUB_REPOSITORY/GH_TOKEN
+// back-compat pair); fake mode: a LOCAL directory
+// (env.CC_FAKE_TRANSCRIPTS_DIR, default <tmp>/fsm-sessions-
 // fake) — deterministic tests never touch git.
 //
 // ARTIFACTS (D4): post-turn the workdir is scanned; every regular file
@@ -106,6 +110,10 @@ import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { classifyOutcome, writeBackDoor } from '../lib/worker-contract.mjs';
 import { collectLaneStats } from './lane-telemetry.mjs';
+// s25/b1 (the X29 F3/F2 rebuild): the transcript lane's shared contents-API
+// engine + the custom-name repo/token seam — the law and the live lesson
+// (run 35999041887) are recorded at the top of worker/sessions-push.mjs.
+import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv } from './sessions-push.mjs';
 
 const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 
@@ -550,48 +558,37 @@ function transcriptMeta(envelope, runId, fake, result, nowIso) {
   }, null, 2) + '\n';
 }
 
-// the real-mode push: a shallow clone/push of the fsm-sessions branch (the
-// token never reaches a log line). Retry-once semantics live at the caller.
-function pushSessionsBranch({ env, files, log }) {
-  const repo = env.GITHUB_REPOSITORY;
-  const token = env.GH_TOKEN || env.GITHUB_TOKEN;
-  if (!repo || !token) throw new Error('sessions push needs GH_TOKEN + GITHUB_REPOSITORY');
-  const url = `https://x-access-token:${token}@github.com/${repo}.git`;
-  const scratch = mkdtempSync(join(tmpdir(), 'cc-sessions-'));
-  const wc = join(scratch, 'wc');
-  // X20 run-2 lesson: BOTH paths need the workdir — `git clone ... .` AND
-  // `git init .` fail with "cannot change to '<wc>'" when it doesn't exist
-  // (the init fallback only ran because the clone failed on the SAME
-  // missing-dir cause, masking the real branch-absence signal)
-  mkdirSync(wc, { recursive: true });
-  const git = (args) => spawnSync('git', args, { cwd: wc, encoding: 'utf8' });
-  const fail = (step, r) => new Error(`${step} failed: ${String(r.stderr || r.error || `rc=${r.status}`).trim().slice(0, 160)}`);
-  try {
-    const clone = git(['clone', '--depth', '1', '--branch', 'fsm-sessions', '--single-branch', url, '.']);
-    if (clone.status !== 0) {
-      // branch absent → orphan-branch genesis (sessions is not a code branch)
-      const init = git(['init', '-b', 'fsm-sessions', '.']);
-      if (init.status !== 0) throw fail('git init', init);
-      const remote = git(['remote', 'add', 'origin', url]);
-      if (remote.status !== 0) throw fail('git remote', remote);
-      log(`CC-SESSIONS-GENESIS fsm-sessions branch absent — orphan genesis (clone stderr: ${String(clone.stderr).trim().slice(0, 120)})`);
-    }
-    for (const [rel, content] of files) {
-      mkdirSync(dirname(join(wc, rel)), { recursive: true });
-      writeFileSync(join(wc, rel), content);
-    }
-    const add = git(['add', ...[...files.keys()]]);
-    if (add.status !== 0) throw fail('git add', add);
-    const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
-      'commit', '-m', 'transcript: sessions update']);
-    if (commit.status !== 0) throw fail('git commit', commit);
-    const push = git(['push', 'origin', 'fsm-sessions']);
-    if (push.status !== 0) throw fail('git push', push);
-    log(`CC-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions`);
-    return { mode: 'pushed', branch: 'fsm-sessions', files: [...files.keys()] };
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
+// the real-mode push (s25/b1 — the X29 F3 rebuild): per-file contents-API
+// CAS via the shared worker/sessions-push.mjs engine — race-free by
+// construction (no shared branch tip to fast-forward, no ref lock, no
+// clone). The repo/token seam is the F2 law: FSM_SESSIONS_REPO/
+// FSM_SESSIONS_TOKEN (the custom names that REACH the process on real
+// runners — step-env overrides of GITHUB_* defaults are silently ignored
+// by the runner) with the GITHUB_REPOSITORY/GH_TOKEN back-compat pair for
+// tests/sims that set the old vocabulary. The token never reaches a log
+// line (the Authorization header only). Retry ladder: the engine's per-PUT
+// budget (3 attempts, backoff+jitter, 409/422/5xx/network) + the caller's
+// ONE whole-set retry in writeTranscript.
+// exported as the ADAPTER SEAM for the mock-first pins (the s25/b1 suite
+// drives the real-mode lane through fetchImpl — zero network, zero git).
+export async function pushSessionsContents({ env, files, log, fetchImpl }) {
+  const repo = sessionsRepoFromEnv(env);
+  const token = sessionsTokenFromEnv(env);
+  if (!repo || !token) throw new Error('sessions push needs FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (or the GITHUB_REPOSITORY/GH_TOKEN back-compat pair)');
+  const out = await pushSessionFiles({
+    repo,
+    token,
+    branch: 'fsm-sessions',
+    files: [...files].map(([path, content]) => ({ path, content, message: `transcript: ${path}` })),
+    log,
+    env,
+    fetchImpl,
+  });
+  // the pinned line SHAPE stays byte-compatible for the run-log consumers;
+  // the repo the files LANDED on is APPENDED — the X29 lesson (the split
+  // record was invisible in the log)
+  log(`CC-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions @ ${repo}`);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,15 +634,28 @@ export function parseLsTree(stdout) {
   return tip;
 }
 
+// W-C2-R (F6) + s25/b1 (F2): the task-branch origin resolver — PURE so the
+// URL seam is pinnable without a git subprocess. CC_TASKBRANCH_ORIGIN (the
+// tests/ops override — the FSM_SESSIONS_ORIGIN pattern, kept verbatim) wins
+// outright; otherwise the github URL built from the SESSIONS seam:
+// FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (the custom names that REACH the
+// process on real runners — the GITHUB_* step-env override law). The X29
+// lesson this closes: the old `env.GITHUB_REPOSITORY` read built the URL
+// from the RUNNER's repo while the log RENDERED the override — mirror run
+// 35999041887 pushed tasks/T-X29-21 to the MIRROR repo, splitting the
+// record-of-record. The GITHUB_REPOSITORY/GH_TOKEN back-compat pair stays
+// for tests/sims that set the old vocabulary.
+export function taskBranchOriginUrl(env = process.env) {
+  const originOverride = typeof env.CC_TASKBRANCH_ORIGIN === 'string' && env.CC_TASKBRANCH_ORIGIN.trim() !== '' ? env.CC_TASKBRANCH_ORIGIN.trim() : null;
+  if (originOverride) return originOverride;
+  const repo = sessionsRepoFromEnv(env);
+  const token = sessionsTokenFromEnv(env);
+  return repo && token ? `https://x-access-token:${token}@github.com/${repo}.git` : null;
+}
+
 export function pushTaskBranch({ env, branch, allowed, workdir, log }) {
-  // W-C2-R (F6): the origin seam — CC_TASKBRANCH_ORIGIN (tests/ops override;
-  // the FSM_SESSIONS_ORIGIN pattern) wins; otherwise the github URL from
-  // GITHUB_REPOSITORY + the worker's own token lane.
-  const originOverride = env.CC_TASKBRANCH_ORIGIN;
-  const repo = env.GITHUB_REPOSITORY;
-  const token = env.GH_TOKEN || env.GITHUB_TOKEN;
-  const url = originOverride || (repo && token ? `https://x-access-token:${token}@github.com/${repo}.git` : null);
-  if (!url) throw new Error('artifact-push: needs GH_TOKEN + GITHUB_REPOSITORY (or CC_TASKBRANCH_ORIGIN)');
+  const url = taskBranchOriginUrl(env);
+  if (!url) throw new Error('artifact-push: needs FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (or the GITHUB_REPOSITORY/GH_TOKEN back-compat pair, or CC_TASKBRANCH_ORIGIN)');
   const taskId = branch.startsWith('tasks/') ? branch.slice('tasks/'.length) : branch;
   const scratch = mkdtempSync(join(tmpdir(), 'cc-taskbr-'));
   const wc = join(scratch, 'wc');
@@ -752,10 +762,11 @@ async function writeTranscript(envelope, runId, fake, result, opts, log) {
       writeFileSync(join(dir, paths.meta), meta);
       return { mode: 'local', dir, txt: paths.txt, meta: paths.meta };
     }
-    return pushSessionsBranch({
+    return pushSessionsContents({
       env: opts.env,
       files: new Map([[paths.txt, body], [paths.meta, meta]]),
       log,
+      fetchImpl: opts.fetchImpl,
     });
   };
   try {
@@ -783,6 +794,11 @@ export async function ccTurn(envelope, opts = {}) {
     transcriptsDir = null,   // fake-mode transcript root (tests/conformance)
     stageDir = null,         // artifact staging root (the W-C seam)
     echoDir = null,          // fake-mode spawn-boundary echo root (F-M7)
+    fetchImpl = null,        // s25/b1: the transcript lane's scripted-fetch seam
+                             // (rides the opts spread into writeTranscript →
+                             // pushSessionsContents → pushSessionFiles; the
+                             // mock-first pins drive the REAL-mode push with
+                             // zero network; null/absent = the live global fetch)
   } = opts;
 
   // envelope shape guards — the same contract the shim enforces
