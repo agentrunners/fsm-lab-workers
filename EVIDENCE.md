@@ -813,3 +813,15 @@ stay the soak's surface), and node 22 (the worker lane's major — v22.23.2
 on the runner) executed the adapter's `with { type: 'json' }` models.json
 import cleanly, live-proving the worker-lane compatibility the B2 suite
 could only pin locally on node 24.
+
+## X29 — the codex-mode soak (2026-09-24, issue #26, chain c-1790252766608)
+
+**THE MULTI-ENGINE CAPSTONE: the first `mode: codex` epoch — done 24/24, zero quarantined, zero failed, zero timeouts — the cleanest soak in the X-series** (X28: 20/24 + 4 designed-quarantined; X27: degraded on the dead lane). The epoch: 24 real codex turns at the X28 capacity shape (16/13/45), the intake door → the codex-mode genesis → the conductor dispatch → the worker's mode-gated codex install → the lane loop → reports → union verification → halt in **3 minutes 10 seconds wall** (12:26:11 → 12:29:01) — the fastest 24-task soak recorded (X28 took ~12 min for the same shape).
+
+**The economics (journal-sourced, recomputed from usage × the verified prices)**: 34 engine calls (the 24 tasks + the 10 infra-retry re-turns), 417,507 tokens, **$0.0249 total** — $0.00104/task — at the retuned 16-parallel ceiling. Per-turn lane data: `deepseek/deepseek-v4.1-flash`, ~10K tokens/turn, ~2.6s lanes, `key_index: 0, pool_size: 2, mode: codex` on every report — **the D5/D6 lane machinery live-proven end-to-end** (the lane_stats synthesis into the EXACT shared aggregate; the console/journal/alerts consumed it unchanged).
+
+**THE SOAK'S REAL CATCH — the fsm-sessions transcript-push race**: the first 16-parallel burst all pushed their transcripts to `fsm-sessions` simultaneously; the non-fast-forward losers got remote-rejected → classified `infra-retry(lane-unavailable, transcript-push-failed)` → re-assigned → **every one completed on the retry** (infra_retries=10, all absorbed — the net-zero ladder doing exactly its job). All 38 X29 transcript files landed on fsm-sessions by halt. THE POLISH ITEM (recorded for the W-D backlog): the transcript push wants the pull-rebase-retry discipline (or per-run subdirectory paths that never contend) — the race costs ~30% extra turns at the full 16-burst, absorbed today but pure waste at scale.
+
+**The artifact write-back**: tasks/T-X29-22/23/24 branches pushed with the report.md artifacts (the declared-artifacts door). T-X29-21's branch is absent from the branch list — its artifact rode the workdir scan (the branch list shows 3 of 4; the 21st's report landed via the same-epoch retry — the branch-vs-scan split recorded honestly; all 24 report done regardless).
+
+**The honest residuals**: tail_turns=0 (codex carries no :free tail — D4 by construction); the burst race above; single-bucket saturation (the overflow never fired at 16 in-flight with 45s leases — the mirror lane idle this epoch; the B3.5 parity is proven by the sync, not by traffic).
