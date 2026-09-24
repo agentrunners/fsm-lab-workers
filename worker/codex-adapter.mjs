@@ -93,10 +93,12 @@
 // TRANSCRIPTS (F15): sessions/<task>/<run>-a<attempt>.txt (+ .meta.json)
 // BEFORE codexTurn returns, with harness:'codex' + mode:'codex' provenance
 // (engine-derived, never the CC hardcode). Fake mode: a LOCAL dir
-// (opts.transcriptsDir / env.CODEX_FAKE_TRANSCRIPTS_DIR); real mode: git
-// push to the fsm-sessions branch (local implementation — cc-adapter is NOT
-// touched on this branch; pushTaskBranch below is the one IMPORTED
-// engine-neutral piece).
+// (opts.transcriptsDir / env.CODEX_FAKE_TRANSCRIPTS_DIR); real mode (s25/b1
+// — the X29 F3/F2 rebuild): per-file CONTENTS-API pushes via the shared
+// worker/sessions-push.mjs engine — race-free by construction (no shared
+// branch tip to fast-forward), on the FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN
+// custom-name seam (the GITHUB_* step-env override law — see
+// sessions-push.mjs) with the GITHUB_REPOSITORY/GH_TOKEN back-compat pair.
 //
 // ARTIFACTS (R1's law): NOTHING codex-owned lands in the workdir — the -o
 // file, the fallback CODEX_HOME, and the lane-stats scratch all live in the
@@ -118,7 +120,7 @@
 // {key_index, model, rc, duration_ms, class}, models tried, real duration,
 // plus key_index/pool_size (the s21/O-3 pair) exactly like ccTurn.
 
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';   // s25/b1: spawnSync left with the git-lane push (the contents API needs no subprocess)
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, statSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, relative } from 'node:path';
@@ -127,9 +129,15 @@ import { classifyOutcome, writeBackDoor } from '../lib/worker-contract.mjs';
 import { collectLaneStats, laneLogLine } from './lane-telemetry.mjs';
 // the W-C2 task-branch write-back is engine-neutral (workdir + the door's
 // allowed set in, branch + read-back out) — IMPORTED from the CC adapter
-// rather than refactored (this branch touches zero cc-adapter lines; the
-// import IS the cheap engine-neutral extraction the design's B2 row names).
+// rather than refactored (the import IS the cheap engine-neutral extraction
+// the design's B2 row names; s25/b1 wires ITS origin seam to the shared
+// FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN resolution in cc-adapter.mjs).
 import { pushTaskBranch } from './cc-adapter.mjs';
+// s25/b1 (the X29 F3/F2 rebuild): the transcript lane's shared contents-API
+// engine + the custom-name repo/token seam — race-free by construction, the
+// repo the files land on explicit (the law + the live lesson are recorded at
+// the top of worker/sessions-push.mjs).
+import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv } from './sessions-push.mjs';
 // the single-source model table (D5b): ctx + retries + idle + prices + peak.
 // Key order IS the model-major lane order (deepseek first — the value pick).
 import CODEX_MODELS_JSON from './codex/models.json' with { type: 'json' };
@@ -574,43 +582,37 @@ function codexTranscriptMeta(envelope, runId, fake, result, nowIso) {
   }, null, 2) + '\n';
 }
 
-// the real-mode push: a shallow clone/push of the fsm-sessions branch (the
-// token never reaches a log line). Retry-once semantics live at the caller.
-function pushSessionsBranch({ env, files, log }) {
-  const repo = env.GITHUB_REPOSITORY;
-  const token = env.GH_TOKEN || env.GITHUB_TOKEN;
-  if (!repo || !token) throw new Error('sessions push needs GH_TOKEN + GITHUB_REPOSITORY');
-  const url = `https://x-access-token:${token}@github.com/${repo}.git`;
-  const scratch = mkdtempSync(join(tmpdir(), 'codex-sessions-'));
-  const wc = join(scratch, 'wc');
-  mkdirSync(wc, { recursive: true });
-  const git = (args) => spawnSync('git', args, { cwd: wc, encoding: 'utf8' });
-  const fail = (step, r) => new Error(`${step} failed: ${String(r.stderr || r.error || `rc=${r.status}`).trim().slice(0, 160)}`);
-  try {
-    const clone = git(['clone', '--depth', '1', '--branch', 'fsm-sessions', '--single-branch', url, '.']);
-    if (clone.status !== 0) {
-      const init = git(['init', '-b', 'fsm-sessions', '.']);
-      if (init.status !== 0) throw fail('git init', init);
-      const remote = git(['remote', 'add', 'origin', url]);
-      if (remote.status !== 0) throw fail('git remote', remote);
-      log(`CODEX-SESSIONS-GENESIS fsm-sessions branch absent — orphan genesis (clone stderr: ${String(clone.stderr).trim().slice(0, 120)})`);
-    }
-    for (const [rel, content] of files) {
-      mkdirSync(dirname(join(wc, rel)), { recursive: true });
-      writeFileSync(join(wc, rel), content);
-    }
-    const add = git(['add', ...[...files.keys()]]);
-    if (add.status !== 0) throw fail('git add', add);
-    const commit = git(['-c', 'user.name=fsm-worker', '-c', 'user.email=fsm-worker@users.noreply.github.com',
-      'commit', '-m', 'transcript: sessions update']);
-    if (commit.status !== 0) throw fail('git commit', commit);
-    const push = git(['push', 'origin', 'fsm-sessions']);
-    if (push.status !== 0) throw fail('git push', push);
-    log(`CODEX-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions`);
-    return { mode: 'pushed', branch: 'fsm-sessions', files: [...files.keys()] };
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
-  }
+// the real-mode push (s25/b1 — the X29 F3 rebuild): per-file contents-API
+// CAS via the shared worker/sessions-push.mjs engine — race-free by
+// construction (no shared branch tip to fast-forward, no ref lock, no
+// clone: the 13-parallel X29 convoy that re-turned 10 runs / $0.005701 /
+// 100,911 tokens is structurally gone). The repo/token seam is the F2 law:
+// FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN (the custom names that REACH the
+// process on real runners — step-env overrides of GITHUB_* defaults are
+// silently ignored by the runner) with the GITHUB_REPOSITORY/GH_TOKEN
+// back-compat pair for tests/sims that set the old vocabulary. The token
+// never reaches a log line (the Authorization header only). Retry ladder:
+// the engine's per-PUT budget (3 attempts, backoff+jitter, 409/422/5xx/
+// network) + the caller's ONE whole-set retry below.
+async function pushSessionsContents({ env, files, log, fetchImpl }) {
+  const repo = sessionsRepoFromEnv(env);
+  const token = sessionsTokenFromEnv(env);
+  if (!repo || !token) throw new Error('sessions push needs FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (or the GITHUB_REPOSITORY/GH_TOKEN back-compat pair)');
+  const out = await pushSessionFiles({
+    repo,
+    token,
+    branch: 'fsm-sessions',
+    files: [...files].map(([path, content]) => ({ path, content, message: `transcript: ${path}` })),
+    log,
+    env,
+    fetchImpl,
+  });
+  // the pinned line SHAPE stays byte-compatible for the run-log consumers;
+  // the repo the files LANDED on is APPENDED — the X29 lesson (the split
+  // record was invisible in the log: the line said fsm-sessions while the
+  // files sat on the mirror repo)
+  log(`CODEX-TRANSCRIPT-PUSHED ${files.size} file(s) to fsm-sessions @ ${repo}`);
+  return out;
 }
 
 async function writeCodexTranscript(envelope, runId, fake, result, opts, log) {
@@ -625,10 +627,11 @@ async function writeCodexTranscript(envelope, runId, fake, result, opts, log) {
       writeFileSync(join(dir, paths.meta), meta);
       return { mode: 'local', dir, txt: paths.txt, meta: paths.meta };
     }
-    return pushSessionsBranch({
+    return pushSessionsContents({
       env: opts.env,
       files: new Map([[paths.txt, body], [paths.meta, meta]]),
       log,
+      fetchImpl: opts.fetchImpl,
     });
   };
   try {
@@ -674,6 +677,11 @@ export async function codexTurn(envelope, opts = {}) {
     stageDir = null,         // artifact staging root (the W-C seam)
     echoDir = null,          // fake-mode spawn-boundary echo root
     pushTaskBranchImpl = null,
+    fetchImpl = null,       // s25/b1: the transcript lane's scripted-fetch seam
+                             // (rides the opts spread into writeCodexTranscript →
+                             // pushSessionsContents → pushSessionFiles; the mock-
+                             // first pins drive the REAL-mode push with zero
+                             // network; null/absent = the live global fetch)
   } = opts;
 
   // envelope shape guards — the same contract the shim/cc adapters enforce
