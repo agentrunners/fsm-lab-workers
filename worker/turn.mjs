@@ -82,8 +82,14 @@ export function sleepCapMs(env = process.env) {
 // seam; one OpenRouter completion stands in for a CC turn), on the
 // env-driven model chain.
 //
-// The chain (T46/W-D §D1): [OPENROUTER_MODEL env (optional), nemotron-3.5,
-// deepseek-v4-flash, cohere] — the s19 eval verdict. dots-studio demoted OUT
+// The chain (T46/W-D §D1 + the s24 reorder): [OPENROUTER_MODEL env
+// (optional), cohere, nemotron-3.5] — the s19 eval verdict with the s24
+// FLIP: the live eval (2026-09-24, scripts/s24-cohere-tail-results.json)
+// puts cohere at 6/6 (200s on every key class incl. drained/overdrawn,
+// content-bearing turns 4-9.5s, zero transport-class failures) vs
+// nemotron's 1/6 (4×500 + 1×504, failure latencies 30-150s) — nemotron
+// DEMOTED to second choice, the 500-tax ACTIVE and worse than s23's 2/6.
+// dots-studio demoted OUT
 // (0% content at the production max_tokens — reasoning eats the budget) and
 // nemotron-3-ultra demoted to never (p95 32s + 30s burst walls, the exact
 // upstream-rate-limit "long container wait" class). The RETIRED
@@ -103,15 +109,20 @@ export function sleepCapMs(env = process.env) {
 // ---------------------------------------------------------------------------
 
 export const REAL_MODEL_CHAIN_DEFAULTS = [
-  'nvidia/nemotron-3.5-lightning:free',
+  // s24 — THE FLIP: cohere leads the free chain. The live eval
+  // (2026-09-24, scripts/s24-cohere-tail-results.json): cohere 6/6 — 200s
+  // on the 32K pre-flight across 4 key classes incl. drained/overdrawn,
+  // content-bearing turn-shaped completions 4-9.5s — vs nemotron 1/6
+  // (4×500+504, 30-150s failure latencies: the 500-tax ACTIVE at its
+  // worst). nemotron demoted to second choice.
   'cohere/north-mini-code:free',
+  'nvidia/nemotron-3.5-lightning:free',
   // s23 (the cctail design §1b/§6.5): deepseek/deepseek-v4-flash-0731:free
   // REMOVED — 404 not_found_error on every key class (the live probe,
   // 2026-09-23; the slug is gone from the upstream catalog). The s19
   // poison exclusion ('hallucinated the task — never unsupervised') is now
   // self-enforcing upstream; the slot was a guaranteed-404 rotation hop.
-  // cohere/north-mini-code:free PROMOTED to slot 2 (the cctail probe's
-  // reliability pick: 6/6 across five key classes, 978ms-5.2s, 256K ctx).
+  // s23 promoted cohere to slot 2; s24 promotes it to slot 1 (the flip).
 ];
 
 export function realModelChain(env = process.env) {

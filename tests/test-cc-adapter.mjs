@@ -26,10 +26,10 @@ import {
   ccTurn, ccLanes, ccKeyPool, ccModelChain, ccArgv, ccLaneEnv, ccCliVersion,
   ccExitJson, ccApiErrorStatus, ccChildEnv, ccNextLaneIndex, CC_ENV_DENYLIST,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
-  CC_KEY_CLASS_STATUSES, artifactPushEscalation,
+  CC_KEY_CLASS_STATUSES, CC_TAIL_MODEL_DEFAULT, artifactPushEscalation,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
-import { composeReportOutcome } from '../worker/turn.mjs';
+import { composeReportOutcome, REAL_MODEL_CHAIN_DEFAULTS } from '../worker/turn.mjs';
 
 const KEY1 = 'cc-test-key-one';
 const KEY2 = 'cc-test-key-two';
@@ -108,11 +108,11 @@ test('cc lanes: the key pool × model chain product, KEY-MAJOR flatten (D2)', ()
     [1, 'vendor/custom-model'],
     [1, 'deepseek/deepseek-v4.1-flash'],
     [1, 'z-ai/glm-5.3-flash'],
-    [1, 'nvidia/nemotron-3.5-lightning:free'],
+    [1, 'cohere/north-mini-code:free'],
     [2, 'vendor/custom-model'],
     [2, 'deepseek/deepseek-v4.1-flash'],
     [2, 'z-ai/glm-5.3-flash'],
-    [2, 'nvidia/nemotron-3.5-lightning:free'],
+    [2, 'cohere/north-mini-code:free'],
   ], 'every model on key 1 before key 2\'s first');
   assert.ok(lanes.every(l => l.key === (l.keyIndex === 1 ? KEY1 : KEY2)));
 });
@@ -127,8 +127,8 @@ test('cc lanes: a single key collapses the pool; an empty pool yields NO lanes',
 });
 
 test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are the s19 eval verdict (D2)', () => {
-  assert.deepEqual(CC_MODEL_CHAIN_DEFAULTS, ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'nvidia/nemotron-3.5-lightning:free'],
-    'D2: deepseek-v4.1-flash primary (20.6s turn, 4/4 calls, flawless content), glm-5.3-flash fallback (provider diversity), nemotron free tail');
+  assert.deepEqual(CC_MODEL_CHAIN_DEFAULTS, ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'cohere/north-mini-code:free'],
+    'D2: deepseek-v4.1-flash primary (20.6s turn, 4/4 calls, flawless content), glm-5.3-flash fallback (provider diversity), cohere free tail (the s24 flip)');
   assert.deepEqual(ccModelChain({}), CC_MODEL_CHAIN_DEFAULTS);
   assert.equal(ccModelChain({ CC_MODEL: ' x/y ' })[0], 'x/y');
   assert.deepEqual(ccModelChain({ CC_MODEL: '' }), CC_MODEL_CHAIN_DEFAULTS, 'empty = absent');
@@ -139,13 +139,35 @@ test('cc model chain: CC_MODEL env heads the chain (trimmed); the defaults are t
   assert.deepEqual(ccModelChain({ CC_MODEL: 'deepseek/deepseek-v4.1-flash' }), CC_MODEL_CHAIN_DEFAULTS,
     'W7: the DEPLOYED shape — a duplicate head collapses to the defaults, no repeat lane');
   assert.deepEqual(ccModelChain({ CC_MODEL: 'z-ai/glm-5.3-flash' }),
-    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'nvidia/nemotron-3.5-lightning:free'],
+    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'cohere/north-mini-code:free'],
     'W7: custom wins the head; the duplicated default slot drops (3 lanes/key, not 4)');
   assert.equal(ccLanes({ OPENROUTER_API_KEY: KEY1, OPENROUTER_API_KEY_2: KEY2, CC_MODEL: 'deepseek/deepseek-v4.1-flash' }).length, 6,
     'W7 end-to-end: the deployed config is 2 keys × 3 distinct models = 6 lanes, not 8');
   assert.ok(!JSON.stringify(ccModelChain({})).includes('minimax'), 'the retired slug stays dead');
   assert.ok(!JSON.stringify(CC_MODEL_CHAIN_DEFAULTS).includes('deepseek-v4-flash-0731'),
     'D2 NEVER: the hallucinating free slug on the cc lane (silent content-poison, measured live)');
+});
+
+test('cc model chain: s24 — THE TAIL FLIP pin (CC_TAIL_MODEL_DEFAULT === cohere; cohere before any nvidia slug on BOTH free chains)', () => {
+  // s24 live eval: cohere 6/6 vs nemotron 1/6 (4×500+504, 30-150s failure
+  // latencies) — scripts/s24-cohere-tail-results.json. The pre-registered
+  // flip rule (research/s23-cc-tail.md §7 open question 1) met: the
+  // s23 "never CLI-evaluated" objection died with the live eval (the
+  // turn-shaped probes answered content-bearing in 4-9.5s on every key
+  // class incl. drained/overdrawn).
+  assert.equal(CC_TAIL_MODEL_DEFAULT, 'cohere/north-mini-code:free', 'the s24 flip: the tail default is cohere');
+  const chain = ccModelChain({});
+  assert.equal(chain[chain.length - 1], CC_TAIL_MODEL_DEFAULT, 'the tail rides the chain\'s LAST slot');
+  const cohereAt = chain.indexOf('cohere/north-mini-code:free');
+  const nvidiaAt = chain.findIndex((m) => m.startsWith('nvidia/'));
+  assert.ok(cohereAt !== -1 && (nvidiaAt === -1 || cohereAt < nvidiaAt),
+    'cohere precedes any nvidia slug in the default cc chain (nvidia is fully absent here — demoted to the CC_TAIL_MODEL override)');
+  // the real-lane free chain (worker/turn.mjs) — the order pin that BITES:
+  // cohere first, nemotron demoted to second choice
+  const realCohereAt = REAL_MODEL_CHAIN_DEFAULTS.indexOf('cohere/north-mini-code:free');
+  const realNvidiaAt = REAL_MODEL_CHAIN_DEFAULTS.findIndex((m) => m.startsWith('nvidia/'));
+  assert.ok(realCohereAt === 0 && realNvidiaAt > realCohereAt,
+    `the real-lane free chain leads with cohere (cohere@${realCohereAt} < nvidia@${realNvidiaAt}) — the s24 eval order`);
 });
 
 test('cc argv: the REAL spawn vector (npx form) — -p, --max-turns, json output, the SA-5 denies', () => {
@@ -551,8 +573,8 @@ test('cc s23 HEADLINE (B1+B2+B3): BOTH keys 402-shaped at the dispatched budget 
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model, l.class]), [
     [1, 'deepseek/deepseek-v4.1-flash', 'infra'],
     [2, 'deepseek/deepseek-v4.1-flash', 'infra'],
-    [2, 'nvidia/nemotron-3.5-lightning:free', 'done'],
-  ], 'k1ds(402) →JUMP→ k2ds(402) →TAIL→ k2nem(:free) — the brief\'s exact arithmetic');
+    [2, 'cohere/north-mini-code:free', 'done'],
+  ], 'k1ds(402) →JUMP→ k2ds(402) →TAIL→ k2cohere(:free) — the brief\'s exact arithmetic, the s24 flip tail');
   // B3: the free-tail marker rides the laneLog row (the slug derivation)
   assert.equal(result.telemetry.lanes[2].lane_class, 'free-tail');
   assert.equal('lane_class' in result.telemetry.lanes[0], false, 'the paid lanes carry no tail marker');
@@ -560,7 +582,7 @@ test('cc s23 HEADLINE (B1+B2+B3): BOTH keys 402-shaped at the dispatched budget 
   // the tail inherits the last auth-known-alive key (the W1 key-jump has
   // already rotated past auth-dead keys by the time the tail fires)
   const e2 = readEcho(roots, 2);
-  assert.equal(e2.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(e2.env.ANTHROPIC_MODEL, 'cohere/north-mini-code:free');
   assert.equal(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2, 'the tail rides the LAST key (both paid keys dry, key 2 still auth-alive)');
   roots.cleanup();
 });
@@ -579,8 +601,11 @@ test('cc s23 (B2 escape hatch): CC_TAIL_MODEL=\'\' — the both-keys-dry arc is 
   roots.cleanup();
 });
 
-test('cc s23 (B2 swap): CC_TAIL_MODEL=cohere — the tail slot swaps without a code change (the reliability alternative, one env line)', async () => {
-  const { result, roots } = await turn(fakeEnv({ CC_TAIL_MODEL: 'cohere/north-mini-code:free' }), {
+test('cc s23 (B2 swap): CC_TAIL_MODEL=nemotron — the tail slot swaps without a code change (the s24-demoted model is now the override alternative, one env line)', async () => {
+  // s24: the default tail is cohere (the flip); the swap mechanism pins on
+  // the DEMOTED nemotron — a distinct slug, so the override stays provably
+  // a real swap (not a no-op against the new default).
+  const { result, roots } = await turn(fakeEnv({ CC_TAIL_MODEL: 'nvidia/nemotron-3.5-lightning:free' }), {
     prompt: '[fixture:exit-api-402-unless-free] go',
     budget: { max_turns: 40, wall_ms: 60_000, lane_attempts: 3 },
   });
@@ -588,7 +613,7 @@ test('cc s23 (B2 swap): CC_TAIL_MODEL=cohere — the tail slot swaps without a c
   assert.deepEqual(result.telemetry.lanes.map(l => l.model), [
     'deepseek/deepseek-v4.1-flash',
     'deepseek/deepseek-v4.1-flash',
-    'cohere/north-mini-code:free',
+    'nvidia/nemotron-3.5-lightning:free',
   ]);
   assert.equal(result.telemetry.lanes[2].lane_class, 'free-tail');
   roots.cleanup();
@@ -626,7 +651,7 @@ test('cc s23 (the bridge, not an immunity): the tail ALSO fails key-class — th
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
     [2, 'deepseek/deepseek-v4.1-flash'],
-    [2, 'nvidia/nemotron-3.5-lightning:free'],
+    [2, 'cohere/north-mini-code:free'],
   ], 'the third slot is still the tail — it just ALSO 402s (the exhaustion shape is unchanged)');
   roots.cleanup();
 });
@@ -648,7 +673,7 @@ test('cc W1: single-key pool — the key-jump degenerates to the tail skip (the 
   assert.match(result.detail, /lane-exhausted\(2\/3 lanes, last lane-429\)/);
   assert.deepEqual(result.telemetry.lanes.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
-    [1, 'nvidia/nemotron-3.5-lightning:free'],
+    [1, 'cohere/north-mini-code:free'],
   ], 'the 1-key key-class ladder: ds → the :free tail (glm skipped — credit-dead sibling)');
   roots.cleanup();
 });
@@ -680,9 +705,9 @@ test('cc lane advance (W1 pure): ccNextLaneIndex — key-class jumps the key blo
 });
 
 test('cc tail (s23/B1 pure): the LAST key\'s key-class failure skips the paid siblings — the same key\'s next `:free` slot', () => {
-  const lanes = ccLanes(fakeEnv());   // 6 lanes: k1[ds,glm,nem], k2[ds,glm,nem]
+  const lanes = ccLanes(fakeEnv());   // 6 lanes: k1[ds,glm,coh], k2[ds,glm,coh]
   // THE RULE (the W1 live arc's fix, design §2.1): i=3 (k2/ds) key-class →
-  // NO next key → the same key's next :free slot (5 = k2/nemotron:free),
+  // NO next key → the same key's next :free slot (5 = k2/cohere:free),
   // NOT +1 (4 = k2/glm — the paid sibling that shares the dead key's
   // credit state: probe §1a, glm 402s wherever deepseek 402s on every
   // drained key; the W1 live arc burned its third slot exactly there)
@@ -726,8 +751,10 @@ test('cc tail (s23/B2 pure): CC_TAIL_MODEL — the override, the `:free` hard ru
   assert.ok(CC_MODEL_CHAIN_DEFAULTS[CC_MODEL_CHAIN_DEFAULTS.length - 1].endsWith(':free'),
     'the chain\'s LAST slot is the :free tail');
   // the override: a valid :free slug swaps the tail without a code change
-  assert.deepEqual(ccModelChain({ CC_TAIL_MODEL: 'cohere/north-mini-code:free' }),
-    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'cohere/north-mini-code:free']);
+  // (s24: the demo swaps to the DEMOTED nemotron — cohere is now the
+  // default, so this pin stays a distinct-slug swap proof)
+  assert.deepEqual(ccModelChain({ CC_TAIL_MODEL: 'nvidia/nemotron-3.5-lightning:free' }),
+    ['deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash', 'nvidia/nemotron-3.5-lightning:free']);
   // the hard rule (§2.7 item 1): a paid tail throws LOUD — even an APPROVED
   // paid model (the tail is the FREE lane by design; a paid tail would
   // burn credit on the exact path taken when credit is the problem)
@@ -758,9 +785,9 @@ test('cc tail (s23/B2 pure): CC_TAIL_MODEL — the override, the `:free` hard ru
   // defaults, and a custom head that IS the tail model dedups the tail slot
   // (no exact (key, model) repeat at m1 AND m3)
   assert.deepEqual(ccModelChain({ CC_MODEL: 'z-ai/glm-5.3-flash' }),
-    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'nvidia/nemotron-3.5-lightning:free']);
-  assert.deepEqual(ccModelChain({ CC_MODEL: 'nvidia/nemotron-3.5-lightning:free' }),
-    ['nvidia/nemotron-3.5-lightning:free', 'deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
+    ['z-ai/glm-5.3-flash', 'deepseek/deepseek-v4.1-flash', 'cohere/north-mini-code:free']);
+  assert.deepEqual(ccModelChain({ CC_MODEL: 'cohere/north-mini-code:free' }),
+    ['cohere/north-mini-code:free', 'deepseek/deepseek-v4.1-flash', 'z-ai/glm-5.3-flash'],
     'the free-as-head chain: the tail slot dedups (W7 discipline); the free slot sits at m1');
 });
 

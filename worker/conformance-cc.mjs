@@ -317,7 +317,7 @@ matrix.push(await matrixRow({
       && eq(JSON.stringify(ladder), JSON.stringify([
         [1, 'deepseek/deepseek-v4.1-flash', 'infra'],
         [2, 'deepseek/deepseek-v4.1-flash', 'infra'],
-        [2, 'nvidia/nemotron-3.5-lightning:free', 'done'],
+        [2, 'cohere/north-mini-code:free', 'done'],
       ]))
       && eq(result.telemetry.lanes[2].lane_class, 'free-tail')
       && eq('lane_class' in result.telemetry.lanes[0], false),
@@ -327,7 +327,7 @@ matrix.push(await matrixRow({
   // rotated past auth-dead keys by the time the tail fires)
   const e2 = readEcho(roots, 2);
   check('tail (s23): the third spawn rode the :free slug on the LAST key (the tail inherits the last auth-alive key)',
-    eq(e2.env.ANTHROPIC_MODEL, 'nvidia/nemotron-3.5-lightning:free') && eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2),
+    eq(e2.env.ANTHROPIC_MODEL, 'cohere/north-mini-code:free') && eq(e2.env.ANTHROPIC_AUTH_TOKEN, KEY2),
     `model=${e2.env.ANTHROPIC_MODEL} auth=${e2.env.ANTHROPIC_AUTH_TOKEN === KEY2 ? 'key2 (last)' : 'OTHER'}`);
   rmSync(roots, { recursive: true, force: true });
 }
@@ -348,7 +348,7 @@ matrix.push(await matrixRow({
       && eq(JSON.stringify(ladder), JSON.stringify([
         [1, 'deepseek/deepseek-v4.1-flash'],
         [2, 'deepseek/deepseek-v4.1-flash'],
-        [2, 'nvidia/nemotron-3.5-lightning:free'],
+        [2, 'cohere/north-mini-code:free'],
       ])),
     `status=${result.status} detail=${result.detail} used=${result.lane_attempts_used} ladder=${JSON.stringify(ladder)}`);
   rmSync(roots, { recursive: true, force: true });

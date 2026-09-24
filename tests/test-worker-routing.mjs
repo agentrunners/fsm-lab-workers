@@ -271,20 +271,22 @@ const jsonRes = (status, body) => new Response(JSON.stringify(body), { status, h
 const okBody = (text) => ({ choices: [{ message: { content: text } }] });
 const models = (fetches) => fetches.map(([, init]) => JSON.parse(init.body).model);
 
-test('routing: real chain — D1: nemotron-3.5 leads, dots-studio/nemotron-3-ultra demoted OUT; the free defaults lead', () => {
-  assert.deepEqual(realModelChain({}), ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);  // s23: the 0731 dead slug removed (404 upstream); cohere promoted to slot 2
+test('routing: real chain — s24 FLIP: cohere leads (the live-eval verdict), nemotron demoted to second choice; the free defaults lead', () => {
+  assert.deepEqual(realModelChain({}), ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free']);  // s24 live eval: cohere 6/6 vs nemotron 1/6 (4×500+504, 30-150s failure latencies) — scripts/s24-cohere-tail-results.json; s23: the 0731 dead slug removed (404 upstream)
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: '' }), realModelChain({}), 'empty env model = absent');
   assert.deepEqual(realModelChain({ OPENROUTER_MODEL: ' x/y ' })[0], 'x/y', 'env model heads the chain (trimmed)');
   assert.ok(!JSON.stringify(realModelChain({})).includes('minimax'), 'the retired slug stays dead');
   assert.ok(!JSON.stringify(realModelChain({})).includes('dots-studio'), 'D1: dots-studio demoted OUT — 0% content at the production shape');
   assert.ok(!JSON.stringify(realModelChain({})).includes('nemotron-3-ultra'), 'D1: nemotron-3-ultra demoted to never — p95 32s + 30s burst walls');
+  assert.ok(realModelChain({}).indexOf('cohere/north-mini-code:free') < realModelChain({}).findIndex(m => m.startsWith('nvidia/')),
+    's24: cohere BEFORE any nvidia slug — the flip order (the eval: 6/6 vs 1/6)');
 });
 
 test('routing: real fallback — primary 429 → ONE hop → the fallback model completes', async () => {
   const h = makeHarness({
     cp: legacyCp({ mode: 'real', behavior: null }),
     env: { OPENROUTER_API_KEY: 'k' },
-    fetchImpl: async (url, init) => JSON.parse(init.body).model.includes('nemotron')
+    fetchImpl: async (url, init) => JSON.parse(init.body).model.includes('cohere')
       ? jsonRes(429, { error: { message: 'rate limited' } })
       : jsonRes(200, okBody('the fallback answer')),
   });
@@ -292,8 +294,8 @@ test('routing: real fallback — primary 429 → ONE hop → the fallback model 
   assert.equal(r.exitCode, 0);
   assert.equal(h.enqueued[0].outcome.status, 'done');
   assert.equal(h.enqueued[0].outcome.artifact, 'the fallback answer');
-  assert.deepEqual(models(h.fetches), ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free'], 'exactly one hop');
-  assert.deepEqual(h.enqueued[0].outcome.models, ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);
+  assert.deepEqual(models(h.fetches), ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free'], 'exactly one hop (the s24 order: cohere primary, nemotron fallback)');
+  assert.deepEqual(h.enqueued[0].outcome.models, ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free']);
   assert.equal(h.enqueued[0].outcome.telemetry.lane_attempts_used, 2);
 });
 
@@ -306,7 +308,7 @@ test('routing: real fallback — OPENROUTER_MODEL heads the chain and is hopped 
       : jsonRes(200, okBody('after the custom lane')),
   });
   await h.turn();
-  assert.deepEqual(models(h.fetches), ['custom/model-x', 'nvidia/nemotron-3.5-lightning:free']);
+  assert.deepEqual(models(h.fetches), ['custom/model-x', 'cohere/north-mini-code:free']);
   assert.equal(h.enqueued[0].outcome.status, 'done');
 });
 
@@ -339,7 +341,7 @@ test('routing: real transport throw on the primary → infra hop → done', asyn
     cp: legacyCp({ mode: 'real' }),
     env: { OPENROUTER_API_KEY: 'k' },
     fetchImpl: async (url, init) => {
-      if (JSON.parse(init.body).model.includes('nemotron')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
+      if (JSON.parse(init.body).model.includes('cohere')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
       return jsonRes(200, okBody('post-transport'));
     },
   });
@@ -380,7 +382,7 @@ test('routing: realWork is directly drivable (the lane chain, no full turn)', as
     fetchImpl: async (u, init) => { fetches.push(JSON.parse(init.body).model); return jsonRes(200, okBody('direct')); },
   });
   assert.equal(raw.content, 'direct');
-  assert.deepEqual(fetches, ['nvidia/nemotron-3.5-lightning:free']);
+  assert.deepEqual(fetches, ['cohere/north-mini-code:free']);
 });
 
 test('routing: real max_tokens — D1: the completion budget is 512 (the seam: the request body the fetch receives)', async () => {
@@ -396,27 +398,27 @@ test('routing: real max_tokens — D1: the completion budget is 512 (the seam: t
   assert.equal(h.fetches.length, 1);
   const body = JSON.parse(h.fetches[0][1].body);
   assert.equal(body.max_tokens, 512, 'the request body carries the 512 completion budget');
-  assert.equal(body.model, 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(body.model, 'cohere/north-mini-code:free');
 });
 
 test('routing: real hop_telemetry — per-hop {model, ms, status} on the two-hop fixture (429 → 200; D4-G5 real-lane half)', async () => {
   const env = { task_ref: { kind: 'state-task', id: 'T1' }, prompt: 'p', deadline_ms: NOW + 600_000, session: 's', budget: { max_turns: 40, wall_ms: 480_000, lane_attempts: 3 }, mode: 'real', attempt: 1 };
   const raw = await realWork(env, {
     env: { OPENROUTER_API_KEY: 'k' },
-    fetchImpl: async (u, init) => JSON.parse(init.body).model.includes('nemotron')
+    fetchImpl: async (u, init) => JSON.parse(init.body).model.includes('cohere')
       ? jsonRes(429, { error: { message: 'rate limited' } })
       : jsonRes(200, okBody('telemetry after the hop')),
   });
   assert.equal(raw.content, 'telemetry after the hop');
-  assert.deepEqual(raw.models, ['nvidia/nemotron-3.5-lightning:free', 'cohere/north-mini-code:free']);
+  assert.deepEqual(raw.models, ['cohere/north-mini-code:free', 'nvidia/nemotron-3.5-lightning:free']);
   assert.ok(Array.isArray(raw.hop_telemetry), 'the optional per-hop field rides the raw lane return');
   assert.equal(raw.hop_telemetry.length, 2, 'one entry per attempted hop');
   const [hop1, hop2] = raw.hop_telemetry;
   assert.deepEqual(Object.keys(hop1).sort(), ['model', 'ms', 'status'], 'the minimal G5 shape');
-  assert.equal(hop1.model, 'nvidia/nemotron-3.5-lightning:free');
+  assert.equal(hop1.model, 'cohere/north-mini-code:free');
   assert.equal(hop1.status, 429, 'the first hop carries the lane answer that triggered the hop');
   assert.ok(Number.isFinite(hop1.ms) && hop1.ms >= 0, 'the hop wall is a finite ms');
-  assert.equal(hop2.model, 'cohere/north-mini-code:free');
+  assert.equal(hop2.model, 'nvidia/nemotron-3.5-lightning:free');
   assert.equal(hop2.status, 200);
   assert.ok(Number.isFinite(hop2.ms) && hop2.ms >= 0);
 });
@@ -426,7 +428,7 @@ test('routing: real hop_telemetry — the transport hop records status \'transpo
   const raw = await realWork(env, {
     env: { OPENROUTER_API_KEY: 'k' },
     fetchImpl: async (u, init) => {
-      if (JSON.parse(init.body).model.includes('nemotron')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
+      if (JSON.parse(init.body).model.includes('cohere')) throw Object.assign(new Error('fetch failed'), { name: 'TimeoutError' });
       return jsonRes(200, okBody('after transport'));
     },
   });
@@ -614,18 +616,18 @@ test('routing: W2 payload with mode=cc — the envelope budget bounds the lane c
   assert.match(rep.outcome.error, /lane-exhausted\(3\/6 lanes/);
   // s23/B5 — THE BEHAVIORAL PIN (the mutation spot): s21/W1's key-jump puts
   // attempt 2 on key-2 deepseek; attempt 3 — the LAST key's key-class
-  // failure — now lands on the FREE TAIL (k2/nemotron:free), NOT the paid
-  // glm sibling (was [k1/ds, k2/ds, k2/glm] pre-s23: the glm slot burned on
-  // a model that shares the dead key's credit state while the :free slot
-  // sat one index away). The tail ALSO 429s here (the plain marker fires on
-  // every lane — the honest both-keys-quota-dead shape) → the exhaustion
-  // message is UNCHANGED: lane-exhausted(3/6) — the tail is a bridge, not
-  // an immunity.
+  // failure — now lands on the FREE TAIL (k2/cohere:free, the s24 flip),
+  // NOT the paid glm sibling (was [k1/ds, k2/ds, k2/glm] pre-s23: the glm
+  // slot burned on a model that shares the dead key's credit state while
+  // the :free slot sat one index away). The tail ALSO 429s here (the plain
+  // marker fires on every lane — the honest both-keys-quota-dead shape) →
+  // the exhaustion message is UNCHANGED: lane-exhausted(3/6) — the tail is
+  // a bridge, not an immunity.
   assert.deepEqual(rep.outcome.telemetry.lanes?.map(l => [l.key_index, l.model]), [
     [1, 'deepseek/deepseek-v4.1-flash'],
     [2, 'deepseek/deepseek-v4.1-flash'],
-    [2, 'nvidia/nemotron-3.5-lightning:free'],
-  ], 'key-jump after the key-1 429, then the FREE TAIL — three spawns, two keys served, the third slot is the :free lane');
+    [2, 'cohere/north-mini-code:free'],
+  ], 'key-jump after the key-1 429, then the FREE TAIL (the s24 cohere default) — three spawns, two keys served, the third slot is the :free lane');
   assert.equal(rep.outcome.telemetry.lanes[2].lane_class, 'free-tail', 'B3: the tail marker rides the laneLog row');
 });
 
