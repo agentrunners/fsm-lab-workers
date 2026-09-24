@@ -391,6 +391,15 @@ async function codexWork(envelope, opts = {}) {
 //                   historical slots are ambiguous across pool redeploys
 //                   (the registry's git history was the only recovery)
 //   hop_telemetry   lane A's real-lane per-hop [{model, ms, status}])
+//   mode            s24/B9: the turn's ENGINE provenance (envelope.mode — the
+//                   B1 vocabulary) — the console's lane-engine column source.
+//                   The M4 lesson applied BEFORE the drop can happen: the
+//                   journal's REPORT records had NO engine/mode marker (the
+//                   lane_stats.models slugs are SHARED between the cc and
+//                   codex chains — deepseek/glm ride both), so the console
+//                   could not derive the engine dimension from anything the
+//                   journal carried; the mode rides the same allowlist
+//                   lane_stats does (this composer is THE named drop point).
 // Without these entries the adapter's richest data dies HERE — the exact
 // silent-drop class W-C2's prCandidates taught (M4's whole point: this
 // composer is the first named drop point between the adapter and the drain).
@@ -401,7 +410,7 @@ async function codexWork(envelope, opts = {}) {
 const SLICE = 200;
 const slice = (s) => String(s).slice(0, SLICE);
 
-export function composeReportOutcome(classified, raw, durationMs) {
+export function composeReportOutcome(classified, raw, durationMs, { mode } = {}) {
   const outcome = { status: classified.status };
   if (classified.detail !== undefined && classified.detail !== null) outcome.error = slice(classified.detail);
   if (classified.status === 'done') {
@@ -426,6 +435,11 @@ export function composeReportOutcome(classified, raw, durationMs) {
   // the pair is the self-describing slot (index + modulo base) in the journal.
   if (Number.isFinite(raw?.pool_size)) outcome.pool_size = raw.pool_size;
   if (Array.isArray(raw?.hop_telemetry) && raw.hop_telemetry.length) outcome.hop_telemetry = raw.hop_telemetry;
+  // s24/B9: the engine provenance — the envelope's mode (already validated
+  // against the 4-member vocabulary at envelopeFromDispatch; guard only).
+  // Absent (the gate-reject compose, legacy callers) → no field, the journal
+  // record degrades to mode-unknown at the console (the guard family).
+  if (typeof mode === 'string' && mode !== '') outcome.mode = mode;
   return outcome;
 }
 
@@ -576,7 +590,10 @@ export async function runTurn({
   }
 
   const durationMs = Number.isFinite(raw?.duration_ms) ? raw.duration_ms : now() - t0;
-  const outcome = composeReportOutcome(classified, raw, durationMs);
+  // s24/B9: the turn's mode rides the outcome — the journal's REPORT record
+  // becomes engine-self-describing (laneOutcomeFields journals it beside
+  // lane_stats; the console's lane-engine column renders it).
+  const outcome = composeReportOutcome(classified, raw, durationMs, { mode: envelope.mode });
   const payload = { event_id: eventId, task: cp.task, lease: cp.lease, outcome, run_id: runId };
 
   if (raw?.repeat_report) {
