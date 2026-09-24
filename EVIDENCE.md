@@ -766,3 +766,50 @@ now demonstrates the swap on the demoted slug). The FREE-TAIL RIDING alert
 body + the X=15min threshold arithmetic comment updated for the cohere
 cadence. Gates: full suite + `scripts/validate.sh` + conformance-cc all
 green at merge time (numbers in the commit/CI).
+
+## x29-codex-smoke — the first live codex turn (2026-09-24)
+
+**The datum: run 35996905777 GREEN ON THE FIRST FIRE — codex-cli 0.156.0
+installed in 7s (`added 2 packages in 7s`, pin-asserted by the no-||true
+gate), the B3 config rendered to CODEX_HOME=/home/runner/.codex-fsm
+(wire_api responses · env_key OPENROUTER_API_KEY), ONE codexTurn through
+the REAL worker machinery on the funded primary (or-074): content
+`X29-SMOKE-OK` EXACT (the model obeyed the echo instruction to the byte),
+status done, 1 lane / 1 attempt / 1 turn, lane 1774ms, whole turn 3.9s
+including the transcript push.** The install path IS the dispatch path: the
+workflow's codex-install step runs the worker.yml step's run body VERBATIM
+(diff-verified at build time; the only seam difference is the OX_RAW source
+— the dispatch-equivalent ox envelope `{"mode":"codex"}` feeding the SAME
+gate parse), so the 7s + the version assert + the config render are the
+numbers a real codex dispatch pays too.
+
+lane_stats (the adapter's own usage × worker/codex/models.json synthesis —
+recomputed, never an engine meter): **1 call, 1 ok, 9274 tokens, $0.000511
+on deepseek/deepseek-v4.1-flash** — OFF-PEAK (Thu 12:05Z, outside the
+01-04/06-10 UTC weekday windows) with a heavy prompt-cache hit fraction at
+the 0.003 cache-read rate, which is why the number sits BELOW the
+~$0.0016-0.004 pre-estimate (the estimate assumed a lighter cached
+fraction): the live X29 economics are BETTER than planned — 24 soak turns
+≈ $0.012 happy-path vs the $0.04-0.09 planning band. The transcript landed
+on fsm-sessions (`sessions/T-X29-SMOKE/35996905777-a1.txt` + `.meta.json`,
+commit 5008867) with `harness: "codex"`, `mode: "codex"`, `fake: false` —
+the F15 engine-derived provenance proven LIVE, plus the full lane log
+(lane 1: key#1 deepseek/deepseek-v4.1-flash rc=0 1774ms class=done).
+
+**Zero catches, zero iterations.** The three pre-named first-failure
+classes all held on the first fire: (1) the config.toml path — CODEX_HOME
+reached the turn step's `process.env` through GITHUB_ENV exactly where the
+adapter resolves it (no /tmp, no workdir pollution); (2) the `-m` slug —
+`deepseek/deepseek-v4.1-flash` + `-c model_context_window=1000000` from
+worker/codex/models.json matched OpenRouter's catalog slug exactly (no
+error_model_400, no metadata fallback warning); (3) env_key auth — the D14
+lane-key overlay rode the child env end-to-end with the 8-member denylist
+dead (conformance-pinned) and the key never surfaced in a log line. The
+honest residuals carried to X29: the smoke rode the SINGLE funded key
+(pool_size 1 — a real dispatch carries both; lane rotation beyond key 1 is
+conformance-pinned, not live-proven), the driver calls codexTurn DIRECTLY
+(the routing arm's lazy import + the report-queue drain + the lease gate
+stay the soak's surface), and node 22 (the worker lane's major — v22.23.2
+on the runner) executed the adapter's `with { type: 'json' }` models.json
+import cleanly, live-proving the worker-lane compatibility the B2 suite
+could only pin locally on node 24.
