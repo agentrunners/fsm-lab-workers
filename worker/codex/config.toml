@@ -1,0 +1,55 @@
+# config.toml — the fsm-lab CODEX base config (s24/B3, D7a/D5b).
+# Rendered by .github/workflows/worker.yml's codex-install step to
+# $CODEX_HOME/config.toml ($HOME/.codex-fsm — never /tmp, gotcha §10.2:
+# helper-binary PATH aliases refuse /tmp; never in the workdir — R1's law:
+# NOTHING codex-owned lands where scanWorkdir claims).
+#
+# Source of truth: the codex-harness quality-lane template
+# (codex-harness/config/config.toml.template @ 9e0f24d, live-proven on
+# 0.156.0) — content-identical except this header. The per-LANE overrides
+# ride the adapter's ARGV, not this file (D5b: worker/codex-adapter.mjs's
+# codexArgv carries `-m <lane.model>` + `-c model_context_window=<per-model>`
+# from worker/codex/models.json — CLI flags > -c overrides > profile >
+# config.toml > defaults, codex-cli.md §3). The `model` key below is a dead
+# fallback under the always-present -m; it pins exactly ONE model so an
+# argv-less invocation can never float between lanes.
+#
+# NO AGENTS.md is seeded anywhere (the R2 fold: codex discovers the project
+# doc at the PROJECT ROOT, and the workdir must stay empty — the FSM
+# envelope IS the prompt; guidance rides the prompt, engine-agnostic).
+
+model = "z-ai/glm-5.3-flash"
+model_provider = "openrouter"
+model_reasoning_effort = "low"
+model_reasoning_summary = "concise"
+model_context_window = 1310720
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.openrouter]
+name = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+# wire_api "responses" is MANDATORY on 0.156.0 ("chat" was removed ~0.84 and
+# errors — research/codex-cli.md §8.1). A "chat" here is a 100%-dead lane.
+wire_api = "responses"
+env_key = "OPENROUTER_API_KEY"
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+
+# SECURITY: codex default is inherit="all" + ignore_default_excludes=true,
+# which passes OPENROUTER_API_KEY into every model-spawned shell. This block
+# strips *KEY*/*SECRET*/*TOKEN* (default excludes) plus the extra patterns —
+# the model-spawned-shell hygiene that pairs with the adapter's D14 denylist
+# (the denylist covers the codex process env; this covers its shells).
+[shell_environment_policy]
+ignore_default_excludes = false
+exclude = ["*PAT*", "*PASS*", "*CRED*", "*GH_*"]
+
+[history]
+persistence = "none"
+
+[otel]
+exporter = "none"
+trace_exporter = "none"
+metrics_exporter = "none"

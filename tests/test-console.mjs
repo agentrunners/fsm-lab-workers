@@ -42,8 +42,15 @@
 //                        ONLY, NO secrets.* anywhere, issue_comment[created]
 //                        ONLY, OWN concurrency group, the permission set;
 //                        m-8: OPS_ISSUE mapped from vars.OPS_ISSUE || '1';
-//                        s21/O-1: CC_SPEND_CEILING_USD mapped from
-//                        vars.CC_SPEND_CEILING_USD || '8.0' (same shape)
+//                        s21/O-1 → s24/B9: ENGINE_SPEND_CEILING_USD mapped
+//                        from vars.ENGINE_SPEND_CEILING_USD ||
+//                        vars.CC_SPEND_CEILING_USD || '8.0' (same shape, the
+//                        CC_ fallback at both layers)
+//   s24/B9 engine        the LANE section's ENGINE line (the window's mode
+//                        spread off the REPORT records' mode carry — the B9
+//                        journal field) + the ceiling's ENGINE_/CC_ parse
+//                        chain + the de-hardcoded FREE-TAIL remediation
+//                        (source-pinned on conductor/turn.mjs)
 //   s21/O-1 epoch        the EPOCH economics line: epochSpend's boundary
 //                        semantics (newest applied reset bounds the epoch;
 //                        pre-reset spend excluded; old-format turns counted
@@ -592,6 +599,44 @@ test('status (the fold, A4): the LANE section sources from readJournalTail(64, R
   assert.match(body2, /- phase: executing/);
 });
 
+// s24/B9 — the LANE section's ENGINE line: the window's mode spread off the
+// REPORT records' `mode` (the B9 carry: composeReportOutcome's envelope.mode
+// → laneOutcomeFields → the journal). The finding that forced the carry: the
+// journal carried NO engine marker, and the lane_stats model slugs are
+// SHARED between the cc and codex chains (deepseek/glm ride both) — so the
+// engine dimension could not be derived from anything the journal had.
+test('status (s24/B9): the LANE section renders the ENGINE line — the window\'s mode spread, unknown pinned last, absent on pre-B9 windows', async () => {
+  const mkBody = async (journalTail) => {
+    const { api, calls } = mkApi();
+    const { store } = mkStore({ state: STATUS_STATE, journalTail });
+    await runConsole({ event: commentEvent({ body: 'status' }), env: ENV, api, store, now: NOW });
+    return calls.find(x => x.method === 'POST' && x.path.endsWith('/comments')).body.body;
+  };
+  const ls = { calls: 1, ok: 1, err429: 0, err5xx: 0, tokens: 10, cost: 0.001, p50_ms: 5, p95_ms: 7, models: {}, rate_classes: {} };
+  // a MIXED window (an epoch transition inside the 64-turn window): 2 codex
+  // + 1 cc + 1 pre-B9 telemetry record + 1 old-format record
+  const body = await mkBody([
+    { kind: 'REPORT', task: 'A1', mode: 'codex', lane_stats: ls },
+    { kind: 'REPORT', task: 'A2', mode: 'codex', lane_stats: ls },
+    { kind: 'REPORT', task: 'A3', mode: 'cc', lane_stats: ls },
+    { kind: 'REPORT', task: 'A4', lane_stats: ls },          // pre-B9: telemetry, no mode yet
+    { kind: 'REPORT', task: 'A5' },                          // old-format: skipped entirely
+  ]);
+  assert.match(body, /- lane engines: codex:2 cc:1 unknown:1/, 'the mode spread — the named engines by count, unknown (pre-B9 records) pinned LAST');
+  assert.match(body, /- lanes: 4 calls/, 'the rest of the lane section survives');
+  // a pre-B9 window (telemetry everywhere, no mode anywhere) renders NO
+  // engine line — the guard family: no line, never a crash, never a lie
+  const legacy = await mkBody([
+    { kind: 'REPORT', task: 'A1', lane_stats: ls },
+    { kind: 'REPORT', task: 'A2', lane_stats: ls },
+  ]);
+  assert.doesNotMatch(legacy, /lane engines/);
+  assert.match(legacy, /- lanes: 2 calls/);
+  // unknown-ONLY never renders either (a named engine is the gate)
+  const unknownOnly = await mkBody([{ kind: 'REPORT', task: 'A1', lane_stats: ls }]);
+  assert.doesNotMatch(unknownOnly, /lane engines/);
+});
+
 test('status: unreadable state → an honest one-screen reply (never a silent red)', async () => {
   const { api, calls } = mkApi();
   const { store, writes } = mkStore({ state: null });
@@ -658,11 +703,15 @@ test('epochSpend (pure): the newest applied reset bounds the epoch — pre-reset
   assert.equal(doubleBill.withTelemetry, 1);
 });
 
-test('status (s21/O-1): the EPOCH economics line renders from readJournals — read-only kept, the three ceiling states', async () => {
-  const mkBody = async (journalAll, ceilingEnv) => {
+test('status (s21/O-1 → s24/B9): the EPOCH economics line renders from readJournals — read-only kept, the three ceiling states, the ENGINE_/CC_ ceiling chain', async () => {
+  const mkBody = async (journalAll, ceilingEnv, engineEnv) => {
     const { api, calls } = mkApi();
     const { store, reads, writes } = mkStore({ state: STATUS_STATE, journalAll });
-    const env = { ...ENV, ...(ceilingEnv ? { CC_SPEND_CEILING_USD: ceilingEnv } : {}) };
+    const env = {
+      ...ENV,
+      ...(ceilingEnv ? { CC_SPEND_CEILING_USD: ceilingEnv } : {}),
+      ...(engineEnv ? { ENGINE_SPEND_CEILING_USD: engineEnv } : {}),
+    };
     const r = await runConsole({ event: commentEvent({ body: 'status' }), env, api, store, now: NOW });
     assert.equal(r.outcome, 'status');
     assert.equal(r.exitCode, 0);
@@ -679,11 +728,26 @@ test('status (s21/O-1): the EPOCH economics line renders from readJournals — r
     { kind: 'REPORT', task: 'A', lane_stats: { cost: 6.5, tokens: 1000 } },
   ], '8');
   assert.match(approaching, /- epoch: cost \$6\.5000 · tokens 1000 · telemetry on 1\/1 turns — \*\*SPEND CEILING APPROACHING: \$6\.50 of \$8\.00 \(81%\)\*\*/);
-  // exceeded: $9.06 of $8.00 = 113% (the audit's live or-074 quantity)
+  // exceeded: $9.06 of $8.00 = 113% (the audit's live or-074 quantity) —
+  // s24/B9: the remediation names the ENGINE-neutral var with the CC_
+  // fallback + the honest render-only label (the D15 fold: no enforcement
+  // machinery rides the name)
   const over = await mkBody([
     { kind: 'REPORT', task: 'A', lane_stats: { cost: 9.06, tokens: 1000 } },
   ], '8');
-  assert.match(over, /- epoch: cost \$9\.0600 · tokens 1000 · telemetry on 1\/1 turns — \*\*SPEND CEILING EXCEEDED: \$9\.06 of \$8\.00 \(113%\) — pause the chain or raise the ceiling \(repo var CC_SPEND_CEILING_USD\)\*\*/);
+  assert.match(over, /- epoch: cost \$9\.0600 · tokens 1000 · telemetry on 1\/1 turns — \*\*SPEND CEILING EXCEEDED: \$9\.06 of \$8\.00 \(113%\) — pause the chain or raise the ceiling \(repo var ENGINE_SPEND_CEILING_USD, CC_SPEND_CEILING_USD fallback; render-only — the console never enforces it\)\*\*/);
+  // s24/B9: the ENGINE name drives the same render through the same seam,
+  // and WINS over a wired CC_ value (the parse chain)
+  const overEngine = await mkBody([
+    { kind: 'REPORT', task: 'A', lane_stats: { cost: 9.06, tokens: 1000 } },
+  ], undefined, '8');
+  assert.match(overEngine, /SPEND CEILING EXCEEDED: \$9\.06 of \$8\.00 \(113%\)/);
+  assert.match(overEngine, /repo var ENGINE_SPEND_CEILING_USD/);
+  const both = await mkBody([
+    { kind: 'REPORT', task: 'A', lane_stats: { cost: 9.06, tokens: 1000 } },
+  ], '4', '20');
+  assert.match(both, /- epoch: cost \$9\.0600 · tokens 1000 · telemetry on 1\/1 turns · ceiling \$20\.00 \(45%\)/,
+    'ENGINE=20 beats CC=4 — the epoch-cumulative render is the same quantity for every engine');
   // a fresh epoch (no turns since the reset) still names the ceiling
   const fresh = await mkBody([{ kind: 'CONTROL', command: 'reset', applied: true }], '5');
   assert.match(fresh, /- epoch: no turns yet · ceiling \$5\.00/);
@@ -692,15 +756,29 @@ test('status (s21/O-1): the EPOCH economics line renders from readJournals — r
   assert.match(ok, /- queues: report 0/);
 });
 
-test('parseSpendCeilingUsd (pure): the env read — valid, default on absent/garbage/non-positive', () => {
+test('parseSpendCeilingUsd (pure): the ENGINE_/CC_ chain — ENGINE wins, CC_ falls back, default on absent/garbage/non-positive', () => {
   assert.equal(parseSpendCeilingUsd({}), SPEND_CEILING_DEFAULT_USD);
   assert.equal(SPEND_CEILING_DEFAULT_USD, 8.0);
+  // the s21/O-1 name still works ALONE (existing repos unchanged — the
+  // generalization must not move a set knob)
   assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '2.5' }), 2.5);
   assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: ' 4 ' }), 4);
-  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: 'garbage' }), 8.0);
-  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '' }), 8.0);
-  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '-1' }), 8.0);
-  assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: '0' }), 8.0);
+  // the engine-neutral name WINS when both are wired
+  assert.equal(parseSpendCeilingUsd({ ENGINE_SPEND_CEILING_USD: '5.5', CC_SPEND_CEILING_USD: '2.5' }), 5.5);
+  assert.equal(parseSpendCeilingUsd({ ENGINE_SPEND_CEILING_USD: ' 7 ' }), 7);
+  // a garbage/non-positive ENGINE value falls THROUGH to the CC value (the
+  // graceful chain — never a NaN that would break the render)
+  for (const bad of ['garbage', '', '-1', '0', null]) {
+    assert.equal(parseSpendCeilingUsd({ ENGINE_SPEND_CEILING_USD: bad, CC_SPEND_CEILING_USD: '3.5' }), 3.5,
+      `ENGINE=${JSON.stringify(bad)} falls back to the CC value`);
+    assert.equal(parseSpendCeilingUsd({ ENGINE_SPEND_CEILING_USD: bad }), SPEND_CEILING_DEFAULT_USD,
+      `ENGINE=${JSON.stringify(bad)} alone falls back to the default`);
+  }
+  // both garbage → the default (the s21/O-1 matrix, carried forward)
+  for (const bad of ['garbage', '', '-1', '0']) {
+    assert.equal(parseSpendCeilingUsd({ ENGINE_SPEND_CEILING_USD: bad, CC_SPEND_CEILING_USD: bad }), 8.0);
+    assert.equal(parseSpendCeilingUsd({ CC_SPEND_CEILING_USD: bad }), 8.0);
+  }
 });
 
 test('statusSummary (pure): the epoch line slots between queues and lanes — seven lines with journalAll, six without (legacy callers)', () => {
@@ -946,8 +1024,8 @@ test('F-13 source pin: the workflow is GITHUB_TOKEN ONLY — no secrets wiring a
   // the console source reads only GH_TOKEN as its credential env
   assert.match(CONSOLE_SRC, /TOKEN:\s*process\.env\.GH_TOKEN/);
   const envReads = [...CONSOLE_SRC.matchAll(/process\.env\.([A-Z_][A-Z0-9_]*)/g)].map(m => m[1]);
-  assert.deepEqual([...new Set(envReads)].sort(), ['CC_SPEND_CEILING_USD', 'EVENT', 'GH_TOKEN', 'GITHUB_REPOSITORY', 'OPS_ISSUE'],
-    'console.mjs touches EXACTLY the five wired envs — no other credential surface (CC_SPEND_CEILING_USD is the s21/O-1 repo var, mapped like OPS_ISSUE, not a credential)');
+  assert.deepEqual([...new Set(envReads)].sort(), ['CC_SPEND_CEILING_USD', 'ENGINE_SPEND_CEILING_USD', 'EVENT', 'GH_TOKEN', 'GITHUB_REPOSITORY', 'OPS_ISSUE'],
+    'console.mjs touches EXACTLY the six wired envs — no other credential surface (the two ceiling names are the s21/O-1 + s24/B9 repo vars, mapped like OPS_ISSUE, not credentials)');
 });
 
 test('F-13 source pin: issue_comment[created] ONLY, OWN concurrency group (no conductor-chain contention)', () => {
@@ -967,11 +1045,41 @@ test('F-13 source pin (m-8): OPS_ISSUE maps from the LOAD-BEARING repo variable 
   assert.match(YML, /LOAD-BEARING/, 'documented as load-bearing in the workflow');
 });
 
-// s21/O-1: the spend ceiling rides the SAME var-mapping shape — vars.* with a
-// documented default, still NO secrets.* anywhere (the F-13 law holds).
-test('F-13 source pin (s21/O-1): CC_SPEND_CEILING_USD maps from the repo variable with the default 8.0', () => {
-  assert.match(YML, /CC_SPEND_CEILING_USD:\s*\$\{\{\s*vars\.CC_SPEND_CEILING_USD\s*\|\|\s*'8\.0'\s*\}\}/, 'the var, default 8.0');
+// s21/O-1 → s24/B9: the spend ceiling rides the SAME var-mapping shape —
+// vars.* with a documented default, still NO secrets.* anywhere (the F-13
+// law holds). The ENGINE name maps with the CC_ fallback INSIDE the
+// expression (a repo that never sets it keeps the s21/O-1 behavior); the
+// CC_ mapping itself stays byte-identical (existing repos unchanged).
+test('F-13 source pin (s21/O-1 → s24/B9): ENGINE_SPEND_CEILING_USD maps with the CC_ fallback; the CC_ mapping itself unchanged', () => {
+  assert.match(YML, /ENGINE_SPEND_CEILING_USD:\s*\$\{\{\s*vars\.ENGINE_SPEND_CEILING_USD\s*\|\|\s*vars\.CC_SPEND_CEILING_USD\s*\|\|\s*'8\.0'\s*\}\}/,
+    'the engine-neutral var, the CC_ fallback, default 8.0');
+  assert.match(YML, /CC_SPEND_CEILING_USD:\s*\$\{\{\s*vars\.CC_SPEND_CEILING_USD\s*\|\|\s*'8\.0'\s*\}\}/, 'the s21/O-1 mapping, default 8.0 — byte-identical');
+  assert.match(YML, /RENDER-ONLY/, 'the D15 honest label rides the workflow comment');
   assert.equal(/\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}/.test(YML), false, 'still zero secrets wiring');
+});
+
+// s24/B9 — the FREE-TAIL RIDING alert's remediation text is DE-HARDCODED
+// (engine-neutral wording): the trigger describes the CONDITION (the slug
+// derivation keys ANY engine's `:free` lane_stats entry), and the
+// CC_TAIL_MODEL knob is scoped to the cc lane — the engine that carries a
+// tail today — instead of presented as THE tail knob. Source-pinned (the
+// alert composer is inline in a self-executing I/O script — the s22/M-1
+// discipline).
+test('s24/B9 source pin: the FREE-TAIL RIDING remediation is engine-neutral — the condition unscoped, the knob cc-scoped', () => {
+  const src = readFileSync(join(ROOT, 'conductor/turn.mjs'), 'utf8');
+  const m = /async function tailAlertIssue\(action\) \{([\s\S]*?)\.join\('\\n'\)/.exec(src);
+  assert.ok(m, 'tailAlertIssue and its body array exist');
+  const text = m[1];
+  // the CONDITION is engine-neutral (the derivation is slug-based, any engine)
+  assert.ok(text.includes('the free tail is serving turns: the paid lanes are dry'),
+    'the trigger describes the condition, not an engine');
+  assert.ok(!text.includes('the CC lane\'s free tail'), 'the cc hardcode in the trigger is dead');
+  assert.ok(!text.includes('BOTH paid keys are dry'), 'the two-key hardcode is dead (the pool may be any size)');
+  // the OPERATOR ACTIONS header scopes the knob engine-side
+  assert.match(text, /the tail knob is engine-side — today only the cc lane carries one/);
+  // the knob stays ACTIONABLE but cc-scoped (de-hardcode ≠ de-actionable)
+  assert.match(text, /set the cc lane\\'s tail knob `CC_TAIL_MODEL` to another `:free` model/);
+  assert.match(text, /set `CC_TAIL_MODEL=''` to DISABLE the tail/);
 });
 
 test('F-13 source pin: the permission set — issues:write for replies + contents:write (the F-2a class: the queue CAS push + nudge dispatch need write)', () => {

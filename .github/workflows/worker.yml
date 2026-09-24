@@ -15,6 +15,15 @@
 #     write-back door on artifacts. CC_FAKE_LLM=1 swaps the CLI for
 #     worker/fake-cc.mjs (deterministic fixtures — never set in live
 #     dispatches; the X20 smoke is the only real-lane execution).
+#   mode=codex — the CODEX adapter (worker/codex-adapter.mjs, s24/B2): the
+#     codex exec turn on the key-pool × models-table lanes (D5a model-major
+#     [k1/ds,k2/ds,k1/glm,k2/glm]), CODEX_HOME=$HOME/.codex-fsm + config.toml
+#     rendered by the codex-install step below (s24/B3, D7a — never /tmp,
+#     never in the workdir), the D14 env overlay (the lane key is the ONLY
+#     credential the child holds), the JSONL event decode (R7 event-wins,
+#     D13's terminal exit-2) + transcripts with harness:'codex' provenance.
+#     CODEX_FAKE_LLM=1 swaps the CLI for worker/fake-codex.mjs (deterministic
+#     fixtures — never set in live dispatches; the conformance suite's lane).
 # EVERY mode passes the LAW-1 START-GATE first (envelopeFromDispatch): an
 # already-expired deadline → one infra_failed 'late-start' report, exit 0 —
 # the lease is never burned on a guaranteed orphan.
@@ -121,6 +130,66 @@ jobs:
             echo "INSTALL-SKIPPED mode=$MODE (non-cc dispatch — no CC CLI needed)"
           fi
 
+      - name: Install the Codex CLI (codex-mode dispatches only — once per job)
+        # s24/B3 (D7a): the second engine's install — the CC step's discipline
+        # VERBATIM (m-9/C: the ox envelope's mode gates the install, riding
+        # ENV — never ${{ }}-interpolated into the shell, injection-safe;
+        # m-2/C: no `|| true` — a failed install fails the job LOUDLY, the
+        # lease re-covers). ONE inversion vs the CC gate: the gate is
+        # codex-ONLY — the CC step installs fail-safe on an ABSENT ox (absent
+        # = legacy = the pre-ox dispatches were cc), but a codex dispatch
+        # ALWAYS carries ox.mode='codex' (the B1 vocabulary — an absent mode
+        # defaults to 'mock' at envelopeFromDispatch), so mock/real/cc/legacy
+        # dispatches NEVER pay the codex install. The npm pin (never latest)
+        # is the X21 m-9 lesson: an unpinned install pays a fresh package
+        # download INSIDE the wall budget. CODEX_VERSION is the OPTIONAL repo
+        # variable (default 0.156.0 — the codex-harness pins.env verified pin;
+        # worker/codex/config.toml's wire_api="responses" is mandatory on
+        # 0.156). Unlike CC (whose spawn argv pins the version via npx, so
+        # CC_VERSION rides BOTH this file's install + spawn env), the codex
+        # adapter spawns the INSTALLED `codex` binary (env.CODEX_BIN override)
+        # — CODEX_VERSION is install-only, the mirror sync carries it to the
+        # second bucket as a repo VARIABLE (R4: the mirror vars parity).
+        env:
+          CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          OX_RAW: ${{ github.event.client_payload.ox || '' }}
+        run: |
+          MODE=$(printf '%s' "$OX_RAW" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(typeof o==="object"&&o?String(o.mode||""):"")}catch{console.log("")}})')
+          if [ "$MODE" = "codex" ]; then
+            CODEX_PIN="${CODEX_VERSION:-0.156.0}"
+            # CODEX_HOME (D7a): $HOME/.codex-fsm — NEVER /tmp (helper-binary
+            # PATH aliases refuse /tmp, gotcha §10.2), NEVER inside a workdir
+            # (R1's law: nothing codex-owned lands where scanWorkdir claims).
+            # Created + config rendered BEFORE the version assert so a failed
+            # assert still leaves the home provably wired; the adapter
+            # mkdirSync's it again defensively (codex-adapter.mjs gotcha #2).
+            # Exported via GITHUB_ENV (GitHub's env mapping cannot expand
+            # $HOME): the "Work the task" step's node process then reads
+            # process.env.CODEX_HOME — the adapter's resolution order (a
+            # non-empty env.CODEX_HOME wins; absent = its turn-scoped scratch
+            # fallback, never reached on a dispatch that passed this gate).
+            CODEX_HOME_DIR="$HOME/.codex-fsm"
+            mkdir -p "$CODEX_HOME_DIR"
+            if [ ! -f worker/codex/config.toml ]; then
+              echo "::error::worker/codex/config.toml missing from the checkout — the codex config render cannot proceed (the engine's committed template, s24/B3)"
+              exit 1
+            fi
+            cp worker/codex/config.toml "${CODEX_HOME_DIR}/config.toml"
+            echo "CODEX_HOME=${CODEX_HOME_DIR}" >> "$GITHUB_ENV"
+            echo "CODEX-CONFIG-RENDERED ${CODEX_HOME_DIR}/config.toml (wire_api responses · env_key OPENROUTER_API_KEY)"
+            T0=$(date +%s)
+            npm install -g "@openai/codex@${CODEX_PIN}"
+            INSTALLED="$(codex --version)"
+            T1=$(date +%s)
+            echo "CODEX-CLI-VERSION ${INSTALLED} (pin ${CODEX_PIN}) · install $((T1-T0))s (the ~9-16s npm expectation — minutes = the m-9 class)"
+            case "$INSTALLED" in
+              *"$CODEX_PIN"*) ;;
+              *) echo "::error::codex --version (${INSTALLED}) does not match the pin ${CODEX_PIN} — refusing to let the spawn lane pay a fresh npx download inside the wall budget (s24/B3, the m-9 class)"; exit 1;;
+            esac
+          else
+            echo "CODEX-INSTALL-SKIPPED mode=$MODE (non-codex dispatch — no codex CLI needed)"
+          fi
+
       - name: Mask the key-pool secrets (per split key)
         # T46/W-D review fold (A5, lens-2 F3): GitHub auto-masks only the
         # JOINED secret string — the ~68 individual pool keys would render in
@@ -189,6 +258,15 @@ jobs:
           OPENROUTER_API_KEY_2: ${{ secrets.OPENROUTER_API_KEY_2 }}
           CC_MODEL: ${{ vars.CC_MODEL || '' }}
           CC_VERSION: ${{ vars.CC_VERSION || '' }}
+          # s24/B3 (D7a): the codex lane's CODEX_HOME — NOT mapped here: the
+          # codex-install step above exports it via GITHUB_ENV
+          # ($HOME/.codex-fsm — GitHub's env mapping cannot expand $HOME), so
+          # it reaches this process's env exactly where the adapter reads it
+          # (codex-adapter.mjs's env.CODEX_HOME resolution). The codex lane
+          # reuses BOTH OpenRouter key secrets above (D14: the SAME pool —
+          # the lane overlay re-injects the serving key per lane); the CLI
+          # pin rides vars.CODEX_VERSION at the INSTALL step only (the adapter
+          # spawns the installed binary — no version argv).
           # T46/W4: the CC adapter's transcript push (fsm-sessions branch) —
           # the token lane (X20 run-1 finding: without it the turn reports
           # infra 'transcript-push-failed'). T46/ar (20-e): the value moved UP

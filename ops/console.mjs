@@ -52,23 +52,38 @@ import { pathToFileURL } from 'node:url';
 const REPO_DEFAULT = 'claudecode-headless/fsm-lab';
 const OPS_ISSUE_DEFAULT = '1';   // m-8: the load-bearing default
 
-// s21/O-1 (audit a5): the SPEND CEILING — the repo variable
-// `CC_SPEND_CEILING_USD` (mapped through ops-console.yml exactly like
-// OPS_ISSUE; default 8.0). The console READS it and renders the epoch spend
-// against it (ok / APPROACHING / EXCEEDED) — the ceiling is an OPERATOR
-// surface here, not a control action: the console never writes, so the burn
-// decision (pause / halt / reset) stays the operator's. Read through the env
-// seam the same way CC_MODEL reaches the worker adapter.
+// s21/O-1 (audit a5) → s24/B9: the SPEND CEILING — the repo variable
+// `ENGINE_SPEND_CEILING_USD` (the engine-neutral name; `CC_SPEND_CEILING_USD`
+// — the s21/O-1 name — stays the FALLBACK so existing repos keep working
+// unchanged; mapped through ops-console.yml exactly like OPS_ISSUE, default
+// 8.0). The console READS it and renders the epoch spend against it
+// (ok / APPROACHING / EXCEEDED) — RENDER-ONLY, labeled honestly (the D15
+// fold): NO enforcement machinery rides this name. The console never writes,
+// so the burn decision (pause / halt / reset) stays the operator's — the
+// honest guards are the budget-pause, the lane/max-attempt bounds, and the
+// wall (no cost-cap flag exists on any engine's exec surface). The RENDER
+// itself is engine-agnostic: it sums whatever lane_stats the epoch's REPORT
+// records carry, cc and codex alike. Read through the env seam the same way
+// CC_MODEL reaches the worker adapter.
 export const SPEND_CEILING_DEFAULT_USD = 8.0;
 const SPEND_CEILING_APPROACH_FRACTION = 0.8;
 
 // parseSpendCeilingUsd(env) — the pure env read (vars come through the
 // workflow's env mapping; absent / unparseable / non-positive → the default,
-// never a NaN that would break the render).
+// never a NaN that would break the render). s24/B9: ENGINE_SPEND_CEILING_USD
+// wins, CC_SPEND_CEILING_USD is the fallback — a garbage ENGINE value falls
+// through to the CC value (the same graceful chain as absent), never a NaN.
 export function parseSpendCeilingUsd(env = {}) {
-  const raw = env == null ? null : env.CC_SPEND_CEILING_USD;
-  const n = typeof raw === 'string' ? Number(raw.trim()) : Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : SPEND_CEILING_DEFAULT_USD;
+  const read = (name) => {
+    const raw = env == null ? null : env[name];
+    const n = typeof raw === 'string' ? Number(raw.trim()) : Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const engine = read('ENGINE_SPEND_CEILING_USD');
+  if (engine !== null) return engine;
+  const cc = read('CC_SPEND_CEILING_USD');
+  if (cc !== null) return cc;
+  return SPEND_CEILING_DEFAULT_USD;
 }
 
 // epochSpend(journalRecords) — the s21/O-1 epoch-cumulative economics.
@@ -293,7 +308,7 @@ function epochSection(journalAll, spendCeilingUsd) {
   const frac = sp.cost / ceiling;
   const pct = Math.round(frac * 100);
   if (frac >= 1) {
-    return [`${base} — **SPEND CEILING EXCEEDED: $${sp.cost.toFixed(2)} of ${cap} (${pct}%) — pause the chain or raise the ceiling (repo var CC_SPEND_CEILING_USD)**`];
+    return [`${base} — **SPEND CEILING EXCEEDED: $${sp.cost.toFixed(2)} of ${cap} (${pct}%) — pause the chain or raise the ceiling (repo var ENGINE_SPEND_CEILING_USD, CC_SPEND_CEILING_USD fallback; render-only — the console never enforces it)**`];
   }
   if (frac >= SPEND_CEILING_APPROACH_FRACTION) {
     return [`${base} — **SPEND CEILING APPROACHING: $${sp.cost.toFixed(2)} of ${cap} (${pct}%)**`];
@@ -338,6 +353,13 @@ function accumulateLaneStats(recs) {
   const keys = {};      // key_index -> turns served (the window's spread)
   let poolSize = null;  // the max pool_size seen (the pick's modulo base)
   const hops = [];      // hop_telemetry rows, journal order
+  // s24/B9: the ENGINE dimension — the REPORT record's `mode` (the B9
+  // carry: composeReportOutcome's envelope.mode → laneOutcomeFields → the
+  // journal). Mode IS the engine surface (the mock|real|cc|codex
+  // vocabulary); records without one (pre-B9) tally as `unknown` — rendered
+  // honestly, never guessed from the model slugs (the cc and codex chains
+  // SHARE deepseek/glm, so slug-derived engines would lie).
+  const engines = {};   // mode -> telemetry turns served in the window
   // s23/B8: the FREE-TAIL derivation — a record whose lane_stats.models
   // carries a `:free` slug with ok>0 was SERVED by the tail (the answering
   // lane was free: BOTH paid keys were dry at that turn). At most one lane
@@ -348,6 +370,8 @@ function accumulateLaneStats(recs) {
   const tailKeys = {};
   for (const r of recs) {
     const s = r.lane_stats;
+    if (typeof r.mode === 'string' && r.mode !== '') engines[r.mode] = (engines[r.mode] || 0) + 1;
+    else engines.unknown = (engines.unknown || 0) + 1;
     calls += Number(s.calls) || 0;
     ok += Number(s.ok) || 0;
     err429 += Number(s.err429) || 0;
@@ -383,7 +407,7 @@ function accumulateLaneStats(recs) {
       if (Number.isFinite(r.key_index)) tailKeys[r.key_index] = (tailKeys[r.key_index] || 0) + 1;
     }
   }
-  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes, keys, poolSize, hops, tailTurns, tailModels, tailKeys };
+  return { calls, ok, err429, err5xx, tokens, cost, lat50, lat95, models, classes, keys, poolSize, hops, engines, tailTurns, tailModels, tailKeys };
 }
 
 function renderLaneLines(acc, sourceLabel) {
@@ -407,6 +431,19 @@ function renderLaneLines(acc, sourceLabel) {
   const lines = [
     `- lanes: ${acc.calls} calls (${acc.ok} ok · ${acc.err429}×429 · ${acc.err5xx}×5xx) · p50 ${p50 ?? '?'}ms · p95(max) ${p95max ?? '?'}ms · tokens ${acc.tokens} · cost $${acc.cost.toFixed(4)} · ${sourceLabel}`,
   ];
+  // s24/B9: the ENGINE line — the window's mode spread (which engines
+  // served the telemetry turns). Rendered only when at least one record
+  // carried a mode (the B9 carry); a pre-B9 window renders NO line (the
+  // guard family — no line, never a crash, never a lie). `unknown` =
+  // telemetry-carrying records from before the carry (they age out of the
+  // 64-turn window); pinned LAST regardless of count.
+  const engNamed = Object.entries(acc.engines).filter(([m]) => m !== 'unknown');
+  if (engNamed.length) {
+    const rows = [...engNamed.sort((a, b) => b[1] - a[1]),
+      ...(acc.engines.unknown ? [['unknown', acc.engines.unknown]] : [])]
+      .map(([m, n]) => `${m}:${n}`).join(' ');
+    lines.push(`- lane engines: ${rows}`);
+  }
   // s21/O-3 (audit a5, MAJOR): the KEY line — distinct key_indexes served in
   // the window + the pool size (the pick's modulo base, max seen). §D4's
   // promised "key-pool spread": one key serving every turn (the live CC
@@ -668,9 +705,12 @@ async function main() {
   const env = {
     REPO: process.env.GITHUB_REPOSITORY || REPO_DEFAULT,
     OPS_ISSUE: process.env.OPS_ISSUE || OPS_ISSUE_DEFAULT,
-    // s21/O-1: the spend ceiling rides the env seam (ops-console.yml maps the
-    // repo variable vars.CC_SPEND_CEILING_USD, default '8.0' — the same
-    // mapping shape m-8 uses for OPS_ISSUE)
+    // s21/O-1 → s24/B9: the spend ceiling rides the env seam (ops-console.yml
+    // maps the repo variables, default '8.0' — the same mapping shape m-8
+    // uses for OPS_ISSUE). ENGINE_SPEND_CEILING_USD is the engine-neutral
+    // name; CC_SPEND_CEILING_USD stays the fallback (parseSpendCeilingUsd
+    // resolves the chain — a garbage ENGINE value falls through to CC).
+    ENGINE_SPEND_CEILING_USD: process.env.ENGINE_SPEND_CEILING_USD,
     CC_SPEND_CEILING_USD: process.env.CC_SPEND_CEILING_USD,
     TOKEN: process.env.GH_TOKEN,   // F-13: the JOB token — the console's ONLY credential
   };
