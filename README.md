@@ -1,9 +1,12 @@
-# fsm-lab — FSM-Anchored Long-Running Agent Orchestration on GitHub Actions
+# fsm-lab — The GHA-Native Agent Execution OS (engine-agnostic: CC + Codex)
 
-**Track-1 Task 43 lab.** The de-risking question: can a single, local,
+> **Charter (reframed 2026-09-24):** this repo is the **GHA-based agent harness / execution engine / OS** — not a CC-GHA adapter. The agent harnesses (Claude Code, OpenAI Codex CLI) are **replaceable executors** beneath the OS: the intake door, conductor, dispatch budgets, dual-bucket workers, union verification, watchdogs, epochs, and the alert lane are engine-agnostic machinery; each engine is one adapter (`worker/cc-adapter.mjs`, `worker/codex-adapter.mjs`) behind the shared `engineTurn` contract. The application layer grows on top (first: the agent review kit).
+
+**Origin (Track-1 Task 43 lab, kept for history):** The de-risking question was: can a single, local,
 continuously-running agent harness (like Claude Code) be converted into a
 **distributed system of short-lived GHA jobs that is collectively continuous** —
 stateful, parallel, watched, and bounded — using only GitHub-native constructs?
+(Answer: yes — see EVIDENCE.md; the system now runs production-grade with two engines.)
 
 ```
 stateless today                          stateful here
