@@ -25,19 +25,27 @@
 //     carries lane_stats into the enqueued report (a codex turn WITHOUT
 //     lane_stats fails THIS test — the adapter-to-drain carry is pinned,
 //     not just the adapter's own return)
+//   - s25/b1: THE REAL-MODE TRANSCRIPT LANE — pushSessionsContents (the
+//     adapter seam) + a full real-mode codex turn whose transcripts land
+//     through the CONTENTS API on an injected fetch (CODEX_BIN shim →
+//     fake-codex.mjs with the REAL argv: the real lane's code paths —
+//     NOT CODEX_FAKE_LLM — zero network, zero git), and the done-turn
+//     escalation when the push dies (transcript-push-failed, the class the
+//     FSM's net-zero ladder absorbs)
 // The design-spec conformance matrix (the §2 rows) lives in
 // worker/conformance-codex.mjs — this file is the adapter's own unit surface.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   codexTurn, codexLanes, codexKeyPool, codexModelEntry, codexArgv, codexLaneEnv,
   codexChildEnv, codexNextLaneIndex, codexErrorClass, codexLaneOutcome,
   decodeCodexEvents, codexUsageCost, isCodexPeakWindow, codexUsageLaneLine,
-  codexErrorLaneLine, codexArtifactPushEscalation,
+  codexErrorLaneLine, codexArtifactPushEscalation, pushSessionsContents,
   CODEX_ENV_DENYLIST, CODEX_MODELS, CODEX_MODEL_TABLE,
   CODEX_KEY_CLASS_EVENTS, CODEX_ROTATABLE_ERROR_EVENTS,
 } from '../worker/codex-adapter.mjs';
@@ -745,6 +753,156 @@ test('codex transcript: fake mode writes locally with harness \'codex\' + mode \
     assert.ok(result.transcript.mode === 'local');
     assert.equal(result.transcript.txt, 'sessions/T1/test-run-a1.txt');
   } finally { roots.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// s25/b1 — THE REAL-MODE TRANSCRIPT LANE (the contents API, the X29 F3/F2
+// rebuild). The scripted-fetch mock answers the contents contract (GET
+// 404/200 {sha} → PUT 201/200); the CODEX_BIN shim swaps the codex binary
+// for fake-codex.mjs WITH THE REAL ARGV so the turn runs the REAL lane's
+// code paths (no CODEX_FAKE_LLM) — the adapter's transcript push, retry
+// wrapper and escalation are the code under test, not the CLI.
+// ---------------------------------------------------------------------------
+
+const FAKE_CODEX_BIN = fileURLToPath(new URL('../worker/fake-codex.mjs', import.meta.url));
+
+// the shim: real mode resolves cmd from env.CODEX_BIN — a shell wrapper
+// around fake-codex.mjs keeps the argv EXACTLY as the real codex CLI sees it
+function makeCodexBinShim(base) {
+  const shim = join(base, 'codex-bin-shim.sh');
+  writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_CODEX_BIN}" "$@"\n`);
+  chmodSync(shim, 0o755);
+  return shim;
+}
+
+function mockContentsApi(respond) {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const call = {
+      url: String(url),
+      method: init.method || 'GET',
+      headers: { ...(init.headers || {}) },
+      body: typeof init.body === 'string' ? JSON.parse(init.body) : null,
+    };
+    calls.push(call);
+    const r = respond(call, calls.length);
+    return { status: r.status, text: async () => (r.data === undefined ? '' : JSON.stringify(r.data)) };
+  };
+  return { fetchImpl, calls };
+}
+
+// THE F2 PIN (the X29 mirror shape verbatim): the process env carries BOTH
+// the runner's GITHUB_REPOSITORY (agentrunners/fsm-lab-workers — what the
+// broken step-env override left in the process) AND the custom
+// FSM_SESSIONS_REPO (claudecode-headless/fsm-lab — what TARGET_REPO meant)
+// → the transcript lane MUST follow the custom name.
+const REAL_MODE_ENV = {
+  OPENROUTER_API_KEY: KEY1,
+  OPENROUTER_API_KEY_2: KEY2,
+  FSM_SESSIONS_REPO: 'claudecode-headless/fsm-lab',
+  FSM_SESSIONS_TOKEN: 'sess-token-1',
+  GITHUB_REPOSITORY: 'agentrunners/fsm-lab-workers',
+  GH_TOKEN: 'runner-job-token',
+};
+
+test('s25/b1 pushSessionsContents (the adapter seam): the custom-name seam wins, the pinned log line carries the landed repo, the engine PUTs the pair', async () => {
+  const logs = [];
+  const { fetchImpl, calls } = mockContentsApi((c) => (c.method === 'GET' ? { status: 404, data: null } : { status: 201, data: {} }));
+  const r = await pushSessionsContents({
+    env: { ...REAL_MODE_ENV },
+    files: new Map([['sessions/T-77/run77-a1.txt', 'body'], ['sessions/T-77/run77-a1.meta.json', '{}']]),
+    log: (l) => logs.push(l),
+    fetchImpl,
+  });
+  assert.equal(r.mode, 'pushed');
+  assert.equal(r.repo, 'claudecode-headless/fsm-lab');
+  assert.deepEqual(r.files, ['sessions/T-77/run77-a1.txt', 'sessions/T-77/run77-a1.meta.json']);
+  assert.ok(logs.some((l) => l === 'CODEX-TRANSCRIPT-PUSHED 2 file(s) to fsm-sessions @ claudecode-headless/fsm-lab'), 'the pinned line SHAPE + the landed repo APPENDED (the X29 lesson)');
+  for (const c of calls) {
+    assert.ok(c.url.includes('/repos/claudecode-headless/fsm-lab/contents/sessions/T-77/'), 'every call targets the CUSTOM repo');
+    assert.ok(!c.url.includes('agentrunners'), 'NEVER the runner repo the old env.GITHUB_REPOSITORY read would have picked (F2)');
+    assert.equal(c.headers.Authorization, 'Bearer sess-token-1', 'the custom token lane, not GH_TOKEN');
+  }
+  assert.equal(calls.filter((c) => c.method === 'PUT').length, 2);
+  // the legacy pair still backs compat when the custom names are absent
+  const legacy = mockContentsApi((c) => (c.method === 'GET' ? { status: 404, data: null } : { status: 201, data: {} }));
+  const r2 = await pushSessionsContents({
+    env: { GITHUB_REPOSITORY: 'claudecode-headless/fsm-lab', GH_TOKEN: 'legacy-tok' },
+    files: new Map([['sessions/T-78/r.txt', 'b']]),
+    log: () => {},
+    fetchImpl: legacy.fetchImpl,
+  });
+  assert.equal(r2.repo, 'claudecode-headless/fsm-lab');
+  assert.ok(legacy.calls[0].url.includes('/repos/claudecode-headless/fsm-lab/contents/'));
+  assert.equal(legacy.calls[0].headers.Authorization, 'Bearer legacy-tok');
+  // and the missing-both case fails LOUD with the seam contract
+  await assert.rejects(
+    () => pushSessionsContents({ env: {}, files: new Map([['x', 'y']]), log: () => {}, fetchImpl: () => {} }),
+    /sessions push needs FSM_SESSIONS_REPO \+ FSM_SESSIONS_TOKEN/,
+  );
+});
+
+test('s25/b1 REAL-MODE turn (CODEX_BIN shim): the transcript pair lands through the CONTENTS API — the composed body + meta at the per-run paths, on the TARGET repo', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'codex-real-lane-'));
+  const logs = [];
+  try {
+    const shim = makeCodexBinShim(base);
+    const { fetchImpl, calls } = mockContentsApi((c) => (c.method === 'GET' ? { status: 404, data: null } : { status: 201, data: {} }));
+    const result = await codexTurn(envelope({ prompt: '[fixture:ok] real-mode transcript lane' }), {
+      env: { ...REAL_MODE_ENV, CODEX_BIN: shim, CODEX_HOME: join(base, 'codex-home') },
+      runId: 'test-run',
+      now: () => NOW_OFFPEAK,
+      log: (l) => logs.push(l),
+      fetchImpl,
+    });
+    assert.equal(classifyOutcome(result).status, 'done', 'the shim answered the fixture stream through the REAL lane (the raw-extraction shape — runTurn classifies)');
+    assert.equal(result.transcript.mode, 'pushed', 'the transcript landed via the contents API, not a git push');
+    assert.equal(result.transcript.repo, 'claudecode-headless/fsm-lab');
+    assert.equal(result.transcript.branch, 'fsm-sessions');
+    assert.equal(result.transcript.txt, 'sessions/T1/test-run-a1.txt');
+    const puts = calls.filter((c) => c.method === 'PUT');
+    assert.deepEqual(puts.map((c) => c.url.split('/contents/')[1]), ['sessions/T1/test-run-a1.txt', 'sessions/T1/test-run-a1.meta.json'], 'the per-run pair, txt then meta');
+    const txtBody = Buffer.from(puts[0].body.content, 'base64').toString('utf8');
+    assert.ok(txtBody.includes('fsm-lab CODEX transcript (mode: codex)'), 'the composed body rode the PUT');
+    assert.ok(txtBody.includes('[fixture:ok] real-mode transcript lane'), 'the prompt verbatim in the transcript');
+    const metaBody = JSON.parse(Buffer.from(puts[1].body.content, 'base64').toString('utf8'));
+    assert.equal(metaBody.harness, 'codex');
+    assert.equal(metaBody.fake, false, 'real mode — the F15 provenance pin');
+    assert.equal(puts[0].body.branch, 'fsm-sessions');
+    assert.equal(puts[0].headers.Authorization, 'Bearer sess-token-1');
+    assert.ok(puts[0].url.includes('/repos/claudecode-headless/fsm-lab/contents/'));
+    assert.ok(!puts[0].url.includes('agentrunners'), 'F2: the TARGET repo, never the runner repo');
+    assert.ok(logs.some((l) => l === 'CODEX-TRANSCRIPT-PUSHED 2 file(s) to fsm-sessions @ claudecode-headless/fsm-lab'));
+    assert.ok(!logs.some((l) => l.includes('CODEX-TRANSCRIPT-RETRY')), 'the happy path needed no whole-set retry');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('s25/b1 REAL-MODE turn, the push DIES: a DONE turn escalates infra_failed transcript-push-failed carrying the aggregate (the net-zero ladder\'s class)', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'codex-real-lane-'));
+  const logs = [];
+  try {
+    const shim = makeCodexBinShim(base);
+    // 401 on every call: FATAL per file (no 3×5s of retry theater before the
+    // same death) — the fast deterministic route to the escalation
+    const { fetchImpl } = mockContentsApi(() => ({ status: 401, data: { message: 'Bad credentials' } }));
+    const result = await codexTurn(envelope({ prompt: '[fixture:ok] push death' }), {
+      env: { ...REAL_MODE_ENV, CODEX_BIN: shim, CODEX_HOME: join(base, 'codex-home') },
+      runId: 'test-run',
+      now: () => NOW_OFFPEAK,
+      log: (l) => logs.push(l),
+      fetchImpl,
+    });
+    assert.equal(result.status, 'infra_failed', 'a DONE turn whose transcript never landed escalates (its report references the transcript)');
+    assert.match(result.detail, /transcript-push-failed\(sessions contents push: 2\/2 file\(s\) failed/);
+    assert.match(result.detail, /sessions\/T1\/test-run-a1\.txt: GET -> HTTP 401/);
+    assert.match(result.summary, /the transcript never landed/);
+    assert.ok(logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-RETRY first attempt failed:')));
+    assert.deepEqual(result.artifact_refs, [], 'fixture:ok wrote nothing — no artifact surface on this lane');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 test('codex escalation: the artifact-push escalation keeps lane_stats + the key pair (the retry\'s console view must see WHY attempt 1 burned)', () => {

@@ -27,6 +27,7 @@ import {
   ccExitJson, ccApiErrorStatus, ccChildEnv, ccNextLaneIndex, CC_ENV_DENYLIST,
   CC_BRIDGE_BASE_URL, CC_MODEL_CHAIN_DEFAULTS, CC_PERMISSION_DENIES,
   CC_KEY_CLASS_STATUSES, CC_TAIL_MODEL_DEFAULT, artifactPushEscalation,
+  pushSessionsContents,
 } from '../worker/cc-adapter.mjs';
 import { classifyOutcome } from '../lib/worker-contract.mjs';
 import { composeReportOutcome, REAL_MODEL_CHAIN_DEFAULTS } from '../worker/turn.mjs';
@@ -934,6 +935,74 @@ test('cc transcripts: push failure → retry once → infra_failed transcript-pu
     assert.match(result.detail, /transcript-push-failed/);
     assert.ok(logs.some(l => l.includes('CC-TRANSCRIPT-RETRY')), 'exactly one retry before the failure lane');
   } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// s25/b1 — THE REAL-MODE TRANSCRIPT LANE (the contents API, the X29 F3/F2
+// rebuild): the adapter seam pin. ccTurn's real spawn is `npx claude` (no
+// CODEX_BIN-style binary override), so the cc lane's deepest mock-first pin
+// is the exported seam itself — pushSessionsContents — driven by a scripted
+// fetch (zero network, zero git); the codex twin's suite additionally drives
+// a full REAL-mode turn through a CODEX_BIN shim.
+// ---------------------------------------------------------------------------
+
+test('s25/b1 pushSessionsContents (the cc adapter seam): the custom-name seam wins, the pinned log line carries the landed repo, the pair PUTs on the TARGET repo', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const call = {
+      url: String(url),
+      method: init.method || 'GET',
+      headers: { ...(init.headers || {}) },
+      body: typeof init.body === 'string' ? JSON.parse(init.body) : null,
+    };
+    calls.push(call);
+    return { status: call.method === 'GET' ? 404 : 201, text: async () => '' };
+  };
+  const logs = [];
+  // THE F2 PIN (the X29 mirror shape): the runner's GITHUB_REPOSITORY says
+  // agentrunners/fsm-lab-workers, the custom FSM_SESSIONS_REPO says the
+  // target — the lane MUST follow the custom name (the old env read split
+  // the record-of-record across two repos)
+  const r = await pushSessionsContents({
+    env: {
+      FSM_SESSIONS_REPO: 'claudecode-headless/fsm-lab',
+      FSM_SESSIONS_TOKEN: 'sess-token-cc',
+      GITHUB_REPOSITORY: 'agentrunners/fsm-lab-workers',
+      GH_TOKEN: 'runner-job-token',
+    },
+    files: new Map([['sessions/T-80/run80-a1.txt', 'body'], ['sessions/T-80/run80-a1.meta.json', '{}']]),
+    log: (l) => logs.push(l),
+    fetchImpl,
+  });
+  assert.equal(r.mode, 'pushed');
+  assert.equal(r.repo, 'claudecode-headless/fsm-lab');
+  assert.deepEqual(r.files, ['sessions/T-80/run80-a1.txt', 'sessions/T-80/run80-a1.meta.json']);
+  assert.ok(logs.some((l) => l === 'CC-TRANSCRIPT-PUSHED 2 file(s) to fsm-sessions @ claudecode-headless/fsm-lab'), 'the pinned line SHAPE + the landed repo APPENDED');
+  assert.equal(calls.length, 4, 'GET+PUT per file of the pair');
+  for (const c of calls) {
+    assert.ok(c.url.startsWith('https://api.github.com/repos/claudecode-headless/fsm-lab/contents/sessions/T-80/'), 'the TARGET repo');
+    assert.ok(!c.url.includes('agentrunners'), 'NEVER the runner repo (F2)');
+    assert.equal(c.headers.Authorization, 'Bearer sess-token-cc', 'the custom token lane, not GH_TOKEN');
+  }
+  // the legacy pair backs compat when the custom names are absent
+  const legacyCalls = [];
+  const r2 = await pushSessionsContents({
+    env: { GITHUB_REPOSITORY: 'claudecode-headless/fsm-lab', GH_TOKEN: 'legacy-tok' },
+    files: new Map([['sessions/T-81/r.txt', 'b']]),
+    log: () => {},
+    fetchImpl: async (url, init = {}) => {
+      legacyCalls.push({ url: String(url), method: init.method || 'GET', headers: { ...(init.headers || {}) } });
+      return { status: init.method === 'PUT' ? 201 : 404, text: async () => '' };
+    },
+  });
+  assert.equal(r2.repo, 'claudecode-headless/fsm-lab');
+  assert.ok(legacyCalls[0].url.includes('/repos/claudecode-headless/fsm-lab/contents/'));
+  assert.equal(legacyCalls[0].headers.Authorization, 'Bearer legacy-tok');
+  // missing both → the loud seam contract
+  await assert.rejects(
+    () => pushSessionsContents({ env: {}, files: new Map([['x', 'y']]), log: () => {}, fetchImpl: async () => ({ status: 404, text: async () => '' }) }),
+    /sessions push needs FSM_SESSIONS_REPO \+ FSM_SESSIONS_TOKEN/,
+  );
 });
 
 // ---------------------------------------------------------------------------
