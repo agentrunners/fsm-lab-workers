@@ -75,14 +75,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50   # T46/X21: the wall can be lease-2min (45-lease epochs); was 20 (the 15-lease era)
     steps:
-      # T46/ar (20-e): TARGET_REPO redirects the seat — the second bucket's
-      # workers (agentrunners/fsm-lab-workers) check out the MAIN repo so the
-      # task-branch push, the transcript push and the report-queue CAS-append
-      # all land THERE (every git push follows the CHECKOUT: the report push
-      # rides the checkout's origin; the cc-lane pushes ride the
-      # GITHUB_REPOSITORY + GH_TOKEN env below — both re-targeted together).
-      # Unset = own repo on the ephemeral job token — today's behavior,
-      # byte-identical.
+      # T46/ar (20-e) + s25/b1 (the X29 F2 correction): TARGET_REPO redirects
+      # the seat — the second bucket's workers (agentrunners/fsm-lab-workers)
+      # check out the MAIN repo so the task-branch push, the transcript push
+      # and the report-queue CAS-append all land THERE. The report push rides
+      # the checkout's own origin (lib/store.mjs — follows the checkout by
+      # construction, no env seam needed); the transcript + task-branch pushes
+      # ride the FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN CUSTOM names below.
+      # THE CORRECTED LAW (the X29 live lesson, run 35999041887): the old
+      # GITHUB_REPOSITORY + GH_TOKEN step-env mapping RENDERED the re-target
+      # in the step's env listing but never reached the process — step-env
+      # overrides of GITHUB_* default names are silently ignored by the
+      # runner — so 6 of 34 X29 runs silently pushed transcripts/artifacts to
+      # the MIRROR repo (the record-of-record split). Custom names are the
+      # only reliable seam. Unset = own repo on the ephemeral job token —
+      # today's behavior, byte-identical.
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.TARGET_REPO || github.repository }}
@@ -212,20 +219,34 @@ jobs:
       - name: Work the task
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          # T46/ar (20-e): the cc-lane push targets (fsm-sessions transcripts
-          # + the tasks/<id> write-back) follow the CHECKOUT target, not the
-          # run's repo: GITHUB_REPOSITORY re-targets to TARGET_REPO and
-          # GH_TOKEN rides the PAT lane (the ephemeral job token cannot push
-          # cross-repo). Unset TARGET_REPO = github.repository + the job token
-          # — today's behavior. The report-queue push needs no mapping: it
-          # rides the checkout's own origin (lib/store.mjs).
-          GITHUB_REPOSITORY: ${{ vars.TARGET_REPO || github.repository }}
-          GH_TOKEN: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}
+          # s25/b1 (the X29 F2 fix — THE GITHUB_* OVERRIDE LAW): the sessions
+          # push targets (fsm-sessions transcripts + the tasks/<id> write-back)
+          # follow the CHECKOUT target through CUSTOM names. The law: step-env
+          # overrides of GITHUB_* default names are SILENTLY IGNORED by the
+          # runner — the step's env listing RENDERS the override in the log
+          # while the spawned process keeps the real value (the X29 live
+          # lesson: run 35999041887 rendered GITHUB_REPOSITORY:
+          # claudecode-headless/fsm-lab and pushed To
+          # https://github.com/agentrunners/fsm-lab-workers.git). Custom names
+          # are the only reliable seam. (GH_TOKEN is NOT a protected name —
+          # its override worked; the failure was repo-selection only, which
+          # is exactly why the old split was SILENT.) The adapters resolve
+          # FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN first, falling back to the
+          # GITHUB_REPOSITORY/GH_TOKEN back-compat pair (worker/
+          # sessions-push.mjs). Unset TARGET_REPO = github.repository + the
+          # job token — byte-identical to today. The report-queue push needs
+          # no mapping: it rides the checkout's own origin (lib/store.mjs).
+          FSM_SESSIONS_REPO: ${{ vars.TARGET_REPO || github.repository }}
+          FSM_SESSIONS_TOKEN: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           # T45/F-E: GITHUB_RUN_ID is STABLE across re-runs — only the attempt
           # increments. The report id is attempt-scoped (rep-<run>-a<attempt>)
           # so a re-run's report is never dedup-swallowed. GITHUB_RUN_ATTEMPT
           # IS a default env var, but the mapping keeps the contract explicit.
+          # s25/b1: these two ARE GITHUB_* names — the override law says they
+          # never reach the process — but they are SAME-VALUE no-ops (the
+          # runner's own run_id/run_attempt are exactly these values): kept
+          # as harmless contract documentation, never load-bearing.
           GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
           # T45/F-G(a): the mock sleep cap = WORKER_TTL_MIN - 2 (margin so the
           # report enqueues before the SIGTERM). Keep in sync with
@@ -267,10 +288,12 @@ jobs:
           # the lane overlay re-injects the serving key per lane); the CLI
           # pin rides vars.CODEX_VERSION at the INSTALL step only (the adapter
           # spawns the installed binary — no version argv).
-          # T46/W4: the CC adapter's transcript push (fsm-sessions branch) —
-          # the token lane (X20 run-1 finding: without it the turn reports
-          # infra 'transcript-push-failed'). T46/ar (20-e): the value moved UP
-          # beside GITHUB_REPOSITORY (the cc-lane push pair — both follow the
-          # CHECKOUT target; see the ar comment there).
+          # T46/W4 → s25/b1: the transcript push rides the CONTENTS API now
+          # (the X29 F3 race fix — worker/sessions-push.mjs, per-file CAS,
+          # race-free at any parallelism). The X20 run-1 lesson still holds:
+          # without a token lane the turn reports infra
+          # 'transcript-push-failed' — FSM_SESSIONS_TOKEN above IS that lane
+          # (the job token by default, the PAT when TARGET_REPO redirects —
+          # the ephemeral job token cannot push cross-repo).
           EVENT: ${{ toJSON(github.event) }}
         run: node worker/turn.mjs
