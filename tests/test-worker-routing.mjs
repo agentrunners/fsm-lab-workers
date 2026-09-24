@@ -264,6 +264,61 @@ test('routing: MODE=cc laneLogPath glue — a pre-written bridge-lane JSONL beco
 });
 
 // ---------------------------------------------------------------------------
+// MODE=codex — the s24/B1 SEAM (multi-engine design D1/D13). The adapter
+// (worker/codex-adapter.mjs, exporting codexTurn(envelope, opts)) ships in
+// PARALLEL as B2; the seam routes NOW: a codex dispatch at a worker without
+// the adapter reports infra_failed 'codex-adapter-missing' — LOUD, terminal
+// at the TURN level (no lane rotation: the invocation is broken, not the
+// lane). Both pins force the lazy import deterministically via
+// codexAdapterPath (a temp dir), so they stay valid AFTER B2 lands — they
+// never depend on the adapter's absence in the checkout.
+// ---------------------------------------------------------------------------
+
+test('routing: MODE=codex (s24/B1 seam) — the adapter missing → infra_failed \'codex-adapter-missing\', ONE report, exit 0, no lane rotation', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'wd-codex-seam-'));
+  try {
+    const h = makeHarness({ cp: legacyCp({ mode: 'codex', behavior: null }) });
+    const r = await h.turn({ codexAdapterPath: join(scratch, 'codex-adapter.mjs') });
+    assert.equal(r.exitCode, 0, 'a handled infra report is never a failed run');
+    assert.equal(r.reported, true);
+    assert.equal(h.enqueued.length, 1, 'exactly ONE report — terminal at the turn level (D13: no lane rotation, the invocation is broken)');
+    const rep = h.enqueued[0];
+    assert.equal(rep.outcome.status, 'infra_failed');
+    assert.equal(rep.outcome.error, 'codex-adapter-missing');
+    assert.equal(rep.outcome.telemetry.lane_attempts_used, 0, 'zero lane attempts — the failure precedes any lane');
+    assert.equal(h.sleeps.length, 0, 'no worker-side sleep');
+    assert.ok(!h.fetches.length, 'zero network through the whole turn');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('routing: MODE=codex (s24/B1 seam) — a present adapter module routes to its exported codexTurn(envelope, opts) through the lazy import', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'wd-codex-stub-'));
+  try {
+    // the stub honors the engineTurn contract shape (a RawTurn return) —
+    // the seam test is about ROUTING, not the engine
+    writeFileSync(join(scratch, 'codex-adapter.mjs'), [
+      'export async function codexTurn(envelope, opts) {',
+      '  opts.log(`codex-stub routed mode=${envelope.mode} allowRoot=${(opts.allowRoot ?? []).length}`);',
+      '  return { status: \'done\', summary: `codex stub ok: mode=${envelope.mode} prompt=${envelope.prompt}`, artifact_refs: [], telemetry: { turns: 1, wall_ms: 5, lane_attempts_used: 1 } };',
+      '}',
+    ].join('\n'));
+    const h = makeHarness({ cp: legacyCp({ mode: 'codex', behavior: null }) });
+    const r = await h.turn({ codexAdapterPath: join(scratch, 'codex-adapter.mjs') });
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.reported, true);
+    const rep = h.enqueued[0];
+    assert.equal(rep.outcome.status, 'done', 'the stub\'s raw flows through the ONE normalizer');
+    assert.match(rep.outcome.artifact, /codex stub ok: mode=codex prompt=task A3/);
+    assert.equal(rep.outcome.telemetry.lane_attempts_used, 1, 'the adapter\'s telemetry rides the report');
+    assert.ok(h.logs.some(l => l.includes('codex-stub routed mode=codex')), 'the routing arm passed env/runId/now/log through to codexTurn');
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // MODE=real — the env-driven model chain with ONE fallback hop.
 // ---------------------------------------------------------------------------
 

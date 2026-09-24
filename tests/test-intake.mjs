@@ -134,6 +134,13 @@ test('validate: artifacts bind to the MINTED id (m-4) + the .. traversal fold', 
 
 test('validate: lease_minutes + milestone bounds; mode vocabulary', () => {
   assert.ok(validateSpec({ ...VALID, lease_minutes: 45, milestone: 2, mode: 'cc' }, { issue: 1 }).ok);
+  // s24/B1: 'codex' is a vocabulary member on every epoch-level surface
+  // (the single-task top level here; the tasks form's top level + the
+  // worker envelope carry the same set — pinned in their own files)
+  assert.ok(validateSpec({ ...VALID, mode: 'codex' }, { issue: 1 }).ok, 's24/B1: the codex engine epoch is door-legal');
+  assert.ok(!validateSpec({ ...VALID, mode: 'docker' }, { issue: 1 }).ok, 'unknown mode');
+  const dm = validateSpec({ ...VALID, mode: 'docker' }, { issue: 1 });
+  assert.ok(dm.errors.some(e => e.includes('is not one of [mock, real, cc, codex]')), 'the rejection names the 4-member vocabulary');
   // s22/B-1: the floor moved 1 -> 3 (the advertised bounds and the enforcement
   // together): 3 is the minimum legal lease; 1-2 are the work-destroying trap
   // (envelope deadline = min(lease,48) - 120s <= 0 at assign) and now REJECTED
@@ -425,7 +432,7 @@ test('B-1 validate: per-entry violations list EVERY violation, entry-prefixed, i
   assert.ok(e2.some(x => x.includes('must live under tasks/<id-invalid>/')), 'entry artifacts bind to the ENTRY id (invalid id -> the <id-invalid> placeholder, same as the single-task lane)');
   assert.ok(e2.some(x => x.includes('lease_minutes 2 is outside [3, 120]')), 'entry lease floor');
   assert.ok(e2.some(x => x.includes('milestone 0 is outside [1, 9]')), 'entry milestone bound');
-  assert.ok(e2.some(x => x.includes('is not one of [mock, real, cc]')), 'entry mode vocab');
+  assert.ok(e2.some(x => /mode is epoch-level — set it once at the top of the block \(mode: mock \| real \| cc \| codex\), not per entry/.test(x)), 'entry mode REJECTS with the epoch-level pointer (s24/B1 D16 — the placement is the violation, the value\'s validity is moot)');
   assert.ok(e2.some(x => x.includes('unknown key(s): prio')), 'entry unknown key');
   assert.ok(v.errors.every(e => !e.startsWith('task entry 1')), 'the CLEAN entry contributes no errors');
 });
@@ -449,6 +456,38 @@ test('B-1 validate: the tasks form degenerates the top level — task keys besid
   assert.ok(ok.ok, JSON.stringify(ok.errors));
 });
 
+// s24/B1 (multi-engine design D16): per-entry `mode` REJECTS at the door.
+// It used to be validated here (the vocabulary rule ran on entries) then
+// silently DROPPED by specToTask (conductor-core.mjs) — the door accepted
+// input the machine would never honor. The rejection points at the
+// EPOCH-level field; the epoch-level mode keeps its rule on BOTH forms.
+test('s24/B1 D16: per-entry mode in the tasks form REJECTS with the epoch-level pointer (validated-then-dropped is dead)', () => {
+  // a VALID per-entry mode value still rejects — the field's PLACEMENT is
+  // the violation (an epoch runs ONE harness; there is no per-task mode)
+  const v = validateSpec({ tasks: [
+    { id: 'T-1', title: 't', behavior: 'fast', mode: 'cc' },
+  ] }, { issue: 5 });
+  assert.ok(!v.ok, JSON.stringify(v.errors));
+  assert.ok(v.errors.some(e => /task entry 1 \(T-1\): mode is epoch-level — set it once at the top of the block \(mode: mock \| real \| cc \| codex\), not per entry/.test(e)), v.errors.join(' | '));
+  // every vocabulary member rejects per entry — 'codex' included (a codex
+  // epoch is minted by the epoch-level field, never per task)
+  for (const mode of ['mock', 'real', 'cc', 'codex']) {
+    const r = validateSpec({ tasks: [{ id: 'T-1', title: 't', behavior: 'fast', mode }] }, { issue: 5 });
+    assert.ok(!r.ok, `per-entry mode ${mode} rejects`);
+    assert.ok(r.errors.some(e => e.includes('mode is epoch-level')), `${mode} gets the epoch-level pointer`);
+    assert.ok(r.errors.every(e => !e.includes('is not one of [mock, real, cc, codex]')), 'no vocab drip — the value is irrelevant, the placement is the violation');
+  }
+  // the D16 twin: the EPOCH-level mode keeps its rule on the tasks form's
+  // top level — all four members, codex included
+  for (const mode of ['mock', 'real', 'cc', 'codex']) {
+    const okTop = validateSpec({ mode, tasks: [{ id: 'T-1', title: 't', behavior: 'fast' }] }, { issue: 5 });
+    assert.ok(okTop.ok, `epoch-level mode ${mode} stays legal: ${JSON.stringify(okTop.errors)}`);
+  }
+  // and the single-task form's top level is both task and epoch level —
+  // 'codex' is legal there too (the X29 operator switch shape)
+  assert.ok(validateSpec({ title: 't', accept: 'a', mode: 'codex' }, { issue: 5 }).ok, 'single-task form: epoch-level codex is legal');
+});
+
 test('B-1 validate: entry id REQUIRED in the tasks form (the default would collide across entries); tasks-shape rejects', () => {
   const noId = validateSpec({ tasks: [{ title: 't', behavior: 'fast' }] }, { issue: 42 });
   assert.ok(!noId.ok);
@@ -468,9 +507,9 @@ test('B-1 validate: entry id REQUIRED in the tasks form (the default would colli
   assert.ok(empty.errors.some(e => e.includes('tasks carries 0 entries')), empty.errors.join(' | '));
 });
 
-test('B-1 validate: entry-level artifacts bind to the ENTRY id (m-4 per entry); entry milestone/mode are validated metadata', () => {
+test('B-1 validate: entry-level artifacts bind to the ENTRY id (m-4 per entry); entry milestone is validated metadata', () => {
   const ok = validateSpec({ tasks: [
-    { id: 'T-1', title: 't', behavior: 'fast', artifacts: ['tasks/T-1/report.md'], milestone: '5', mode: 'cc', lease_minutes: '9' },
+    { id: 'T-1', title: 't', behavior: 'fast', artifacts: ['tasks/T-1/report.md'], milestone: '5', lease_minutes: '9' },
   ] }, { issue: 2 });
   assert.ok(ok.ok, JSON.stringify(ok.errors));
   const foreign = validateSpec({ tasks: [
@@ -518,6 +557,18 @@ test('B-1 how-to: the multi-task form + the 32 cap are documented (the template 
   assert.ok(v1.ok, `the how-to's own multi-task example is door-legal: ${JSON.stringify(v1.errors)}`);
   const p0 = parseSpecBlock(h);
   assert.ok(p0 && p0.spec.id === 'T-501', 'the single-task example still parses');
+});
+
+// s24/B1: the help text's advertised mode vocabulary — the 4-member set,
+// rendered verbatim (mock | real | cc | codex, epoch-level), with the D16
+// per-entry rule documented beside it. The door's error messages and the
+// how-to must agree (the advertised bounds and the enforcement move
+// TOGETHER — the lease-floor precedent).
+test('s24/B1 how-to: the mode vocabulary line advertises the 4 members (mock | real | cc | codex, epoch-level) + the D16 rule', () => {
+  const h = howToComment();
+  assert.ok(h.includes('`mode` optional — one of mock | real | cc | codex (epoch-level'), 'the advertised vocabulary is the 4-member set');
+  assert.ok(!h.includes('one of mock | real | cc (epoch-level'), 'the stale 3-member line is gone');
+  assert.ok(h.includes('a per-entry mode in the `tasks:` form is rejected'), 'the D16 per-entry rejection is documented where a stranger reads it');
 });
 
 // ---------------------------------------------------------------------------
