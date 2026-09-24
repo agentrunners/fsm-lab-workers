@@ -879,7 +879,7 @@ test('s25/b1 REAL-MODE turn (CODEX_BIN shim): the transcript pair lands through 
   }
 });
 
-test('s25/b1 REAL-MODE turn, the push DIES: a DONE turn escalates infra_failed transcript-push-failed carrying the aggregate (the net-zero ladder\'s class)', async () => {
+test('s25 REAL-MODE turn, the push DIES PERSISTENTLY (401): a DONE turn escalates infra_failed transcript-push-failed carrying the aggregate (the lane-broken class — unchanged by the X30 correction)', async () => {
   const base = mkdtempSync(join(tmpdir(), 'codex-real-lane-'));
   const logs = [];
   try {
@@ -896,10 +896,44 @@ test('s25/b1 REAL-MODE turn, the push DIES: a DONE turn escalates infra_failed t
     });
     assert.equal(result.status, 'infra_failed', 'a DONE turn whose transcript never landed escalates (its report references the transcript)');
     assert.match(result.detail, /transcript-push-failed\(sessions contents push: 2\/2 file\(s\) failed/);
-    assert.match(result.detail, /sessions\/T1\/test-run-a1\.txt: GET -> HTTP 401/);
+    assert.match(result.detail, /sessions\/T1\/test-run-a1\.txt: GET HTTP 401/, 'the compact error (s25/X30: the status survives every downstream slice)');
     assert.match(result.summary, /the transcript never landed/);
-    assert.ok(logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-RETRY first attempt failed:')));
     assert.deepEqual(result.artifact_refs, [], 'fixture:ok wrote nothing — no artifact surface on this lane');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('s25/X30 THE DEGRADED PATH: a 409 storm exhausts the ladder — the DONE turn KEEPS its status + the note rides the summary (no re-run of a completed paid turn)', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'codex-real-lane-'));
+  const logs = [];
+  try {
+    const shim = makeCodexBinShim(base);
+    // the X30 storm shape verbatim: every PUT conflicts (the ref moved
+    // server-side — "is at X but expected Y") → retryable → the 10-attempt
+    // de-sync ladder burns → DEGRADED, never thrown
+    const { fetchImpl, calls } = mockContentsApi((c) => (c.method === 'GET' ? { status: 404, data: null } : { status: 409, data: { message: 'is at 3865e67 but expected 6c2c182' } }));
+    const sleeps = [];
+    const result = await codexTurn(envelope({ prompt: '[fixture:ok] storm' }), {
+      env: { ...REAL_MODE_ENV, CODEX_BIN: shim, CODEX_HOME: join(base, 'codex-home') },
+      runId: 'test-run',
+      now: () => NOW_OFFPEAK,
+      log: (l) => logs.push(l),
+      fetchImpl,
+      sleepImpl: (ms) => { sleeps.push(ms); },
+      rand: () => 0.5,
+    });
+    // the happy-path return is the raw-extraction shape (content/reasoning,
+    // NO stamped status — the classification is runTurn's). The X30 law
+    // asserts: the WORK is intact, the escalation did NOT fire, and the
+    // degraded marker rides the transcript result + the summary.
+    assert.equal(result.transcript.mode, 'degraded', 'the transcript result carries the degraded marker');
+    assert.ok(String(result.content ?? '').includes('fake-codex ok'), 'the turn\'s work is intact — the storm never touched the content');
+    assert.equal(result.status, undefined, 'no escalation fired (a raw-shape return, not an infra_failed compose)');
+    assert.match(result.summary, /\[transcript degraded: 2 file\(s\) unlanded @ /, 'the note rides the report summary (the journal-visible marker)');
+    assert.ok(logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-DEGRADED')), 'the LOUD run-log line');
+    assert.ok(!logs.some((l) => l.startsWith('CODEX-TRANSCRIPT-RETRY')), 'the outer whole-set retry is GONE (it re-fed the storm — the X30 correction)');
+    assert.equal(calls.filter((c) => c.method === 'PUT').length, 2 * 10, 'both files burned the full 10-attempt ladder');
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
