@@ -19,8 +19,10 @@
 //   5. report routing (REAL local git, the X25 geometry) — a worker seat
 //      whose checkout origin is the TARGET repo enqueues its report onto
 //      THAT repo's fsm-state; the run's own repo never sees a branch.
-//   4. the YAML pins — worker.yml's TARGET_REPO checkout switch (+ the env
-//      pair that follows it) and conductor.yml's WORKER_REPO_2 mapping.
+//   4. the YAML pins — worker.yml's TARGET_REPO checkout switch (+ the
+//      s25/b1 custom-name env pair that follows it — FSM_SESSIONS_REPO/
+//      FSM_SESSIONS_TOKEN, the X29 F2 fix) and conductor.yml's WORKER_REPO_2
+//      mapping.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -347,23 +349,25 @@ test('ar YAML pin: worker.yml TARGET_REPO checkout switch (own-repo default, PAT
   assert.ok(at > co && at < setup, 'the repository mapping rides the CHECKOUT step (before setup-node)');
   assert.ok(tok !== -1 && tok > co && tok < setup, 'the checkout token lane rides the CHECKOUT step');
   assert.ok(at < tok, 'repository before token (the with-block order)');
-  // the cc-lane push pair follows the checkout target (fsm-sessions + the
-  // task branch ride GITHUB_REPOSITORY + GH_TOKEN — the env seam the adapter
-  // actually reads; the job token cannot push cross-repo)
+  // s25/b1 (the X29 F2 fix — THE GITHUB_* OVERRIDE LAW): the sessions push
+  // pair follows the checkout target through CUSTOM names. Step-env
+  // overrides of GITHUB_* default names are silently ignored by the runner
+  // (run 35999041887 rendered the override and pushed to the mirror anyway),
+  // so the old GITHUB_REPOSITORY/GH_TOKEN mappings are GONE and
+  // FSM_SESSIONS_REPO/FSM_SESSIONS_TOKEN — the names worker/sessions-push.mjs
+  // resolves FIRST — carry the same var-gated lanes.
   const work = yml.indexOf('name: Work the task');
   const run = yml.indexOf('run: node worker/turn.mjs');
-  const gr = yml.indexOf('GITHUB_REPOSITORY: ${{ vars.TARGET_REPO || github.repository }}');
-  const gh = yml.indexOf('GITHUB_REPOSITORY: ${{ github.repository }}');
-  assert.equal(gh, -1, 'the OLD same-repo GITHUB_REPOSITORY mapping is gone');
-  assert.ok(gr !== -1 && gr > work && gr < run, 'GITHUB_REPOSITORY follows TARGET_REPO inside Work-the-task');
-  const ghTok = yml.split('GH_TOKEN:').length - 1;
-  assert.equal(ghTok, 1, 'exactly ONE GH_TOKEN mapping (the pair moved up; no duplicate keys)');
   const workBlock = yml.slice(work, run);
-  assert.ok(workBlock.includes('GH_TOKEN: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}'), 'the Work-the-task GH_TOKEN uses the SAME var-gated PAT lane');
-  assert.ok(workBlock.includes('GITHUB_REPOSITORY: ${{ vars.TARGET_REPO || github.repository }}'), 'GITHUB_REPOSITORY uses the SAME var-gated repo mapping');
+  assert.equal(yml.indexOf('GITHUB_REPOSITORY: ${{ vars.TARGET_REPO'), -1, 'the broken GITHUB_REPOSITORY override mapping is GONE (the F2 law)');
+  assert.equal(yml.indexOf('GH_TOKEN: ${{ vars.TARGET_REPO'), -1, 'the GH_TOKEN override went with it (FSM_SESSIONS_TOKEN replaces the lane)');
+  assert.ok(workBlock.includes('FSM_SESSIONS_REPO: ${{ vars.TARGET_REPO || github.repository }}'), 'FSM_SESSIONS_REPO uses the SAME var-gated repo mapping (fsm-sessions transcripts + the task branch ride it)');
+  assert.ok(workBlock.includes('FSM_SESSIONS_TOKEN: ${{ vars.TARGET_REPO && secrets.LAB_PAT || secrets.GITHUB_TOKEN }}'), 'FSM_SESSIONS_TOKEN uses the SAME var-gated PAT lane (the job token cannot push cross-repo)');
+  const fsmTok = yml.split('FSM_SESSIONS_TOKEN:').length - 1;
+  assert.equal(fsmTok, 1, 'exactly ONE FSM_SESSIONS_TOKEN mapping (no duplicate keys)');
   // the mapping-set-when-unset contract: the pre-existing explicit mappings survive
-  assert.ok(yml.includes('GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}'), 'the attempt mapping is intact');
-  assert.ok(yml.includes("OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}"), 'the B1 pool line is untouched by the ar edit');
+  assert.ok(yml.includes('GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}'), 'the attempt mapping is intact (the same-value no-op class — kept as contract documentation)');
+  assert.ok(yml.includes("OPENROUTER_KEY_POOL: ${{ secrets.OPENROUTER_KEY_POOL || '' }}"), 'the B1 pool line is untouched by the s25 edit');
 });
 
 test('ar YAML pin: conductor.yml maps WORKER_REPO_2 + WORKER_OVERFLOW_AT from repo variables (unset = empty env = no lane)', () => {
