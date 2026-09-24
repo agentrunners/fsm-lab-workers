@@ -32,9 +32,12 @@
 //
 // THE LANE PICKER (D2): key pool [OPENROUTER_API_KEY, OPENROUTER_API_KEY_2] ×
 // model chain [CC_MODEL, deepseek-v4.1-flash, glm-5.3-flash,
-// nemotron-3.5-lightning:free] (T46/W-D §D2: the s19 cc-lane eval verdict —
-// deepseek primary, glm fallback for provider diversity, nemotron the free
-// tail; deepseek-v4-flash-0731:free is NEVER on this lane — it hallucinated
+// cohere/north-mini-code:free] (T46/W-D §D2: the s19 cc-lane eval verdict —
+// deepseek primary, glm fallback for provider diversity; s24 FLIPS the free
+// tail nemotron→cohere — the live eval: cohere 6/6 vs nemotron 1/6, the
+// nemotron 500-tax ACTIVE at its worst (4×500+504, 30-150s failure
+// latencies);
+// deepseek-v4-flash-0731:free is NEVER on this lane — it hallucinated
 // the eval task, silent content-poison, and is 404-dead upstream anyway
 // (s23 probe §1b) — the exclusion is now self-enforcing), flattened
 // KEY-MAJOR (every model on key 1 before key 2's first), bounded by
@@ -114,12 +117,21 @@ export const CC_BRIDGE_BASE_URL = 'https://openrouter.ai/api/v1';
 // s23/B2: the PAID defaults (the OPENROUTER-KEYS §S23 approved pair — paid
 // traffic rides ONLY these two models) and the FREE tail slot, composed by
 // ccModelChain. CC_MODEL_CHAIN_DEFAULTS stays the DEFAULT chain's exact
-// shape (the deployed [ds, glm, nemotron:free], pinned verbatim below).
+// shape (the deployed [ds, glm, cohere:free], pinned verbatim below).
+// s24 — THE TAIL FLIP (the pre-registered rule, research/s23-cc-tail.md §7
+// open question 1, met): the live eval (2026-09-24,
+// scripts/s24-cohere-tail-results.json) — cohere/north-mini-code:free 6/6
+// (all 200s on the 32K pre-flight across 4 key classes incl. drained /
+// overdrawn keys; content-bearing turn-shaped completions 4-9.5s; ZERO
+// transport-class failures) vs nemotron 1/6 (4×500 + 1×504, failure
+// latencies 30-150s — the 500-tax ACTIVE and worse than the s23 probe's
+// 2/6). The default flips nemotron → cohere; nemotron stays exactly one
+// CC_TAIL_MODEL env line away (the s23 swap mechanism, pinned in tests).
 export const CC_PAID_MODEL_DEFAULTS = [
   'deepseek/deepseek-v4.1-flash',
   'z-ai/glm-5.3-flash',
 ];
-export const CC_TAIL_MODEL_DEFAULT = 'nvidia/nemotron-3.5-lightning:free';
+export const CC_TAIL_MODEL_DEFAULT = 'cohere/north-mini-code:free';
 export const CC_MODEL_CHAIN_DEFAULTS = [...CC_PAID_MODEL_DEFAULTS, CC_TAIL_MODEL_DEFAULT];
 // SA-5: the web tools are DENIED at the CLI boundary (mcp-web replaces them)
 export const CC_PERMISSION_DENIES = ['WebFetch', 'WebSearch'];
@@ -132,7 +144,7 @@ export function ccModelChain(env = process.env) {
   // s21/W7 (a2): dedup the custom head against the defaults — the deployed
   // CC_MODEL (deepseek/deepseek-v4.1-flash == CC_MODEL_CHAIN_DEFAULTS[0])
   // made lane 2 an EXACT (key, model) repeat of lane 1: a no-backoff plain
-  // retry that pushes glm/nemotron and KEY_2's block further out of the
+  // retry that pushes glm/the-tail and KEY_2's block further out of the
   // 3-slot dispatched budget (compounds W1, the unreachable failover).
   // Custom wins (the operator's head position); the duplicate slot drops.
   //

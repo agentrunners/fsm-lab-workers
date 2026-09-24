@@ -736,3 +736,33 @@ lane; the budget-pause machinery end-to-end in its designed shape
 quirks dead (genesis init + REJECTED-never-arms, live-proven); the dup-report
 CAS absorbing doubles at saturation; and a DEGRADED-CLEAN halt with zero
 timeouts, zero orphans, zero uncontrolled burn.
+
+## s24 — the cohere tail flip (2026-09-24)
+
+**THE LIVE EVAL** (results JSON: `scripts/s24-cohere-tail-results.json`, 12
+probes, 2026-09-24T02:11Z): `cohere/north-mini-code:free` **6/6** — every
+probe a 200, across 4 key classes on the 32K pre-flight (or-079
+kasulty-overdrawn, or-083 zikomolapo-drained, or-082 ansgauretychisB-3mill,
+or-001 free-tier — including the DRAINED and OVERDRAWN keys the tail exists
+to serve) plus the two turn-shaped content probes (STATUS-OK answers, 4.2s
+and 9.5s, 579-in/173-out and 579-in/649-out) — ZERO transport-class
+failures. `nvidia/nemotron-3.5-lightning:free` **1/6** — 4× 500 (`INTERNAL`,
+"The signal has been aborted") + 1× 504, with failure latencies 30-150s: the
+500-tax ACTIVE and WORSE than the s23 probe's 2/6 (which the s23 design
+§2.4's absorber arithmetic was sized against).
+
+**THE PRE-REGISTERED RULE** (research/s23-cc-tail.md §7 open question 1):
+s23 shipped nemotron as the default because "the verified surface beats the
+unverified one — never CLI-evaluated" held then; the rule was to spend a
+live eval on cohere and FLIP via `CC_TAIL_MODEL` if cohere won. The s24 eval
+is that eval and cohere won on every axis (per-call health 6/6 vs 1/6,
+failure latency, content-bearing turns). **Rule met → flip landed in code**
+(this commit): `CC_TAIL_MODEL_DEFAULT` = `cohere/north-mini-code:free`
+(worker/cc-adapter.mjs), the real-lane free chain REORDERED cohere-first
+(worker/turn.mjs `REAL_MODEL_CHAIN_DEFAULTS` — nemotron demoted to second
+choice), every conformance/pin surface updated. nemotron stays exactly one
+`CC_TAIL_MODEL` env line away (the s23 swap mechanism — the B2 override pin
+now demonstrates the swap on the demoted slug). The FREE-TAIL RIDING alert
+body + the X=15min threshold arithmetic comment updated for the cohere
+cadence. Gates: full suite + `scripts/validate.sh` + conformance-cc all
+green at merge time (numbers in the commit/CI).
