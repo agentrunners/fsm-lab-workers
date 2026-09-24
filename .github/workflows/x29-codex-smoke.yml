@@ -1,0 +1,142 @@
+# x29-codex-smoke — s24/B10: the FIRST live codex turn on an fsm-lab worker
+# lane (the x20-cc-smoke precedent, second engine: workflow_dispatch, timed
+# install, ONE real turn, cost line, content assert). This run IS the
+# measurement — it de-risks the X29 codex-mode soak the same way x20
+# de-risked the CC epoch (the B10 row of research-s24/multi-engine-design.md
+# §3).
+#
+# THE INSTALL PATH IS THE DISPATCH PATH: the codex-install step below runs
+# the worker.yml "Install the Codex CLI" step's run body VERBATIM
+# (extracted programmatically at build time — byte-identical commands: the
+# OX_RAW mode gate + the CODEX_HOME=$HOME/.codex-fsm render of
+# worker/codex/config.toml + the pinned @openai/codex npm install + the
+# no-||true version assert). The ONE seam difference: a workflow_dispatch
+# carries no client_payload, so OX_RAW is set to the equivalent ox envelope
+# '{"mode":"codex"}' — the SAME gate parse then takes the SAME codex branch
+# a real codex dispatch rides. The ONE additive line (the install_s
+# GITHUB_OUTPUT carriage, the x20 pattern) is marked below. STANDING
+# OBLIGATION (the D12a mirror-sync discipline): any worker.yml install-step
+# change re-syncs HERE too.
+#
+# The turn: scripts/x29-codex-smoke.mjs (the driver) builds the minimal
+# envelope {task_ref T-X29-SMOKE, prompt 'Reply with exactly: X29-SMOKE-OK',
+# mode codex, wall 8min + lane_attempts 3} and calls the adapter's
+# codexTurn DIRECTLY (the same export the routing arm resolves) with env
+# from the runner secrets — CODEX_HOME rides GITHUB_ENV from the install
+# step (the B3 wiring), OPENROUTER_API_KEY is the funded primary (or-074).
+# The driver asserts the content marker (exit 4 on the miss — the step
+# fails LOUD so the logs get read), prints the cost line (lane_stats — the
+# adapter's own usage × worker/codex/models.json synthesis, deepseek
+# peak-aware; expect ~$0.0016-0.004 on deepseek/deepseek-v4.1-flash), the
+# per-lane log, and the install seconds. The transcript push rides
+# GH_TOKEN to the fsm-sessions branch (harness 'codex' provenance).
+#
+# Driver-plane discipline: manual dispatch ONLY (never a push/schedule
+# trigger — no hostile-input surface). Secrets: the ALREADY-DEPLOYED
+# OPENROUTER_API_KEY only (NO new secrets). Optional vars: CODEX_VERSION
+# (CLI pin; default 0.156.0 — same default as the worker.yml step).
+name: x29-codex-smoke
+
+run-name: "x29-codex-smoke · the first live codex turn"
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: 'the one-turn prompt (default: the trivial echo marker)'
+        required: false
+        default: 'Reply with exactly: X29-SMOKE-OK'
+
+permissions:
+  contents: write   # the transcript push (fsm-sessions branch) — X20 run-5: read denied it
+
+concurrency:
+  group: x29-codex-smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # install ~10-20s + turn ~10-60s + transcript push + slack
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # the WORKER lane's major (worker.yml pins 22; the codex adapter rides it on real dispatches)
+
+      - name: Install the Codex CLI (the worker.yml install path VERBATIM, timed)
+        # The body below is the worker.yml step's run block verbatim (see the
+        # header: the standing sync obligation). env differs ONLY in the OX_RAW
+        # source (the dispatch-equivalent ox envelope) — the commands are the
+        # dispatch path's.
+        id: codex-install
+        env:
+          CODEX_VERSION: ${{ vars.CODEX_VERSION }}
+          OX_RAW: '{"mode":"codex"}'   # the dispatch envelope's ox equivalent — the SAME gate parse takes the codex branch
+        run: |
+          MODE=$(printf '%s' "$OX_RAW" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(typeof o==="object"&&o?String(o.mode||""):"")}catch{console.log("")}})')
+          if [ "$MODE" = "codex" ]; then
+            CODEX_PIN="${CODEX_VERSION:-0.156.0}"
+            # CODEX_HOME (D7a): $HOME/.codex-fsm — NEVER /tmp (helper-binary
+            # PATH aliases refuse /tmp, gotcha §10.2), NEVER inside a workdir
+            # (R1's law: nothing codex-owned lands where scanWorkdir claims).
+            # Created + config rendered BEFORE the version assert so a failed
+            # assert still leaves the home provably wired; the adapter
+            # mkdirSync's it again defensively (codex-adapter.mjs gotcha #2).
+            # Exported via GITHUB_ENV (GitHub's env mapping cannot expand
+            # $HOME): the "Work the task" step's node process then reads
+            # process.env.CODEX_HOME — the adapter's resolution order (a
+            # non-empty env.CODEX_HOME wins; absent = its turn-scoped scratch
+            # fallback, never reached on a dispatch that passed this gate).
+            CODEX_HOME_DIR="$HOME/.codex-fsm"
+            mkdir -p "$CODEX_HOME_DIR"
+            if [ ! -f worker/codex/config.toml ]; then
+              echo "::error::worker/codex/config.toml missing from the checkout — the codex config render cannot proceed (the engine's committed template, s24/B3)"
+              exit 1
+            fi
+            cp worker/codex/config.toml "${CODEX_HOME_DIR}/config.toml"
+            echo "CODEX_HOME=${CODEX_HOME_DIR}" >> "$GITHUB_ENV"
+            echo "CODEX-CONFIG-RENDERED ${CODEX_HOME_DIR}/config.toml (wire_api responses · env_key OPENROUTER_API_KEY)"
+            T0=$(date +%s)
+            npm install -g "@openai/codex@${CODEX_PIN}"
+            INSTALLED="$(codex --version)"
+            T1=$(date +%s)
+            echo "CODEX-CLI-VERSION ${INSTALLED} (pin ${CODEX_PIN}) · install $((T1-T0))s (the ~9-16s npm expectation — minutes = the m-9 class)"
+            case "$INSTALLED" in
+              *"$CODEX_PIN"*) ;;
+              *) echo "::error::codex --version (${INSTALLED}) does not match the pin ${CODEX_PIN} — refusing to let the spawn lane pay a fresh npx download inside the wall budget (s24/B3, the m-9 class)"; exit 1;;
+            esac
+            echo "install_s=$((T1-T0))" >> "$GITHUB_OUTPUT"
+          else
+            echo "CODEX-INSTALL-SKIPPED mode=$MODE (non-codex dispatch — no codex CLI needed)"
+          fi
+
+      - name: One codex turn through the REAL worker machinery (timed)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # or-074 the funded primary — the lane key the D14 overlay re-injects
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}                   # the transcript push (fsm-sessions branch)
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          X29_INSTALL_S: ${{ steps.codex-install.outputs.install_s }}
+          X29_PROMPT: ${{ inputs.prompt }}
+          # CODEX_HOME rides GITHUB_ENV from the install step above (the B3
+          # wiring — GitHub's env mapping cannot expand $HOME) exactly where
+          # the adapter resolves it.
+          # CODEX_FAKE_LLM intentionally UNSET — the REAL lane; this run IS
+          # the measurement (tests always run fake; this is the one real
+          # turn). OPENROUTER_API_KEY_2 intentionally UNSET too — the smoke
+          # rides the funded primary only; a real dispatch carries both keys.
+        run: |
+          t0=$(date +%s)
+          set +e
+          node scripts/x29-codex-smoke.mjs
+          rc=$?
+          set -e
+          t1=$(date +%s)
+          echo "X29-TURN-STEP $((t1-t0))s rc=${rc} (install ${{ steps.codex-install.outputs.install_s }}s + the turn — the full lane)"
+          exit $rc
+
+      - name: The readback
+        if: always()
+        run: echo "install_s from the codex-install step's output; the turn's X29-* lines above carry the content assert, the cost line (usage × worker/codex/models.json prices), the lane log, and the transcript branch push."
