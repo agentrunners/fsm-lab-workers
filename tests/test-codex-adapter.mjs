@@ -323,6 +323,89 @@ test('codex env: the caller\'s CODEX_HOME wins over the scratch home; absent cal
   } finally { rmSync(provided, { recursive: true, force: true }); }
 });
 
+// ---------------------------------------------------------------------------
+// B3 — the worker.yml codex INSTALL GATE + the config template it renders.
+// The W2-pin discipline from test-cc-adapter.mjs (the install lane and the
+// spawn lane must agree; drift = the m-9 npx-download-inside-the-wall class),
+// mirrored for the second engine — plus the gate's fail-direction pin (the
+// ONE deliberate inversion vs the CC step: codex-ONLY, never the absent-ox
+// fail-safe) and the committed template's load-bearing keys.
+// ---------------------------------------------------------------------------
+
+test('codex B3: worker.yml\'s install gate — the codex-ONLY mode gate (the OX_RAW mechanism), the npm pin + version assert (no || true), CODEX_HOME + the config render', () => {
+  const yml = readFileSync(new URL('../.github/workflows/worker.yml', import.meta.url), 'utf8');
+  const step = /- name: Install the Codex CLI \([^)]*\)([\s\S]*?)(?=\n      - name:)/.exec(yml);
+  assert.ok(step, 'the codex-install step exists in worker.yml');
+  const body = step[1];
+  // THE GATE: the EXACT mechanism the CC install step uses (the ox envelope
+  // rides ENV and is parsed by the node stdin one-liner — never
+  // ${{ }}-interpolated into the shell, injection-safe).
+  assert.ok(body.includes('OX_RAW: ${{ github.event.client_payload.ox || \'\' }}'),
+    'the gate reads ox.mode through the OX_RAW env + node stdin parse (the CC step\'s exact mechanism)');
+  assert.ok(body.includes('if [ "$MODE" = "codex" ]; then'), 'the gate fires on MODE=codex');
+  assert.ok(!/\[ "\$MODE" = "codex" \] \|\| \[ -z "\$MODE" \]/.test(body),
+    'the CC step\'s absent-ox fail-safe is NOT copied — absent ox = legacy = the mock/cc era, and a codex dispatch ALWAYS carries ox.mode (B1 vocabulary; envelopeFromDispatch defaults absent → mock): mock/real/cc/legacy NEVER install codex');
+  assert.ok(body.includes('CODEX-INSTALL-SKIPPED mode=$MODE'), 'non-codex dispatches log the skip');
+  // THE PIN + THE ASSERT (the W2 tie, mirrored): install default = the
+  // verified literal, never latest; a mismatch fails the step LOUDLY.
+  const m = /CODEX_PIN="\$\{CODEX_VERSION:-(.+?)\}"/.exec(body);
+  assert.ok(m, 'the install step defines CODEX_PIN with a ${CODEX_VERSION:-<literal>} default');
+  assert.equal(m[1], '0.156.0', 'the pins.env verified pin (the harness config\'s wire_api="responses" is mandatory on 0.156)');
+  assert.ok(body.includes('npm install -g "@openai/codex@${CODEX_PIN}"'), 'the install consumes the pin');
+  assert.ok(!/\$\{CODEX_VERSION:-latest\}/.test(body), 'the stale latest default is dead');
+  assert.match(body, /case "\$INSTALLED" in\s*\n\s*\*"\$CODEX_PIN"\*\) ;;\s*\n\s*\*\)[^\n]*exit 1;;/,
+    'the version assert: a mismatch FAILS the step (no || true — the m-2/C law; the lease re-covers)');
+  // CODEX_HOME + the config render (D7a)
+  assert.ok(body.includes('CODEX_HOME_DIR="$HOME/.codex-fsm"'),
+    'CODEX_HOME is $HOME/.codex-fsm — never /tmp (gotcha §10.2), never in the workdir (R1)');
+  assert.ok(body.includes('mkdir -p "$CODEX_HOME_DIR"'), 'the home is pre-created (gotcha #2: CODEX_HOME must exist)');
+  assert.ok(body.includes('cp worker/codex/config.toml "${CODEX_HOME_DIR}/config.toml"'),
+    'the engine\'s committed template renders INTO the home');
+  assert.ok(body.includes('echo "CODEX_HOME=${CODEX_HOME_DIR}" >> "$GITHUB_ENV"'),
+    'the home is exported via GITHUB_ENV — the Work-the-task node process reads process.env.CODEX_HOME (the adapter\'s env.CODEX_HOME resolution)');
+  assert.ok(!body.includes('AGENTS.md'), 'NO AGENTS.md seeding anywhere in the install (the R2 fold — the envelope IS the prompt)');
+  assert.match(body, /install \$\(\(T1-T0\)\)s/, 'the install seconds are echoed (the ~9-16s npm expectation — minutes = the m-9 class)');
+  // the Work-the-task env block documents the GITHUB_ENV carriage (the env
+  // block does NOT re-map CODEX_HOME — GitHub's env mapping cannot expand
+  // $HOME; the export above is the single source)
+  assert.ok(yml.includes('codex-install step above exports it via GITHUB_ENV'),
+    'the Work-the-task env block documents where the adapter\'s CODEX_HOME comes from');
+});
+
+test('codex B3: worker/codex/config.toml — the committed template the install step renders (the load-bearing keys cannot silently rot)', () => {
+  const toml = readFileSync(new URL('../worker/codex/config.toml', import.meta.url), 'utf8');
+  // the provider block — wire_api is the 0.156.0 kill switch
+  assert.match(toml, /^model_provider = "openrouter"$/m);
+  assert.match(toml, /^base_url = "https:\/\/openrouter\.ai\/api\/v1"$/m);
+  assert.match(toml, /^wire_api = "responses"$/m,
+    'MANDATORY on 0.156.0 — "chat" was removed ~0.84 and errors (codex-cli.md §8.1): a chat here is a 100%-dead lane');
+  assert.match(toml, /^env_key = "OPENROUTER_API_KEY"$/m,
+    'the D14 inversion\'s other half — the lane key the overlay re-injects is the env_key auth');
+  assert.match(toml, /^request_max_retries = 4$/m);
+  assert.match(toml, /^stream_max_retries = 5$/m);
+  assert.match(toml, /^stream_idle_timeout_ms = 300000$/m, 'D15\'s config-side bound (the wall + this idle are the v1 turn bounds)');
+  // the model keys — exactly ONE model (the argv-less fallback; argv carries
+  // the lane per D5b), the glm ctx (the argv -c overrides per lane)
+  const models = [...toml.matchAll(/^model = "(.+)"$/mg)];
+  assert.equal(models.length, 1, 'exactly ONE model key — config.toml pins a single model (D5b)');
+  assert.ok(CODEX_MODELS.includes(models[0][1]), `the pinned fallback (${models[0][1]}) is a models.json lane model`);
+  assert.match(toml, /^model_context_window = 1310720$/m, 'glm\'s ctx — the argv -c model_context_window overrides per lane');
+  // the hygiene + noise blocks
+  assert.match(toml, /^ignore_default_excludes = false$/m,
+    'the model-spawned-shell hygiene that pairs with the adapter\'s D14 denylist');
+  assert.match(toml, /^exclude = \["\*PAT\*", "\*PASS\*", "\*CRED\*", "\*GH_\*"\]$/m);
+  assert.match(toml, /^\[history\]$/m);
+  assert.match(toml, /^persistence = "none"$/m);
+  assert.match(toml, /^\[otel\]$/m);
+  assert.equal((toml.match(/^exporter = "none"$/mg) || []).length + (toml.match(/^(trace_exporter|metrics_exporter) = "none"$/mg) || []).length, 3,
+    'every otel exporter off');
+  // the bracket-balance sanity (the [m/[h display-eating artifact class made
+  // this explicit): every section header line is a well-formed [table]
+  for (const h of toml.split('\n').filter((l) => l.startsWith('['))) {
+    assert.match(h, /^\[[a-z_.]+\]$/, `well-formed section header: ${h}`);
+  }
+});
+
 test('codex env at the boundary: the denylist is DEAD at the spawn (M-1); the lane key is the only re-injection', async () => {
   const env = fakeEnv({
     GH_TOKEN: 'gh-leak', GITHUB_TOKEN: 'github-leak', GL_PAT: 'gl-leak',
