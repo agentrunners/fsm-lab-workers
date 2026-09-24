@@ -25,6 +25,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   pushSessionFiles,
+  appendTranscriptNote,
   sessionsRepoFromEnv,
   sessionsTokenFromEnv,
   sessionsBackoffMs,
@@ -175,6 +176,46 @@ test('aggregate PERSISTENT failure: one file degrades (retryable), one fails fat
   );
   assert.equal(perPath['a.txt'], SESSIONS_PUT_ATTEMPTS, 'the retryable file burned the full ladder');
   assert.equal(perPath['b.txt'], 1, 'the 401 is fatal per file — no retry theater');
+});
+
+test('s25-r1/R1: 429 and 403-with-rate-limit-body are RETRYABLE (the secondary-rate-limit storm class must never re-run a completed paid turn)', async () => {
+  const mk = async (status, body) => {
+    let putCount = 0;
+    const { fetchImpl } = mockFetch((c) => {
+      if (c.method === 'GET') return { status: 404, data: null };
+      putCount += 1;
+      return putCount === 1 ? { status, data: { message: body } } : { status: 201, data: {} };
+    });
+    const r = await pushSessionFiles({ ...BASE_ARGS, files: [FILE('rl.txt')], fetchImpl, sleepImpl: noSleep([]), rand: randMid });
+    return { r, putCount };
+  };
+  const a = await mk(429, 'Too many requests');
+  assert.equal(a.r.mode, 'pushed', '429 absorbed by the ladder');
+  const b = await mk(403, 'You have exceeded a secondary rate limit and given the Retry-After header');
+  assert.equal(b.r.mode, 'pushed', '403-with-rate-limit-body absorbed (the GitHub secondary-limit shape)');
+  // a plain 403 (permission) is FATAL — the throw is the assertion
+  await assert.rejects(() => mk(403, 'Resource not accessible by integration'), /PUT\(create\) HTTP 403/, 'a plain 403 (permission) still fails — no retry theater');
+});
+
+test('s25-r1/R2: the missing-branch 422 is FATAL (fail-loud — never a silent zero-transcript degrade)', async () => {
+  const { fetchImpl } = mockFetch((c) => {
+    if (c.method === 'GET') return { status: 404, data: null };
+    return { status: 422, data: { message: 'No ref found for branch fsm-sessions' } };
+  });
+  await assert.rejects(
+    () => pushSessionFiles({ ...BASE_ARGS, files: [FILE('nb.txt')], fetchImpl, sleepImpl: noSleep([]), rand: randMid }),
+    /branch is missing — the ops-born dependency/,
+    'the branch-missing class throws (the silent-hole killer)',
+  );
+});
+
+test('s25-r1/R4: appendTranscriptNote — the shared pinned note builder (both adapters call it)', () => {
+  const t = { mode: 'degraded', repo: 'o/r', failures: [{ path: 'a' }, { path: 'b' }] };
+  assert.equal(appendTranscriptNote('base', t), 'base [transcript degraded: 2 file(s) unlanded @ o/r]');
+  assert.equal(appendTranscriptNote(undefined, t), ' [transcript degraded: 2 file(s) unlanded @ o/r]', 'undefined summary degrades safely (no \'undefined\' string)');
+  assert.equal(appendTranscriptNote('base', { mode: 'pushed' }), 'base', 'non-degraded: untouched');
+  assert.equal(appendTranscriptNote('base', null), 'base', 'null transcript: untouched');
+  assert.equal(appendTranscriptNote(undefined, { mode: 'pushed' }), undefined, 'non-degraded + undefined: stays undefined');
 });
 
 test('THE DEGRADED RETURN (the X30 law): pure retryable exhaustion NEVER throws — the landed files are recorded, the unlanded are named, the turn keeps its DONE status', async () => {

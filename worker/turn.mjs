@@ -440,6 +440,14 @@ export function composeReportOutcome(classified, raw, durationMs, { mode } = {})
   // Absent (the gate-reject compose, legacy callers) → no field, the journal
   // record degrades to mode-unknown at the console (the guard family).
   if (typeof mode === 'string' && mode !== '') outcome.mode = mode;
+  // s25-r1/R3 + d1-G8: the DEGRADED-transcript marker — the only run-log-
+  // grep-visible fact before this field; now the journal REPORT record and
+  // last_result carry it (the compose + laneOutcomeFields pair is the ride;
+  // absent = byte-identical legacy shape, the hard compat requirement)
+  if (raw?.transcript && typeof raw.transcript === 'object' && raw.transcript.mode === 'degraded'
+      && Array.isArray(raw.transcript.failures)) {
+    outcome.transcript_degraded = raw.transcript.failures.length;
+  }
   return outcome;
 }
 

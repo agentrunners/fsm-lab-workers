@@ -137,7 +137,7 @@ import { pushTaskBranch } from './cc-adapter.mjs';
 // engine + the custom-name repo/token seam — race-free by construction, the
 // repo the files land on explicit (the law + the live lesson are recorded at
 // the top of worker/sessions-push.mjs).
-import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv } from './sessions-push.mjs';
+import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv, appendTranscriptNote } from './sessions-push.mjs';
 // the single-source model table (D5b): ctx + retries + idle + prices + peak.
 // Key order IS the model-major lane order (deepseek first — the value pick).
 import CODEX_MODELS_JSON from './codex/models.json' with { type: 'json' };
@@ -593,9 +593,13 @@ function codexTranscriptMeta(envelope, runId, fake, result, nowIso) {
 // back-compat pair for tests/sims that set the old vocabulary. The token
 // never reaches a log line (the Authorization header only). Retry ladder:
 // the engine's per-PUT budget (3 attempts, backoff+jitter, 409/422/5xx/
-// network) + the caller's ONE whole-set retry below.
+// network). s25/X30: the engine's 10-attempt jittered ladder is the absorber —
+// this wrapper makes exactly ONE call (the old outer whole-set retry is gone).
 // exported as the ADAPTER SEAM for the mock-first pins (the s25/b1 suite
 // drives the real-mode lane through fetchImpl — zero network, zero git).
+// s25/X30: the engine's OWN retry ladder is the absorber (10 jittered
+// attempts); this wrapper makes exactly ONE call — the old outer whole-set
+// retry is REMOVED (it re-fed the 409 storm).
 export async function pushSessionsContents({ env, files, log, fetchImpl, sleepImpl, rand }) {
   const repo = sessionsRepoFromEnv(env);
   const token = sessionsTokenFromEnv(env);
@@ -975,9 +979,10 @@ export async function codexTurn(envelope, opts = {}) {
         // ops console reads (artifact field carries the summary on dones).
         // typeof-guard: the happy-path result carries no summary until the
         // compose step — undefined + ' += ' would stringify 'undefined'.
+        // s25-r1/R4: the shared, PINNED note builder (the inline twin was
+        // unpinned — the reviewer's cc-glue mutation survived the suite)
         if (result.transcript && result.transcript.mode === 'degraded') {
-          const note = ` [transcript degraded: ${result.transcript.failures.length} file(s) unlanded @ ${result.transcript.repo}]`;
-          result.summary = (typeof result.summary === 'string' ? result.summary : '') + note;
+          result.summary = appendTranscriptNote(result.summary, result.transcript);
         }
       } catch (e) {
         // the transcript lesson: a FAILED turn keeps its work-class result

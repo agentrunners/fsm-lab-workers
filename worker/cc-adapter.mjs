@@ -113,7 +113,7 @@ import { collectLaneStats } from './lane-telemetry.mjs';
 // s25/b1 (the X29 F3/F2 rebuild): the transcript lane's shared contents-API
 // engine + the custom-name repo/token seam — the law and the live lesson
 // (run 35999041887) are recorded at the top of worker/sessions-push.mjs.
-import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv } from './sessions-push.mjs';
+import { pushSessionFiles, sessionsRepoFromEnv, sessionsTokenFromEnv, appendTranscriptNote } from './sessions-push.mjs';
 
 const FAKE_CC_PATH = fileURLToPath(new URL('./fake-cc.mjs', import.meta.url));
 
@@ -568,9 +568,12 @@ function transcriptMeta(envelope, runId, fake, result, nowIso) {
 // tests/sims that set the old vocabulary. The token never reaches a log
 // line (the Authorization header only). Retry ladder: the engine's per-PUT
 // budget (3 attempts, backoff+jitter, 409/422/5xx/network) + the caller's
-// ONE whole-set retry in writeTranscript.
+// ONE call in writeTranscript (the outer whole-set retry is gone — s25/X30).
 // exported as the ADAPTER SEAM for the mock-first pins (the s25/b1 suite
 // drives the real-mode lane through fetchImpl — zero network, zero git).
+// s25/X30: the engine's OWN retry ladder is the absorber (10 jittered
+// attempts); this wrapper makes exactly ONE call — the old outer whole-set
+// retry is REMOVED (it re-fed the 409 storm).
 export async function pushSessionsContents({ env, files, log, fetchImpl, sleepImpl, rand }) {
   const repo = sessionsRepoFromEnv(env);
   const token = sessionsTokenFromEnv(env);
@@ -1206,9 +1209,10 @@ export async function ccTurn(envelope, opts = {}) {
         // s25/X30: the DEGRADED transcript rides the report summary — the
         // FSM keeps the DONE status (no re-run of a completed paid turn);
         // typeof-guard: undefined + ' += ' would stringify 'undefined'.
+        // s25-r1/R4: the shared, PINNED note builder (the inline twin was
+        // unpinned — the reviewer's cc-glue mutation survived the suite)
         if (result.transcript && result.transcript.mode === 'degraded') {
-          const note = ` [transcript degraded: ${result.transcript.failures.length} file(s) unlanded @ ${result.transcript.repo}]`;
-          result.summary = (typeof result.summary === 'string' ? result.summary : '') + note;
+          result.summary = appendTranscriptNote(result.summary, result.transcript);
         }
       } catch (e) {
         // X20 run-2 lesson: a FAILED turn keeps its work-class result — the
