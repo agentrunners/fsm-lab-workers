@@ -594,7 +594,9 @@ function codexTranscriptMeta(envelope, runId, fake, result, nowIso) {
 // never reaches a log line (the Authorization header only). Retry ladder:
 // the engine's per-PUT budget (3 attempts, backoff+jitter, 409/422/5xx/
 // network) + the caller's ONE whole-set retry below.
-async function pushSessionsContents({ env, files, log, fetchImpl }) {
+// exported as the ADAPTER SEAM for the mock-first pins (the s25/b1 suite
+// drives the real-mode lane through fetchImpl — zero network, zero git).
+export async function pushSessionsContents({ env, files, log, fetchImpl }) {
   const repo = sessionsRepoFromEnv(env);
   const token = sessionsTokenFromEnv(env);
   if (!repo || !token) throw new Error('sessions push needs FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (or the GITHUB_REPOSITORY/GH_TOKEN back-compat pair)');
