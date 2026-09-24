@@ -135,8 +135,9 @@ async function conductorRuns() {
 //
 // Age source (DECIDED — the brief leaves it open): a read-only shallow clone
 // `git clone --shallow-since=<now-(gcDays+2)d> --branch fsm-sessions
-// --single-branch` (mirrors worker/cc-adapter.mjs pushSessionsBranch's clone
-// shape). Listing: `git ls-tree -r --name-only HEAD`. Age map: `git log
+// --single-branch` (the s24-era sessions git-push lane's clone shape — the
+// transcript lane itself moved to the contents API in s25/b1; the GC keeps
+// its own read-only git lane, which predates and outlives that change). Listing: `git ls-tree -r --name-only HEAD`. Age map: `git log
 // --name-only --format='@@@%H %cI'` → newest-touching-commit per path (the
 // REST trees API has no mtime; the commits-list endpoint has no per-commit
 // file set). Paths outside the fetched window fall to the horizon rule
