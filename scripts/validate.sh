@@ -10,6 +10,9 @@
 #      51 checks)
 #   5. the CC-adapter conformance (worker/conformance-cc.mjs — the C3/F-M7
 #      multi-harness parity proof, 26 checks; was hand-ritual only)
+#      + the codex-engine conformance (worker/conformance-codex.mjs — s24/B4:
+#      the multi-engine design §2 executable: argv/env boundary, R7/D13
+#      decode precedence, R1 workdir hygiene, lane_stats shape, 21 checks)
 #   6. the conductor smoke (REAL adapter against a local bare origin) —
 #      OPT-IN via FSM_SMOKE=1 (it shells git + node heavily; keep CI-like
 #      environments on the fast paths by default)
@@ -52,6 +55,9 @@ node sim/run-sim4.mjs || fail=1
 
 echo "== conformance (CC adapter × harness-shim parity, C3/F-M7) =="
 node worker/conformance-cc.mjs || fail=1
+
+echo "== conformance (codex engine × the multi-engine design §2, s24/B4) =="
+node worker/conformance-codex.mjs || fail=1
 
 if [ "${FSM_SMOKE:-0}" = "1" ]; then
   echo "== conductor smoke (FSM_SMOKE=1) =="
