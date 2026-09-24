@@ -596,7 +596,7 @@ function codexTranscriptMeta(envelope, runId, fake, result, nowIso) {
 // network) + the caller's ONE whole-set retry below.
 // exported as the ADAPTER SEAM for the mock-first pins (the s25/b1 suite
 // drives the real-mode lane through fetchImpl — zero network, zero git).
-export async function pushSessionsContents({ env, files, log, fetchImpl }) {
+export async function pushSessionsContents({ env, files, log, fetchImpl, sleepImpl, rand }) {
   const repo = sessionsRepoFromEnv(env);
   const token = sessionsTokenFromEnv(env);
   if (!repo || !token) throw new Error('sessions push needs FSM_SESSIONS_REPO + FSM_SESSIONS_TOKEN (or the GITHUB_REPOSITORY/GH_TOKEN back-compat pair)');
@@ -608,6 +608,10 @@ export async function pushSessionsContents({ env, files, log, fetchImpl }) {
     log,
     env,
     fetchImpl,
+    // s25/X30: the mock-first seams ride through (the storm pins drive the
+    // 10-attempt ladder at zero wall-clock; the defaults are the live lane)
+    ...(sleepImpl ? { sleepImpl } : {}),
+    ...(rand ? { rand } : {}),
   });
   // the pinned line SHAPE stays byte-compatible for the run-log consumers;
   // the repo the files LANDED on is APPENDED — the X29 lesson (the split
@@ -621,7 +625,16 @@ async function writeCodexTranscript(envelope, runId, fake, result, opts, log) {
   const paths = codexTranscriptPaths(envelope, runId);
   const body = codexTranscriptBody(envelope, runId, fake, result);
   const meta = codexTranscriptMeta(envelope, runId, fake, result, new Date(opts.now()).toISOString());
-  const attempt = async () => {
+  // s25/X30 structure: ONE attempt, no outer whole-set retry (the old
+  // retry RE-FED the 409 storm: a second 10-attempt ladder immediately
+  // re-collides with the same moving ref; the internal jittered ladder IS
+  // the absorber, and retryable exhaustion returns degraded — the turn
+  // keeps its DONE status, the note rides the report summary). PERSISTENT
+  // errors (and fake-mode local write failures — test-setup errors keep
+  // the same wrap for classification) throw 'transcript-push-failed' (the
+  // done-turn escalation below is unchanged: infra_failed).
+  try {
+    // fake mode: the local determinism lane, unchanged
     if (fake) {
       const dir = opts.transcriptsDir || opts.env.CODEX_FAKE_TRANSCRIPTS_DIR || join(tmpdir(), 'fsm-sessions-codex-fake');
       mkdirSync(join(dir, dirname(paths.txt)), { recursive: true });
@@ -629,22 +642,22 @@ async function writeCodexTranscript(envelope, runId, fake, result, opts, log) {
       writeFileSync(join(dir, paths.meta), meta);
       return { mode: 'local', dir, txt: paths.txt, meta: paths.meta };
     }
-    return pushSessionsContents({
+    const out = await pushSessionsContents({
       env: opts.env,
       files: new Map([[paths.txt, body], [paths.meta, meta]]),
       log,
       fetchImpl: opts.fetchImpl,
+      sleepImpl: opts.sleepImpl,
+      rand: opts.rand,
     });
-  };
-  try {
-    return await attempt();
-  } catch (e1) {
-    log(`CODEX-TRANSCRIPT-RETRY first attempt failed: ${String(e1?.message ?? e1).slice(0, 160)}`);
-    try {
-      return await attempt();
-    } catch (e2) {
-      throw new Error(`transcript-push-failed(${String(e2?.message ?? e2).slice(0, 120)})`);
+    if (out && out.mode === 'degraded') {
+      // LOUD + structured: which files landed, which did not — the run log
+      // keeps the full diagnosis; the report summary carries the headline
+      log(`CODEX-TRANSCRIPT-DEGRADED ${out.files.length}/${out.files.length + out.failures.length} file(s) landed @ ${out.repo} — unlanded: ${out.failures.map((f) => f.path).join(', ')} (the 409-storm class: the turn KEEPS its done status; the record is degraded, the spend is not re-run)`);
     }
+    return out;
+  } catch (e) {
+    throw new Error(`transcript-push-failed(${String(e?.message ?? e).slice(0, 160)})`);
   }
 }
 
@@ -949,6 +962,16 @@ export async function codexTurn(envelope, opts = {}) {
       try {
         result.transcript = await writeCodexTranscript(envelope, runId, fake, forTranscript, { ...opts, env, now }, log);
         result.transcript.txt = codexTranscriptPaths(envelope, runId).txt;
+        // s25/X30: the DEGRADED transcript (409-storm exhaustion) rides the
+        // report summary — the FSM keeps the DONE status (no re-run of a
+        // completed paid turn); the note is the journal-visible marker the
+        // ops console reads (artifact field carries the summary on dones).
+        // typeof-guard: the happy-path result carries no summary until the
+        // compose step — undefined + ' += ' would stringify 'undefined'.
+        if (result.transcript && result.transcript.mode === 'degraded') {
+          const note = ` [transcript degraded: ${result.transcript.failures.length} file(s) unlanded @ ${result.transcript.repo}]`;
+          result.summary = (typeof result.summary === 'string' ? result.summary : '') + note;
+        }
       } catch (e) {
         // the transcript lesson: a FAILED turn keeps its work-class result
         // (the escalation would mask the diagnosis); only a DONE turn
