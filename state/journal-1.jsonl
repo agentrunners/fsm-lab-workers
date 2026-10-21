@@ -286,3 +286,4 @@
 {"id":"e286","ts":"2026-10-20T19:24:39.925Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1792524279925","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
 {"id":"e287","ts":"2026-10-20T22:35:24.760Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1792535724760","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
 {"id":"e288","ts":"2026-10-21T00:59:26.445Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1792544366445","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
+{"id":"e289","ts":"2026-10-21T05:57:18.723Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1792562238723","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
