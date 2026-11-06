@@ -365,3 +365,4 @@
 {"id":"e365","ts":"2026-11-05T11:41:24.504Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1793878884504","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
 {"id":"e366","ts":"2026-11-05T19:03:26.044Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1793905406044","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
 {"id":"e367","ts":"2026-11-06T00:17:27.080Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1793924247080","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
+{"id":"e368","ts":"2026-11-06T07:04:50.564Z","applied":false,"kind":"TICK","actor":"watchdog","event_id":"watchdog-scan-1793948690564","note":"watchdog-scan (audit-only deadman marker — the scan completed; no state change, no seq bump)"}
