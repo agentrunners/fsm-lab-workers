@@ -1,7 +1,7 @@
 {
  "schema": 1,
  "version": 69,
- "journal_seq": 400,
+ "journal_seq": 401,
  "chain": {
   "id": "c-1789708602108",
   "seq": 51,
